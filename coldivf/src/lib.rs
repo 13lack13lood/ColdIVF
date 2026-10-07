@@ -1,5 +1,8 @@
 #![allow(unused_variables, dead_code, clippy::ptr_arg)]
 
+mod kernels;
+mod quantization;
+
 use std::io::Error;
 use std::path::Path;
 use std::sync::Arc;
@@ -48,12 +51,19 @@ pub struct BuildParams {
 
 /// A clustering computed elsewhere (eg. with faiss), used instead of the built-in k-means.
 pub struct Clusters {
+    /// The vector dimension, eg. 768.
     pub dim: usize,
-    /// Cluster centers, row-major with `dim` values each, and the cluster of each input row.
+    /// Every cluster's center, one after another, so cluster i is `centroids[i * dim..(i + 1) * dim]`. Its length is
+    /// the number of clusters times `dim`, eg. 6250 × 768 at 1M vectors.
     pub centroids: Vec<f32>,
+    /// The cluster of each input vector, in input order. `assignment[r] = i` puts row r in cluster i. It has one
+    /// entry per vector, eg. 1M.
     pub assignment: Vec<u32>,
-    /// Centers of the cluster groups, and the group of each cluster.
+    /// Every group's center, laid out like `centroids`. A group is a set of nearby clusters, and the groups decide the
+    /// order of the clusters in the file. Its length is the number of groups times `dim`, eg. 128 × 768.
     pub parents: Vec<f32>,
+    /// The group of each cluster. `parent_of[i] = g` puts cluster i in group g. It has one entry per cluster, eg. 6250
+    /// at 1M vectors.
     pub parent_of: Vec<u32>,
 }
 

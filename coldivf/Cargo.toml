@@ -12,6 +12,8 @@ inmem = []
 
 [dependencies]
 # Pure Rust only, so the Mac can cross-compile and check every target.
+# libm: a correctly rounded fused multiply-add that gives the same bits on every platform.
+libm = "0.2.16"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # io-uring: the Linux backend for batched reads.
