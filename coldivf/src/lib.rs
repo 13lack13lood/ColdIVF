@@ -2,6 +2,7 @@
 
 mod kernels;
 mod quantization;
+mod search;
 
 use std::io::Error;
 use std::path::Path;
@@ -136,6 +137,28 @@ impl Index {
     }
 }
 
+/// The whole index in RAM, built from the same codes as an index file. Benchmarks compare against it, and a search of
+/// a file built the same way returns exactly its results.
+#[cfg(feature = "inmem")]
+pub struct InMemoryIndex {
+    inner: search::inmem::InMemory,
+}
+
+#[cfg(feature = "inmem")]
+impl InMemoryIndex {
+    /// Builds the index from `src` and an imported clustering. It uses `params.metric` and `params.seed`.
+    pub fn build(params: &BuildParams, src: &dyn VectorSource, clusters: &Clusters) -> Result<InMemoryIndex, Error> {
+        Ok(InMemoryIndex {
+            inner: search::inmem::InMemory::build(params, src, clusters)?,
+        })
+    }
+
+    /// Searches like [`Index::search`]. The hits live in `ctx`.
+    pub fn search<'a>(&self, query: &[f32], params: &SearchParams, ctx: &'a mut SearchCtx) -> Result<&'a [Hit], Error> {
+        self.inner.search(query, params, ctx)
+    }
+}
+
 /// Per-query settings. Reading more clusters and rescoring more candidates finds more of a query's true nearest
 /// neighbors, but takes longer. [`calibrate`] picks the cheapest values that meet a [`Target`].
 #[derive(Clone, Copy, Debug)]
@@ -164,13 +187,21 @@ pub struct Limits {
     pub max_rerank: usize,
 }
 
-/// Per-thread scratch space, reused across queries. It holds the buffers and the read state for each index.
-/// Create it before timing a cold query.
-pub struct SearchCtx {}
+/// Per-thread scratch space, reused across queries. It holds the buffers and the read state for each index. It sizes
+/// the buffers for an index on the first search, so run one search before timing.
+pub struct SearchCtx {
+    limits: Limits,
+    scratch: Option<search::Scratch>,
+    hits: Vec<Hit>,
+}
 
 impl SearchCtx {
     pub fn new(limits: Limits) -> SearchCtx {
-        todo!()
+        SearchCtx {
+            limits,
+            scratch: None,
+            hits: Vec::with_capacity(limits.max_k),
+        }
     }
 }
 

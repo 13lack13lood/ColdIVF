@@ -1,0 +1,57 @@
+//! Unit tests for routing.
+
+use super::*;
+use crate::quantization::sq4::{self, code_bytes, dots_scalar};
+use crate::quantization::testutil::{dot, gaussian};
+use crate::quantization::{SplitMix64, padded_dim};
+
+#[test]
+fn route_matches_a_full_sort_on_every_tier() {
+    let mut rng = SplitMix64::new(2);
+    for dim in [128, 200, 768] {
+        let nlist = 50;
+        let cb = code_bytes(padded_dim(dim));
+        let mut zs = gaussian(&mut rng, nlist, dim, |_| 1.0);
+        // Center 7 repeats center 3, so their scores tie and 3 must come first.
+        let copy = zs[3 * dim..4 * dim].to_vec();
+        zs[7 * dim..8 * dim].copy_from_slice(&copy);
+        let mut codes = vec![0u8; nlist * cb];
+        let factors: Vec<_> = zs
+            .chunks_exact(dim)
+            .zip(codes.chunks_exact_mut(cb))
+            .map(|(z, c)| sq4::encode(z, c))
+            .collect();
+
+        let y = gaussian(&mut rng, 1, dim, |_| 1.0);
+        let t2 = dot(&y, &y) as f32;
+        let mut q8 = QueryS8::new(dim);
+        q8.prepare(&y);
+
+        let mut dots = vec![0i32; nlist];
+        dots_scalar(&codes, &q8.q8, &mut dots);
+        let mut want: Vec<Candidate> = factors
+            .iter()
+            .zip(&dots)
+            .enumerate()
+            .map(|(i, (f, &d))| Candidate {
+                score: route_score(t2, f, &q8, d),
+                id: i as u32,
+            })
+            .collect();
+        want.sort_unstable_by(order);
+        let (p3, p7) = (want.iter().position(|c| c.id == 3), want.iter().position(|c| c.id == 7));
+        assert!(p3 < p7, "the tie between centers 3 and 7 must go to 3");
+
+        let centers = Centers {
+            codes: &codes,
+            factors: &factors,
+        };
+        for tier in [Tier::SCALAR, Tier::best()] {
+            for nprobe in [0, 1, 10, nlist, nlist + 5] {
+                let mut routes = Vec::new();
+                route(tier, &centers, &q8, t2, nprobe, &mut dots, &mut routes);
+                assert_eq!(routes, want[..nprobe.min(nlist)], "dim {dim}, nprobe {nprobe}");
+            }
+        }
+    }
+}
