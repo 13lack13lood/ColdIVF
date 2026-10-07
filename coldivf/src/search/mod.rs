@@ -14,13 +14,176 @@ pub(crate) mod scan;
 
 use std::io::{Error, ErrorKind};
 
-use crate::quantization::rabitq::{BLOCK, QueryLut};
+use crate::kernels::Tier;
+use crate::quantization::padded_dim;
+use crate::quantization::rabitq::{BLOCK, QueryLut, block_bytes};
+use crate::quantization::rotation::Rotation;
 use crate::quantization::sq4::QueryS8;
-use crate::{Limits, SearchParams};
+use crate::{Hit, LeafId, Limits, Metric, SearchCtx, SearchParams};
 use candidates::{Candidate, Candidates};
+use rerank::rerank;
+use route::{Centers, route};
+use scan::scan_list;
 
-/// The buffers of one search, sized for one index's dimension and cluster count. A `SearchCtx` keeps one and reuses
-/// it, so a search allocates nothing.
+/// The largest squared length a query's or a vector's offset from the mean may have, a quarter of the largest f32, so
+/// adding two of them can't overflow.
+pub(crate) const LIMIT: f64 = f32::MAX as f64 / 4.0;
+
+/// One cluster's place in an index.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct List {
+    /// Where its blocks start, in bytes from the start of all the blocks.
+    pub(crate) offset: usize,
+    /// Its vectors, which have internal ids `first_id..first_id + count`.
+    pub(crate) count: usize,
+    pub(crate) first_id: u32,
+}
+
+/// The 8-bit rows, `per_page` to a page so that no row crosses a page boundary.
+pub(crate) struct RowPages<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) row_bytes: usize,
+    pub(crate) per_page: usize,
+    pub(crate) page_size: usize,
+}
+
+impl<'a> RowPages<'a> {
+    /// The row of internal id `id`.
+    pub(crate) fn row(&self, id: u32) -> &'a [u8] {
+        let id = id as usize;
+        let at = (id / self.per_page) * self.page_size + (id % self.per_page) * self.row_bytes;
+        &self.bytes[at..at + self.row_bytes]
+    }
+}
+
+/// What a search reads from an index. The bytes are the same whether the index is in RAM or in a mapped file.
+pub(crate) struct View<'a> {
+    pub(crate) dim: usize,
+    pub(crate) metric: Metric,
+    pub(crate) mean: &'a [f32],
+    pub(crate) rotation: &'a Rotation,
+    pub(crate) centers: Centers<'a>,
+    pub(crate) lists: &'a [List],
+    /// Every cluster's blocks.
+    pub(crate) blocks: &'a [u8],
+    pub(crate) rows: RowPages<'a>,
+    pub(crate) tier: Tier,
+}
+
+/// Searches `view` for the `params.k` nearest vectors. The hits live in `ctx`.
+pub(crate) fn run<'a>(
+    view: &View,
+    query: &[f32],
+    params: &SearchParams,
+    ctx: &'a mut SearchCtx,
+) -> Result<&'a [Hit], Error> {
+    check_search(query, view.dim, params, &ctx.limits)?;
+
+    let SearchCtx { limits, scratch, hits } = ctx;
+    let s = scratch_for(scratch, view.dim, view.lists.len(), limits);
+    prepare_query(view, query, s)?;
+    route(
+        view.tier,
+        &view.centers,
+        &s.q8,
+        s.lut.k.t2,
+        params.nprobe,
+        &mut s.dots,
+        &mut s.routes,
+    );
+    s.candidates.reset(params.rerank.max(params.k));
+    let size = block_bytes(padded_dim(view.dim));
+
+    for r in &s.routes {
+        let list = view.lists[r.id as usize];
+        let blocks = &view.blocks[list.offset..list.offset + list.count.div_ceil(BLOCK) * size];
+        scan_list(
+            view.tier,
+            blocks,
+            list.count,
+            list.first_id,
+            &s.lut,
+            &mut s.candidates,
+            &mut s.survivors,
+        );
+    }
+
+    let row = |id: u32| view.rows.row(id);
+    rerank(
+        s.candidates.as_slice(),
+        row,
+        &s.offset,
+        params.k,
+        view.metric,
+        &mut s.rescored,
+        hits,
+    )?;
+
+    Ok(&hits[..])
+}
+
+/// Writes the `nprobe` clusters nearest the query into `out`, nearest first.
+pub(crate) fn run_route(
+    view: &View,
+    query: &[f32],
+    nprobe: usize,
+    ctx: &mut SearchCtx,
+    out: &mut Vec<LeafId>,
+) -> Result<(), Error> {
+    let params = SearchParams {
+        k: 0,
+        nprobe,
+        rerank: 0,
+    };
+    check_search(query, view.dim, &params, &ctx.limits)?;
+
+    let SearchCtx { limits, scratch, .. } = ctx;
+    let s = scratch_for(scratch, view.dim, view.lists.len(), limits);
+    prepare_query(view, query, s)?;
+    route(
+        view.tier,
+        &view.centers,
+        &s.q8,
+        s.lut.k.t2,
+        nprobe,
+        &mut s.dots,
+        &mut s.routes,
+    );
+    out.clear();
+    out.extend(s.routes.iter().map(|r| r.id));
+
+    Ok(())
+}
+
+/// Normalizes the query for cosine, then writes its offset q − μ, that offset rotated and its two quantized forms into
+/// `s`.
+fn prepare_query(view: &View, query: &[f32], s: &mut Scratch) -> Result<(), Error> {
+    s.query.copy_from_slice(query);
+
+    if view.metric == Metric::Cosine && !normalize(&mut s.query) {
+        return Err(invalid("a zero query has no direction for cosine"));
+    }
+
+    let mut t2 = 0f64;
+
+    for ((o, &q), &m) in s.offset.iter_mut().zip(&s.query).zip(view.mean) {
+        *o = q - m;
+        t2 += f64::from(*o).powi(2);
+    }
+
+    // An estimate adds T² to a vector's f_add, and a route score adds it to a center's ‖z‖², so T² needs room to spare.
+    if t2 > LIMIT {
+        return Err(invalid("the query is too far from the index's mean"));
+    }
+
+    view.rotation.apply(&s.offset, &mut s.rotated, &mut s.tmp);
+    s.lut.prepare(&s.rotated, t2.sqrt());
+    s.q8.prepare(&s.rotated);
+    Ok(())
+}
+
+/// The buffers of one search, sized for one index's dimension and cluster count. A `SearchCtx` keeps one per shape and
+/// reuses it, so a search allocates nothing after the first with each shape.
 pub(crate) struct Scratch {
     dim: usize,
     nlist: usize,
@@ -63,18 +226,22 @@ impl Scratch {
     }
 }
 
-/// The scratch in `slot`, made first if the slot is empty or sized for another index's shape.
+/// The scratch in `slots` for an index with this dimension and cluster count, made first if there isn't one yet.
 pub(crate) fn scratch_for<'a>(
-    slot: &'a mut Option<Scratch>,
+    slots: &'a mut Vec<Scratch>,
     dim: usize,
     nlist: usize,
     limits: &Limits,
 ) -> &'a mut Scratch {
-    if !matches!(slot, Some(s) if s.dim == dim && s.nlist == nlist) {
-        *slot = Some(Scratch::new(dim, nlist, limits));
-    }
+    let i = match slots.iter().position(|s| s.dim == dim && s.nlist == nlist) {
+        Some(i) => i,
+        None => {
+            slots.push(Scratch::new(dim, nlist, limits));
+            slots.len() - 1
+        }
+    };
 
-    slot.as_mut().expect("the slot was just filled")
+    &mut slots[i]
 }
 
 /// Checks a search's arguments, so a bad one fails with `InvalidInput` instead of a panic.

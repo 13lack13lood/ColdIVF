@@ -21,12 +21,10 @@ fn route_matches_a_full_sort_on_every_tier() {
             .zip(codes.chunks_exact_mut(cb))
             .map(|(z, c)| sq4::encode(z, c))
             .collect();
-
         let y = gaussian(&mut rng, 1, dim, |_| 1.0);
         let t2 = dot(&y, &y) as f32;
         let mut q8 = QueryS8::new(dim);
         q8.prepare(&y);
-
         let mut dots = vec![0i32; nlist];
         dots_scalar(&codes, &q8.q8, &mut dots);
         let mut want: Vec<Candidate> = factors
@@ -41,7 +39,6 @@ fn route_matches_a_full_sort_on_every_tier() {
         want.sort_unstable_by(order);
         let (p3, p7) = (want.iter().position(|c| c.id == 3), want.iter().position(|c| c.id == 7));
         assert!(p3 < p7, "the tie between centers 3 and 7 must go to 3");
-
         let centers = Centers {
             codes: &codes,
             factors: &factors,
@@ -52,6 +49,45 @@ fn route_matches_a_full_sort_on_every_tier() {
                 route(tier, &centers, &q8, t2, nprobe, &mut dots, &mut routes);
                 assert_eq!(routes, want[..nprobe.min(nlist)], "dim {dim}, nprobe {nprobe}");
             }
+        }
+    }
+}
+
+#[test]
+fn a_tie_between_two_centers_goes_to_the_lower_position() {
+    let mut rng = SplitMix64::new(3);
+    let (dim, nlist) = (128, 30);
+    let cb = code_bytes(padded_dim(dim));
+
+    for _ in 0..20 {
+        let mut zs = gaussian(&mut rng, nlist, dim, |_| 1.0);
+        let a = (rng.next_u64() % (nlist as u64 - 1)) as usize;
+        let b = a + 1 + (rng.next_u64() % (nlist - a - 1) as u64) as usize;
+        let copy = zs[a * dim..(a + 1) * dim].to_vec();
+        zs[b * dim..(b + 1) * dim].copy_from_slice(&copy);
+        let mut codes = vec![0u8; nlist * cb];
+        let factors: Vec<_> = zs
+            .chunks_exact(dim)
+            .zip(codes.chunks_exact_mut(cb))
+            .map(|(z, c)| sq4::encode(z, c))
+            .collect();
+        let y = gaussian(&mut rng, 1, dim, |_| 1.0);
+        let t2 = dot(&y, &y) as f32;
+        let mut q8 = QueryS8::new(dim);
+        q8.prepare(&y);
+        let centers = Centers {
+            codes: &codes,
+            factors: &factors,
+        };
+        let mut dots = vec![0i32; nlist];
+        let mut full = Vec::new();
+        route(Tier::SCALAR, &centers, &q8, t2, nlist, &mut dots, &mut full);
+        let pa = full.iter().position(|c| c.id == a as u32).unwrap();
+        assert_eq!(full[pa + 1].id, b as u32, "the copy must come right after the original");
+        for tier in [Tier::SCALAR, Tier::best()] {
+            let mut routes = Vec::new();
+            route(tier, &centers, &q8, t2, pa + 1, &mut dots, &mut routes);
+            assert_eq!(routes, full[..pa + 1], "positions {a} and {b}");
         }
     }
 }

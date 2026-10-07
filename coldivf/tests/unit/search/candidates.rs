@@ -17,12 +17,10 @@ fn keeps_the_best_by_score_then_id() {
             .collect();
         let mut offered = all.clone();
         shuffle(&mut offered, &mut rng);
-
         let mut set = Candidates::new(cap);
         offered.iter().for_each(|&c| set.offer(c));
         let mut kept = set.as_slice().to_vec();
         kept.sort_unstable_by(order);
-
         let mut want = all;
         want.sort_unstable_by(order);
         want.truncate(cap);
@@ -74,4 +72,27 @@ fn a_set_with_no_room_takes_nothing() {
     set.offer(Candidate { score: -1e30, id: 0 });
 
     assert!(set.as_slice().is_empty());
+}
+
+#[test]
+fn a_nan_score_ranks_last_and_sorting_never_panics() {
+    let nan = Candidate { score: f32::NAN, id: 3 };
+    assert!(before(Candidate { score: f32::MAX, id: 9 }, nan));
+    // NaN ranks as +∞, so against +∞ the lower id goes first.
+    let infinite = |id| Candidate {
+        score: f32::INFINITY,
+        id,
+    };
+    assert!(before(nan, infinite(9)) && !before(nan, infinite(1)));
+
+    // The library's sorts check that the order is total once a slice has more than 20 items.
+    let mut many: Vec<Candidate> = (0..40)
+        .map(|id| Candidate {
+            score: (id % 7) as f32,
+            id,
+        })
+        .collect();
+    many[17].score = f32::NAN;
+    many.sort_unstable_by(order);
+    assert_eq!(many.last().unwrap().id, 17);
 }

@@ -7,7 +7,7 @@ use crate::quantization::rabitq::{BLOCK, QueryLut, block_bytes, block_sums, est,
 
 /// Scores one block for the query and writes the lanes that rank before `bound` into `out`, in lane order. Only the
 /// first `count` lanes hold vectors, and lane j has internal id `first_id + j`. Returns how many it wrote. This is the
-/// portable path, and the SIMD paths must match it bit for bit.
+/// portable path, and the single instruction, multiple data (SIMD) paths must match it bit for bit.
 pub(crate) fn scan_block_scalar(
     block: &[u8],
     query: &QueryLut,

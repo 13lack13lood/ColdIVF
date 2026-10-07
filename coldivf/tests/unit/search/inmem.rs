@@ -3,13 +3,16 @@
 use std::io::ErrorKind;
 
 use super::*;
+use crate::build::order::leaf_order;
 use crate::quantization::SplitMix64;
 use crate::quantization::padded_dim;
 use crate::quantization::rabitq::{BLOCK, QueryLut, block_bytes, lane_factors};
-use crate::quantization::testutil::{Rows, clustered, dist2, gaussian, mean, params};
+use crate::quantization::testutil::{Rows, clustered, dist2, gaussian, group, mean, params};
+use crate::search::List;
 use crate::search::candidates::{Candidate, order};
+use crate::search::normalize;
 use crate::search::scan::scan_block_scalar;
-use crate::{Limits, SearchCtx, SearchParams};
+use crate::{LeafOrder, Limits, SearchCtx, SearchParams};
 
 fn ctx(max: usize) -> SearchCtx {
     SearchCtx::new(Limits {
@@ -28,14 +31,11 @@ fn exact_8_bit(index: &InMemory, query: &[f32], k: usize) -> Vec<Hit> {
     let offset: Vec<f32> = q.iter().zip(&index.mean).map(|(&x, &m)| x - m).collect();
     let norm2 = offset.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>() as f32;
 
-    let rb = sq8::row_bytes(index.dim);
-    let mut all: Vec<Candidate> = index
-        .rows
-        .chunks_exact(rb)
-        .enumerate()
-        .map(|(id, row)| Candidate {
-            score: sq8::distance(row, &offset, norm2),
-            id: id as u32,
+    let view = index.view();
+    let mut all: Vec<Candidate> = (0..index.ids.len() as u32)
+        .map(|id| Candidate {
+            score: sq8::distance(view.rows.row(id), &offset, norm2),
+            id,
         })
         .collect();
     all.sort_unstable_by(order);
@@ -43,7 +43,7 @@ fn exact_8_bit(index: &InMemory, query: &[f32], k: usize) -> Vec<Hit> {
     all.iter()
         .take(k)
         .map(|c| Hit {
-            id: sq8::id(&index.rows[c.id as usize * rb..], index.dim),
+            id: sq8::id(view.rows.row(c.id), index.dim),
             score: if index.metric == Metric::Cosine {
                 1.0 - c.score / 2.0
             } else {
@@ -164,7 +164,6 @@ fn estimates_cover_the_true_distances() {
         index.rotation.apply(&offset, &mut rotated, &mut tmp);
         let mut lut = QueryLut::new(dim);
         lut.prepare(&rotated, t);
-
         for (b, block) in index.blocks.chunks_exact(block_bytes(d_pad)).enumerate() {
             let lanes = (n - BLOCK * b).min(BLOCK);
             let mut out = [Candidate::NONE; BLOCK];
@@ -234,31 +233,56 @@ fn clusters_without_vectors_are_skipped() {
 }
 
 #[test]
-fn lists_follow_the_cluster_ids() {
-    let lists = lists(&[2, 0, 2, 2, 0], 4);
-    let want = [
+fn lists_follow_the_file_order() {
+    let size = 1000;
+    let in_id_order = [
         List {
-            block: 0,
+            offset: 0,
             count: 2,
             first_id: 0,
         },
         List {
-            block: 1,
+            offset: 1000,
             count: 0,
             first_id: 2,
         },
         List {
-            block: 1,
+            offset: 1000,
             count: 3,
             first_id: 2,
         },
         List {
-            block: 2,
+            offset: 2000,
             count: 0,
             first_id: 5,
         },
     ];
-    assert_eq!(lists, want);
+    assert_eq!(lists(&[2, 0, 2, 2, 0], &[0, 1, 2, 3], size), in_id_order);
+
+    // Clusters 2, 0, 3, 1 at file positions 0 to 3.
+    let reordered = [
+        List {
+            offset: 0,
+            count: 3,
+            first_id: 0,
+        },
+        List {
+            offset: 1000,
+            count: 2,
+            first_id: 3,
+        },
+        List {
+            offset: 2000,
+            count: 0,
+            first_id: 5,
+        },
+        List {
+            offset: 2000,
+            count: 0,
+            first_id: 5,
+        },
+    ];
+    assert_eq!(lists(&[2, 0, 2, 2, 0], &[2, 0, 3, 1], size), reordered);
 }
 
 #[test]
@@ -336,4 +360,241 @@ fn the_public_index_gives_the_same_hits() {
         bits(inner.search(q, &some, &mut a).unwrap()),
         bits(public.search(q, &some, &mut b).unwrap())
     );
+}
+
+#[test]
+fn more_search_checks_reject_with_invalid_input_and_rerank_below_k_still_gives_k() {
+    let mut rng = SplitMix64::new(9);
+    let (rows, clusters) = clustered(&mut rng, 40, 128, 3, 0.5);
+    let index = InMemory::build(&params(Metric::L2), &rows, &clusters).unwrap();
+    let mut ctx = ctx(10);
+    let ok = SearchParams {
+        k: 5,
+        nprobe: 3,
+        rerank: 10,
+    };
+    let kind = |r: Result<&[Hit], Error>| r.map(|_| ()).unwrap_err().kind();
+
+    for bad in [SearchParams { rerank: 11, ..ok }, SearchParams { nprobe: 11, ..ok }] {
+        assert_eq!(kind(index.search(&[1.0; 128], &bad, &mut ctx)), ErrorKind::InvalidInput);
+    }
+    // Finite values whose squared distance from the mean overflows an f32.
+    assert_eq!(kind(index.search(&[1e18; 128], &ok, &mut ctx)), ErrorKind::InvalidInput);
+
+    let few = SearchParams { rerank: 2, ..ok };
+    assert_eq!(index.search(&rows.data[..128], &few, &mut ctx).unwrap().len(), 5);
+}
+
+#[test]
+fn every_build_check_rejects_with_invalid_input() {
+    let mut rng = SplitMix64::new(10);
+    let (rows, clusters) = clustered(&mut rng, 40, 128, 3, 0.5);
+    let kind = |rows: &Rows, c: &Clusters, p: &BuildParams| InMemory::build(p, rows, c).map(|_| ()).unwrap_err().kind();
+    let l2 = params(Metric::L2);
+
+    let mut bad_clusters = Vec::new();
+    let mut c = clone_clusters(&clusters);
+    c.parent_of[0] = 1;
+    bad_clusters.push(c);
+    let mut c = clone_clusters(&clusters);
+    c.parent_of.pop();
+    bad_clusters.push(c);
+    bad_clusters.push(Clusters {
+        parents: Vec::new(),
+        ..clone_clusters(&clusters)
+    });
+    bad_clusters.push(Clusters {
+        parents: vec![0.5; 64],
+        ..clone_clusters(&clusters)
+    });
+    let mut c = clone_clusters(&clusters);
+    c.centroids.push(0.5);
+    bad_clusters.push(c);
+    let mut c = clone_clusters(&clusters);
+    c.centroids[7] = f32::NAN;
+    bad_clusters.push(c);
+    let mut c = clone_clusters(&clusters);
+    c.parents[7] = f32::NAN;
+    bad_clusters.push(c);
+    for (i, c) in bad_clusters.iter().enumerate() {
+        assert_eq!(kind(&rows, c, &l2), ErrorKind::InvalidInput, "case {i}");
+    }
+
+    let mut nan = Rows {
+        dim: 128,
+        data: rows.data.clone(),
+    };
+    nan.data[5] = f32::NAN;
+    let mut far = Rows {
+        dim: 128,
+        data: rows.data.clone(),
+    };
+    far.data[..128].fill(1e19);
+    for bad in [nan, far] {
+        assert_eq!(kind(&bad, &clusters, &l2), ErrorKind::InvalidInput);
+    }
+
+    for page_size in [0, 4096 + 1, 2 << 20] {
+        assert_eq!(
+            kind(
+                &rows,
+                &clusters,
+                &BuildParams {
+                    page_size,
+                    ..params(Metric::L2)
+                }
+            ),
+            ErrorKind::InvalidInput
+        );
+    }
+
+    // Dimensions just outside 128 to 4080. The page size is large enough that only the dimension is wrong.
+    for dim in [127, 4081] {
+        let (rows, clusters) = clustered(&mut rng, 10, dim, 2, 0.5);
+        let p = BuildParams {
+            page_size: 8192,
+            ..params(Metric::L2)
+        };
+        assert_eq!(kind(&rows, &clusters, &p), ErrorKind::InvalidInput, "dim {dim}");
+    }
+}
+
+#[test]
+fn the_anchor_is_the_mean_of_the_vectors() {
+    let mut rng = SplitMix64::new(11);
+    let (mut rows, clusters) = clustered(&mut rng, 100, 128, 3, 0.5);
+    rows.data.iter_mut().for_each(|x| *x += 5.0);
+
+    let index = InMemory::build(&params(Metric::L2), &rows, &clusters).unwrap();
+    assert_eq!(index.mean, mean(&rows.data, 128));
+
+    let mut normalized = rows.data.clone();
+    let dim = 128;
+    normalized.chunks_exact_mut(dim).for_each(|v| assert!(normalize(v)));
+    let index = InMemory::build(&params(Metric::Cosine), &rows, &clusters).unwrap();
+    assert_eq!(index.mean, mean(&normalized, 128));
+}
+
+#[test]
+fn chained_and_id_order_find_the_same_hits() {
+    let mut rng = SplitMix64::new(12);
+    let (rows, mut clusters) = clustered(&mut rng, 600, 128, 16, 0.5);
+    group(&mut clusters, 4);
+    let by_id = InMemory::build(&params(Metric::L2), &rows, &clusters).unwrap();
+    let chained = InMemory::build(
+        &BuildParams {
+            order: LeafOrder::Chained,
+            ..params(Metric::L2)
+        },
+        &rows,
+        &clusters,
+    )
+    .unwrap();
+
+    let order = leaf_order(LeafOrder::Chained, &clusters, &chained.mean);
+    assert_ne!(
+        order,
+        (0..16).collect::<Vec<u32>>(),
+        "the test needs an order that isn't the identity"
+    );
+    for (p, &c) in order.iter().enumerate() {
+        assert_eq!(chained.parent_of[p], clusters.parent_of[c as usize] as u16);
+        assert_eq!(
+            chained.lists[p].count,
+            clusters.assignment.iter().filter(|&&a| a == c).count()
+        );
+    }
+
+    let (mut a, mut b) = (ctx(64), ctx(64));
+    let dim = 128;
+    for q in gaussian(&mut rng, 6, dim, |_| 1.0).chunks_exact(dim) {
+        for nprobe in [5, 16] {
+            let sp = SearchParams {
+                k: 10,
+                nprobe,
+                rerank: 40,
+            };
+            assert_eq!(
+                bits(by_id.search(q, &sp, &mut a).unwrap()),
+                bits(chained.search(q, &sp, &mut b).unwrap())
+            );
+        }
+    }
+}
+
+#[test]
+fn a_build_reads_every_chunk_and_keeps_every_id() {
+    let mut rng = SplitMix64::new(13);
+    let (dim, n) = (128, 4100);
+    let (rows, clusters) = clustered(&mut rng, n, dim, 3, 0.5);
+    let index = InMemory::build(&params(Metric::L2), &rows, &clusters).unwrap();
+    let view = index.view();
+
+    let mut ids = index.ids.clone();
+    ids.sort_unstable();
+    assert_eq!(ids, (0..n as u64).collect::<Vec<_>>());
+
+    // Each row decodes to its own input vector, within half a step, so no row came from the wrong chunk.
+    for id in 0..n as u32 {
+        let (row, ext) = (view.rows.row(id), index.ids[id as usize] as usize);
+        assert_eq!(sq8::id(row, dim), ext as u64);
+        let scale = f64::from(sq8::scale(row, dim));
+        for (i, (&x, &m)) in rows.data[ext * dim..(ext + 1) * dim]
+            .iter()
+            .zip(&index.mean)
+            .enumerate()
+        {
+            let decoded = scale * f64::from(sq8::code(row, i));
+            assert!((f64::from(x - m) - decoded).abs() <= scale * (0.5 + 1e-4), "row {id}");
+        }
+    }
+}
+
+#[test]
+fn one_ctx_serves_indexes_of_different_shapes() {
+    let mut rng = SplitMix64::new(14);
+    let shapes = [(128, 12), (200, 20), (128, 20)];
+    let indexes: Vec<InMemory> = shapes
+        .iter()
+        .map(|&(dim, nlist)| {
+            let (rows, clusters) = clustered(&mut rng, 300, dim, nlist, 0.5);
+            InMemory::build(&params(Metric::L2), &rows, &clusters).unwrap()
+        })
+        .collect();
+    let sp = SearchParams {
+        k: 10,
+        nprobe: 4,
+        rerank: 30,
+    };
+    let mut shared = ctx(64);
+
+    for round in 0..3 {
+        for index in &indexes {
+            let q = gaussian(&mut rng, 1, index.dim, |_| 1.0);
+            let want = bits(index.search(&q, &sp, &mut ctx(64)).unwrap());
+            assert_eq!(bits(index.search(&q, &sp, &mut shared).unwrap()), want, "round {round}");
+        }
+    }
+    assert_eq!(shared.scratch.len(), 3, "one set of buffers per shape");
+}
+
+#[test]
+fn route_lists_the_nearest_clusters_first() {
+    let mut rng = SplitMix64::new(15);
+    let (rows, clusters) = clustered(&mut rng, 300, 128, 12, 0.5);
+    let index = InMemory::build(&params(Metric::L2), &rows, &clusters).unwrap();
+    let mut ctx = ctx(64);
+    let (mut full, mut some) = (Vec::new(), Vec::new());
+
+    let dim = 128;
+    for q in gaussian(&mut rng, 4, dim, |_| 1.0).chunks_exact(dim) {
+        index.route(q, 12, &mut ctx, &mut full).unwrap();
+        let mut sorted = full.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..12).collect::<Vec<u32>>());
+        for n in [1, 3, 7] {
+            index.route(q, n, &mut ctx, &mut some).unwrap();
+            assert_eq!(some, full[..n]);
+        }
+    }
 }

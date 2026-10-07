@@ -123,3 +123,68 @@ pub(crate) fn shuffle<T>(v: &mut [T], rng: &mut SplitMix64) {
         v.swap(i, (rng.next_u64() % (i as u64 + 1)) as usize);
     }
 }
+
+/// Puts `clusters` into `nparents` groups. The group centers are the first `nparents` cluster centers, and each cluster
+/// joins the group with the nearest center.
+pub(crate) fn group(clusters: &mut Clusters, nparents: usize) {
+    let dim = clusters.dim;
+    clusters.parents = clusters.centroids[..nparents * dim].to_vec();
+    clusters.parent_of = clusters
+        .centroids
+        .chunks_exact(dim)
+        .map(|c| nearest(&clusters.parents, dim, c))
+        .collect();
+}
+
+/// A test's file in the system's temporary folder. The name holds the process id, so test runs don't clash. Dropping it
+/// deletes the file and any temporary files a build left next to it, even when the test fails.
+pub(crate) struct TempFile(std::path::PathBuf);
+
+impl std::ops::Deref for TempFile {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TempFile {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        temps_of(&self.0).iter().for_each(|t| {
+            let _ = std::fs::remove_file(t);
+        });
+    }
+}
+
+pub(crate) fn temp_file(name: &str) -> TempFile {
+    TempFile(std::env::temp_dir().join(format!("coldivf-{}-{name}", std::process::id())))
+}
+
+/// The temporary files that builds of `out` left next to it.
+pub(crate) fn temps_of(out: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let (Some(dir), Some(name)) = (out.parent(), out.file_name()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}.", name.to_string_lossy());
+
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let n = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            n.starts_with(&prefix) && n.ends_with(".tmp")
+        })
+        .collect()
+}

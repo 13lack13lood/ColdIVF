@@ -1,5 +1,5 @@
-//! Single instruction, multiple data (SIMD) kernels, chosen at run time from what the CPU supports. This is the only
-//! module with `unsafe` code.
+//! Single instruction, multiple data (SIMD) kernels, chosen at run time from what the CPU supports. Besides `io`, this
+//! is the only module with `unsafe` code.
 
 #[cfg(target_arch = "aarch64")]
 mod neon;

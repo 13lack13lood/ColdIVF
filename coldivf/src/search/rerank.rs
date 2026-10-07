@@ -1,12 +1,15 @@
 //! The rerank, which rescores the best candidates with their 8-bit rows and returns the top `k` as hits.
 
+use std::io::{Error, ErrorKind};
+
 use super::candidates::{Candidate, order};
 use crate::quantization::sq8;
 use crate::{Hit, Metric};
 
 /// Rescores `candidates` with their rows and writes the best `k` into `hits`, by squared distance and then internal id.
 /// `row(id)` returns a vector's row, and `offset` is the query's offset q − μ from the index's mean μ. L2 hits report
-/// the squared distance d². Cosine hits report the similarity 1 − d²/2, where d² is between the normalized vectors.
+/// the squared distance d². Cosine hits report the similarity 1 − d²/2, where d² is between the normalized vectors. A
+/// distance that comes out NaN means a damaged row, and fails with `InvalidData`.
 pub(crate) fn rerank<'r>(
     candidates: &[Candidate],
     row: impl Fn(u32) -> &'r [u8],
@@ -15,7 +18,7 @@ pub(crate) fn rerank<'r>(
     metric: Metric,
     rescored: &mut Vec<Candidate>,
     hits: &mut Vec<Hit>,
-) {
+) -> Result<(), Error> {
     let dim = offset.len();
     let norm2 = offset.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>() as f32;
 
@@ -24,6 +27,10 @@ pub(crate) fn rerank<'r>(
         score: sq8::distance(row(c.id), offset, norm2),
         id: c.id,
     }));
+
+    if rescored.iter().any(|c| c.score.is_nan()) {
+        return Err(Error::new(ErrorKind::InvalidData, "a vector's 8-bit row is damaged"));
+    }
 
     if k == 0 {
         rescored.clear();
@@ -42,6 +49,8 @@ pub(crate) fn rerank<'r>(
             Metric::Cosine => 1.0 - c.score / 2.0,
         },
     }));
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,5 +1,9 @@
 #![allow(unused_variables, dead_code, clippy::ptr_arg)]
 
+mod build;
+mod format;
+mod index;
+mod io;
 mod kernels;
 mod quantization;
 mod search;
@@ -84,40 +88,42 @@ impl Builder {
 
     /// The same, with an imported clustering.
     pub fn build_with_clusters(&self, src: &dyn VectorSource, clusters: &Clusters, out: &Path) -> Result<(), Error> {
-        todo!()
+        build::build_with_clusters(&self.params, src, clusters, out)
     }
 }
 
 /// An open collection, stored as one file. It is cheap to clone and safe to share across threads.
 #[derive(Clone)]
 pub struct Index {
-    inner: Arc<Inner>,
+    inner: Arc<index::Inner>,
 }
 
-struct Inner {}
-
 impl Index {
-    /// Reads the 16 KiB header page and maps the file without loading it. Nothing else is read until a query.
+    /// Reads the header and the rotation, the first 16 KiB up to 2806 dimensions, and maps the file without loading it.
+    /// Nothing else is read until a query. Don't rewrite the file in place while it is open, eg. by copying over it,
+    /// since the index reads it through a memory map. A rebuild that renames a new file over it is safe.
     pub fn open(path: &Path) -> Result<Index, Error> {
-        todo!()
+        Ok(Index {
+            inner: Arc::new(index::Inner::open(path)?),
+        })
     }
 
     /// Call this when the query text arrives. It starts reading the cluster centers, so that read overlaps the
     /// embedding model.
     pub fn prepare(&self, ctx: &mut SearchCtx) -> Result<(), Error> {
-        todo!()
+        self.inner.prepare()
     }
 
     /// Searches with the final query embedding. It picks the nearest clusters, reads them in one batch, scores
     /// their vectors, then reads and rescores the best candidates in a second small batch. The hits live in `ctx`,
     /// so a query allocates nothing.
     pub fn search<'a>(&self, query: &[f32], params: &SearchParams, ctx: &'a mut SearchCtx) -> Result<&'a [Hit], Error> {
-        todo!()
+        self.inner.search(query, params, ctx)
     }
 
-    /// Writes the `nprobe` clusters `query` would read into `out`, nearest first.
+    /// Writes the positions of the `nprobe` clusters `query` would read into `out`, nearest first.
     pub fn route(&self, query: &[f32], nprobe: usize, ctx: &mut SearchCtx, out: &mut Vec<LeafId>) -> Result<(), Error> {
-        todo!()
+        self.inner.route(query, nprobe, ctx, out)
     }
 
     /// Starts reading `leaves` in one batch and returns right away. The handle then ranks those clusters, and only
@@ -137,8 +143,8 @@ impl Index {
     }
 }
 
-/// The whole index in RAM, built from the same codes as an index file. Benchmarks compare against it, and a search of
-/// a file built the same way returns exactly its results.
+/// The whole index in memory, built from the same codes as an index file. Benchmarks compare against it, and a search
+/// of a file built the same way returns exactly its results.
 #[cfg(feature = "inmem")]
 pub struct InMemoryIndex {
     inner: search::inmem::InMemory,
@@ -146,7 +152,8 @@ pub struct InMemoryIndex {
 
 #[cfg(feature = "inmem")]
 impl InMemoryIndex {
-    /// Builds the index from `src` and an imported clustering. It uses `params.metric` and `params.seed`.
+    /// Builds the index from `src` and an imported clustering. It uses `params.metric`, `params.order`,
+    /// `params.page_size` and `params.seed`.
     pub fn build(params: &BuildParams, src: &dyn VectorSource, clusters: &Clusters) -> Result<InMemoryIndex, Error> {
         Ok(InMemoryIndex {
             inner: search::inmem::InMemory::build(params, src, clusters)?,
@@ -178,7 +185,7 @@ pub struct Hit {
     pub score: f32,
 }
 
-/// The largest request a `SearchCtx` must handle. It sizes its buffers from these once.
+/// The largest request a `SearchCtx` must handle. It sizes its buffers from these.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub max_k: usize,
@@ -187,11 +194,11 @@ pub struct Limits {
     pub max_rerank: usize,
 }
 
-/// Per-thread scratch space, reused across queries. It holds the buffers and the read state for each index. It sizes
-/// the buffers for an index on the first search, so run one search before timing.
+/// Per-thread scratch space, reused across queries. It keeps one set of buffers per index shape, i.e. per dimension and
+/// cluster count, made on the first search with that shape. Run one search with each index before timing.
 pub struct SearchCtx {
     limits: Limits,
-    scratch: Option<search::Scratch>,
+    scratch: Vec<search::Scratch>,
     hits: Vec<Hit>,
 }
 
@@ -199,13 +206,14 @@ impl SearchCtx {
     pub fn new(limits: Limits) -> SearchCtx {
         SearchCtx {
             limits,
-            scratch: None,
+            scratch: Vec::new(),
             hits: Vec::with_capacity(limits.max_k),
         }
     }
 }
 
-/// A cluster id, as returned by [`Index::route`].
+/// A cluster's position in the index file, as returned by [`Index::route`]. It is the cluster's row in [`Clusters`]
+/// only with [`LeafOrder::Id`].
 pub type LeafId = u32;
 
 /// Clusters being read in one batch. Rank them for any number of queries. Nothing outside them is ever read.

@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 
 /// A score with an id. It is a vector's estimate or distance with its internal id, or a cluster's route score with the
-/// cluster's id. Scores are never NaN.
+/// cluster's position. A NaN score, which only a damaged file can give, ranks last.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Candidate {
     pub(crate) score: f32,
@@ -18,11 +18,18 @@ impl Candidate {
     };
 }
 
-/// Whether `a` ranks before `b`, with a lower score, or the same score and a lower id. Every path uses this test, so
-/// results never depend on the order of a scan.
+/// Whether `a` ranks before `b`, with a lower score, or the same score and a lower id. A NaN score ranks as +∞, so the
+/// order stays total. Every path uses this test, so results never depend on the order of a scan.
 #[inline]
 pub(crate) fn before(a: Candidate, b: Candidate) -> bool {
-    a.score < b.score || (a.score == b.score && a.id < b.id)
+    let (x, y) = (rank(a.score), rank(b.score));
+    x < y || (x == y && a.id < b.id)
+}
+
+/// A score as it ranks, with NaN as +∞.
+#[inline]
+fn rank(score: f32) -> f32 {
+    if score.is_nan() { f32::INFINITY } else { score }
 }
 
 /// `before` as an ordering, for sorting.

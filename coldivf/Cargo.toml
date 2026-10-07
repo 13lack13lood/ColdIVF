@@ -14,6 +14,12 @@ inmem = []
 # Pure Rust only, so the Mac can cross-compile and check every target.
 # libm: a correctly rounded fused multiply-add that gives the same bits on every platform.
 libm = "0.2.16"
+# zerocopy: the index file's header and tables as little-endian structs with no hidden padding.
+zerocopy = { version = "0.8.60", features = ["derive"] }
+# crc32fast: checksums of the index file's sections.
+crc32fast = "1.5.0"
+# memmap2: maps an index file into memory.
+memmap2 = "0.9.11"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # io-uring: the Linux backend for batched reads.

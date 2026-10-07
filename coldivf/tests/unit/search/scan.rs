@@ -1,4 +1,4 @@
-//! Unit tests for the scan, including the SIMD scan against the portable one.
+//! Unit tests for the scan, including the single instruction, multiple data (SIMD) scan against the portable one.
 
 use super::*;
 use crate::kernels::scan_block;
@@ -73,7 +73,6 @@ fn simd_scan_matches_scalar_bit_for_bit() {
             let block = random_block(&mut rng, d_pad, count);
             let query = random_query(&mut rng, d_pad);
             let first_id = (rng.next_u64() % 1000) as u32;
-
             // An open bound, a lane's own candidate, and a lane's score with a nearby id, so ties get tested.
             let n_all = scan_block(Tier::SCALAR, &block, &query, first_id, count, Candidate::NONE, &mut all);
             assert_eq!(n_all, count, "an open bound keeps every vector");
@@ -86,7 +85,6 @@ fn simd_scan_matches_scalar_bit_for_bit() {
                     id: lane.id + (rng.next_u64() % 3) as u32,
                 },
             };
-
             let na = scan_block(Tier::SCALAR, &block, &query, first_id, count, bound, &mut a);
             let nb = scan_block(best, &block, &query, first_id, count, bound, &mut b);
             let bits = |c: &[Candidate]| c.iter().map(|c| (c.score.to_bits(), c.id)).collect::<Vec<_>>();
