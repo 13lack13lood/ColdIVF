@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["coldivf"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace.dependencies]
+coldivf = { path = "coldivf" }
+
+[profile.release]
+debug = "line-tables-only" # Symbols for profiling with perf, Instruments and Windows Performance Recorder (WPR)
+codegen-units = 1
+lto = "thin"
+
+# Dependencies keep the default 16 codegen units, which builds faster and uses less memory.
+[profile.release.package."*"]
+codegen-units = 16

@@ -1,0 +1,17 @@
+# Rust build output
+target/
+**/target/
+# derived data, generated models and benchmark outputs
+data/
+models/
+results/
+*.fbin
+*.ibin
+*.npy
+*.hdf5
+*.parquet
+# OS / editor noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

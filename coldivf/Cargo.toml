@@ -1,0 +1,20 @@
+[package]
+name = "coldivf"
+description = "One-file IVF over 1-bit RaBitQ FastScan postings with an SQ8 rerank tier, built for cold queries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Exposes the in-RAM reference index to benchmark binaries.
+inmem = []
+
+[dependencies]
+# Pure Rust only, so the Mac can cross-compile and check every target.
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# io-uring: the Linux backend for batched reads.
+
+[target.'cfg(windows)'.dependencies]
+# windows-sys: the Windows backend for batched reads, using IoRing or I/O completion ports (IOCP).

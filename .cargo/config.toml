@@ -1,0 +1,4 @@
+# Runs at most 4 compiler processes at once, so builds can't run the 36 GB Mac out of memory. The default is one
+# per logical CPU (12).
+[build]
+jobs = 4
