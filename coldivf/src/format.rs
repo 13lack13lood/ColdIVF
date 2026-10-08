@@ -131,6 +131,11 @@ pub(crate) struct Layout {
     pub(crate) metric: Metric,
     pub(crate) page_size: usize,
     pub(crate) seed: u64,
+    /// How many compactions the file has had.
+    pub(crate) epoch: u64,
+    /// The header's checksum, which tells this file apart from any other, so a log written for another file is
+    /// ignored.
+    pub(crate) check: u32,
     spans: [Span; 7],
     crcs: [u32; 7],
 }
@@ -248,7 +253,7 @@ fn encode_header(index: &InMemory, spans: &[Span; 7], crcs: &[u32; 7]) -> Vec<u8
         eps0: F32::new(EPS0),
         sections,
         model_id: [0; 64],
-        epoch: U64::new(0),
+        epoch: U64::new(index.epoch),
         crc: U32::new(0),
     };
     header.crc = U32::new(crc32fast::hash(&header.as_bytes()[..size_of::<Header>() - 4]));
@@ -391,6 +396,8 @@ pub(crate) fn read_header(first: &[u8], file_len: usize) -> Result<Layout, Error
         metric,
         page_size,
         seed: h.seed.get(),
+        epoch: h.epoch.get(),
+        check: h.crc.get(),
         spans,
         crcs,
     })
@@ -504,16 +511,19 @@ pub(crate) fn check_extents(bytes: &[u8], layout: &Layout) -> Result<Vec<List>, 
     Ok(lists)
 }
 
+/// The sections that have checksums, every one after the header.
+pub(crate) const CHECKED: [Part; 6] = [
+    Part::Rotation,
+    Part::Centers,
+    Part::Extents,
+    Part::Codes,
+    Part::Rows,
+    Part::Ids,
+];
+
 /// Checks every section's checksum in the whole file `file`.
 pub(crate) fn verify(file: &[u8], layout: &Layout) -> Result<(), Error> {
-    for part in [
-        Part::Rotation,
-        Part::Centers,
-        Part::Extents,
-        Part::Codes,
-        Part::Rows,
-        Part::Ids,
-    ] {
+    for part in CHECKED {
         check_crc(&file[layout.span(part).range()], layout, part)?;
     }
 
@@ -521,7 +531,12 @@ pub(crate) fn verify(file: &[u8], layout: &Layout) -> Result<(), Error> {
 }
 
 fn check_crc(bytes: &[u8], layout: &Layout, part: Part) -> Result<(), Error> {
-    if crc32fast::hash(bytes) != layout.crcs[part as usize] {
+    check_section(layout, part, crc32fast::hash(bytes))
+}
+
+/// Checks that `crc`, the checksum of section `part`, matches the one in the header.
+pub(crate) fn check_section(layout: &Layout, part: Part, crc: u32) -> Result<(), Error> {
+    if crc != layout.crcs[part as usize] {
         return Err(damaged("a section's checksum doesn't match"));
     }
 

@@ -313,3 +313,97 @@ fn macos_falls_back_only_when_the_file_system_refuses_the_hint() {
     macos::advise(&cold.file, 1 << 30, 16384).unwrap();
     assert_eq!((cold.wave)().page(), 16384);
 }
+
+#[test]
+fn a_warm_up_that_a_clear_interrupted_leaves_the_bit_clear() {
+    let warmth = Warmth::default();
+    let mark = warmth.mark();
+    warmth.finish(mark);
+    assert!(warmth.is_warm());
+
+    // A clear between the start and the end of a warm-up wins.
+    let mark = warmth.mark();
+    warmth.set(false);
+    warmth.finish(mark);
+    assert!(!warmth.is_warm());
+    warmth.set(true);
+    assert!(warmth.is_warm());
+}
+
+#[test]
+fn a_clear_racing_a_finish_always_wins() {
+    use std::hint::spin_loop;
+    use std::sync::Arc;
+
+    let warmth = Arc::new(Warmth::default());
+    // Rounds start and end on spins rather than locks, so the two calls of a round run close together.
+    let (go, done) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let rounds = 20_000;
+    let (w, g, d) = (Arc::clone(&warmth), Arc::clone(&go), Arc::clone(&done));
+    let clearer = std::thread::spawn(move || {
+        for round in 1..=rounds {
+            while g.load(Ordering::Acquire) != round {
+                spin_loop();
+            }
+            (0..round % 8).for_each(|_| spin_loop());
+            w.set(false);
+            d.store(round, Ordering::Release);
+        }
+    });
+
+    // Each clear comes after the warm-up's mark, so the bit must end clear whichever call runs first.
+    for round in 1..=rounds {
+        let mark = warmth.mark();
+        go.store(round, Ordering::Release);
+        (0..round / 8 % 8).for_each(|_| spin_loop());
+        warmth.finish(mark);
+        while done.load(Ordering::Acquire) != round {
+            spin_loop();
+        }
+        assert!(!warmth.is_warm(), "round {round}");
+    }
+
+    clearer.join().unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_memory_pressure_warning_clears_the_warm_bit() {
+    let warmth = std::sync::Arc::new(Warmth::default());
+    warmth.set(true);
+    let mut context = std::sync::Arc::clone(&warmth);
+    // SAFETY: the handler reads its context as an `Arc<Warmth>`, which `context` is, and it outlives the call.
+    unsafe { macos::on_pressure(&mut context as *mut std::sync::Arc<Warmth> as *mut std::ffi::c_void) };
+    assert!(!warmth.is_warm());
+
+    // A watch starts and stops cleanly, and frees its context.
+    for _ in 0..10 {
+        let pressure = Pressure::watch(std::sync::Arc::clone(&warmth));
+        assert!(pressure._watch.is_some());
+    }
+    let start = std::time::Instant::now();
+    while std::sync::Arc::strong_count(&warmth) > 2 {
+        assert!(start.elapsed().as_secs() < 10, "a watch never freed its context");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn the_pool_starts_only_the_threads_a_wave_needs() {
+    let (_, cold, _path) = random_file("threads.bin", 100_000);
+    let mut wave = PoolWave::default();
+    let mut arena = vec![0u8; 3 * 4096];
+
+    wave.submit(0, &cold.file, &[], &mut arena).unwrap();
+    assert_eq!(wave.started(), 0);
+    let ranges: Vec<Range> = (0..3)
+        .map(|i| Range {
+            offset: i * 8192,
+            len: 4096,
+            tag: i,
+            at: i * 4096,
+        })
+        .collect();
+    wave.submit(0, &cold.file, &ranges, &mut arena).unwrap();
+    assert_eq!(wave.started(), 3);
+}

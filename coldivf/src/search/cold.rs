@@ -44,6 +44,8 @@ pub(crate) struct Reads {
     /// The row pages read early for a guess at the query, and whether that wave may still be arriving.
     early: Batch,
     early_pending: bool,
+    /// Whether the last `start_rows` needs some of the early rows.
+    early_used: bool,
     /// The row pages that the final query needs and the early wave didn't read.
     late: Batch,
 }
@@ -84,6 +86,7 @@ impl Reads {
             failed: false,
             early: Batch::new(keep, row_arena),
             early_pending: false,
+            early_used: false,
             late: Batch::new(keep, row_arena),
         }
     }
@@ -112,6 +115,14 @@ impl Reads {
         self.wave.submit(MAIN, file, &c.ranges, &mut c.arena)?;
         (self.clusters_in, self.failed) = (c.ranges.is_empty(), false);
         Ok(())
+    }
+
+    /// Forgets every fetch and row wave, eg. before a search that scans its clusters in place and reads only rows.
+    pub(crate) fn forget(&mut self) {
+        (self.clusters_in, self.failed, self.early_pending) = (true, false, false);
+        self.clusters.clear();
+        self.early.clear();
+        self.late.clear();
     }
 
     /// Scans every fetched cluster for the query in `s`. While the fetch is still arriving, it scans each range as it
@@ -149,7 +160,7 @@ impl Reads {
         self.early_pending = false;
         let e = &mut self.early;
         e.keys.clear();
-        e.keys.extend(candidates.iter().map(|c| self.rows.page_of(c.id)));
+        e.keys.extend(self.rows.pages(candidates));
         e.keys.sort_unstable();
         e.keys.dedup();
         self.rows.plan(e, self.page, self.file_len);
@@ -166,22 +177,32 @@ impl Reads {
     /// Reads the rows of `candidates`. It starts reading the rows that the early wave didn't before it waits for the
     /// early rows, and it skips the wait when none of them are needed.
     pub(crate) fn read_rows(&mut self, file: &File, candidates: &[Candidate]) -> Result<(), Error> {
+        self.start_rows(file, candidates)?;
+        self.finish_rows(file)
+    }
+
+    /// Starts reading the rows of `candidates` that the early wave didn't, so other reads can start before the wait.
+    pub(crate) fn start_rows(&mut self, file: &File, candidates: &[Candidate]) -> Result<(), Error> {
         let (e, l) = (&mut self.early, &mut self.late);
         l.keys.clear();
-        l.keys.extend(candidates.iter().map(|c| self.rows.page_of(c.id)));
+        l.keys.extend(self.rows.pages(candidates));
         l.keys.sort_unstable();
         l.keys.dedup();
         let needed = l.keys.len();
         l.keys.retain(|p| e.keys.binary_search(p).is_err());
         self.rows.plan(l, self.page, self.file_len);
-        self.wave.submit(MAIN, file, &l.ranges, &mut l.arena)?;
+        self.early_used = l.keys.len() < needed;
+        self.wave.submit(MAIN, file, &l.ranges, &mut l.arena)
+    }
 
-        if l.keys.len() < needed && self.early_pending {
-            drain(&mut *self.wave, EARLY, file, e)?;
+    /// Waits for the rows that `start_rows` started, and for the early rows when some of them are needed.
+    pub(crate) fn finish_rows(&mut self, file: &File) -> Result<(), Error> {
+        if self.early_used && self.early_pending {
+            drain(&mut *self.wave, EARLY, file, &mut self.early)?;
         }
 
         self.early_pending = false;
-        drain(&mut *self.wave, MAIN, file, l)
+        drain(&mut *self.wave, MAIN, file, &mut self.late)
     }
 
     /// The row of internal id `id`, which one of the row waves read.
@@ -245,6 +266,8 @@ impl Batch {
 /// Where the rows section starts, and how it packs rows into pages.
 #[derive(Clone, Copy)]
 struct RowSection {
+    /// How many rows the file holds. Candidates past them are inserts, whose rows are in memory.
+    count: usize,
     offset: usize,
     row_bytes: usize,
     per_page: usize,
@@ -254,6 +277,7 @@ struct RowSection {
 impl RowSection {
     fn new(layout: &Layout) -> RowSection {
         RowSection {
+            count: layout.count,
             offset: layout.span(Part::Rows).offset,
             row_bytes: sq8::row_bytes(layout.dim),
             per_page: sq8::rows_per_page(layout.dim, layout.page_size),
@@ -263,6 +287,12 @@ impl RowSection {
 
     fn page_of(&self, id: u32) -> u32 {
         id / self.per_page as u32
+    }
+
+    /// The pages of the rows of `candidates` that the file holds.
+    fn pages<'a>(&'a self, candidates: &'a [Candidate]) -> impl Iterator<Item = u32> + 'a {
+        let file = candidates.iter().filter(|c| (c.id as usize) < self.count);
+        file.map(|c| self.page_of(c.id))
     }
 
     /// The most arena bytes that one row page takes once its read rounds out to `page` boundaries. Row pages sit at

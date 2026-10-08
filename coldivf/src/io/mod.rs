@@ -11,6 +11,7 @@ pub(crate) mod portable;
 use std::fs::File;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A run of bytes in a file, eg. a section or one cluster's blocks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -199,6 +200,19 @@ pub(crate) fn will_need(file: &File, offset: usize, len: usize) {
     let _ = (file, offset, len);
 }
 
+/// Reads `buf.len()` bytes from `offset` of the cold handle `file` so that they also land in the operating system's
+/// cache. The macOS handle skips the cache, but what `F_RDADVISE` reads ahead lands there anyway, so on macOS the read
+/// asks for that first, and a file system that refuses the hint fails the read.
+pub(crate) fn read_cached(file: &File, buf: &mut [u8], offset: usize) -> Result<(), Error> {
+    #[cfg(target_os = "macos")]
+    macos::advise(file, offset, buf.len())?;
+
+    #[cfg(not(target_os = "macos"))]
+    will_need(file, offset, buf.len());
+
+    read_at(file, buf, offset)
+}
+
 /// The next range of a lane's last submit to hand over, and how many it has.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Cursor {
@@ -224,6 +238,77 @@ impl Cursor {
     fn peek(&self) -> Option<usize> {
         (self.next < self.count).then_some(self.next)
     }
+}
+
+/// Whether an index's cluster blocks are known to be in the operating system's cache. It also counts the events that
+/// cleared it, so a warm-up that one of them interrupted doesn't set it afterwards. Both live in one number, the count
+/// times 2 plus 1 when warm, so a warm-up checks the count and sets the bit in one step.
+#[derive(Default)]
+pub(crate) struct Warmth {
+    state: AtomicU64,
+}
+
+impl Warmth {
+    pub(crate) fn is_warm(&self) -> bool {
+        self.state.load(Ordering::Acquire) & 1 == 1
+    }
+
+    pub(crate) fn set(&self, warm: bool) {
+        if warm {
+            self.state.fetch_or(1, Ordering::AcqRel);
+        } else {
+            // Adding 2 counts the clear before the bit drops, so a warm-up that finishes in between fails its check.
+            self.state.fetch_add(2, Ordering::AcqRel);
+            self.state.fetch_and(!1, Ordering::AcqRel);
+        }
+    }
+
+    /// A mark of the clears so far, for `finish`.
+    pub(crate) fn mark(&self) -> u64 {
+        self.state.load(Ordering::Acquire) >> 1
+    }
+
+    /// Sets the bit after a warm-up that started at `mark`, unless something cleared it since.
+    pub(crate) fn finish(&self, mark: u64) {
+        let _ = self
+            .state
+            .compare_exchange(mark << 1, mark << 1 | 1, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// A watch that clears an index's warm bit when the system runs short of memory. Only macOS has one so far, so
+/// elsewhere it does nothing.
+pub(crate) struct Pressure {
+    #[cfg(target_os = "macos")]
+    _watch: Option<macos::PressureWatch>,
+}
+
+impl Pressure {
+    pub(crate) fn watch(warmth: std::sync::Arc<Warmth>) -> Pressure {
+        #[cfg(target_os = "macos")]
+        return Pressure {
+            _watch: macos::PressureWatch::new(warmth),
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = warmth;
+            Pressure {}
+        }
+    }
+}
+
+/// Lowers the calling thread's priority for background work, eg. a warm-up. macOS runs it at utility quality of
+/// service (QoS), Linux gives it a nice value of 10, and elsewhere it does nothing.
+pub(crate) fn background() {
+    #[cfg(target_os = "macos")]
+    macos::utility();
+
+    #[cfg(target_os = "linux")]
+    // SAFETY: setpriority takes only integers, and on Linux a `who` of 0 means the calling thread.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 10)
+    };
 }
 
 /// Hands over the ranges of each lane's submit in order, reading each one when asked for it.

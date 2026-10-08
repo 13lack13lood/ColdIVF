@@ -19,13 +19,31 @@ pub(crate) fn rerank<'r>(
     rescored: &mut Vec<Candidate>,
     hits: &mut Vec<Hit>,
 ) -> Result<(), Error> {
+    rerank_live(candidates, row, |_, _| true, offset, k, metric, rescored, hits)
+}
+
+/// The same, skipping each candidate for which `live(id, row)` is false, eg. one that a delete hid.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rerank_live<'r>(
+    candidates: &[Candidate],
+    row: impl Fn(u32) -> &'r [u8],
+    live: impl Fn(u32, &[u8]) -> bool,
+    offset: &[f32],
+    k: usize,
+    metric: Metric,
+    rescored: &mut Vec<Candidate>,
+    hits: &mut Vec<Hit>,
+) -> Result<(), Error> {
     let dim = offset.len();
     let norm2 = offset.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>() as f32;
 
     rescored.clear();
-    rescored.extend(candidates.iter().map(|c| Candidate {
-        score: sq8::distance(row(c.id), offset, norm2),
-        id: c.id,
+    rescored.extend(candidates.iter().filter_map(|c| {
+        let r = row(c.id);
+        live(c.id, r).then(|| Candidate {
+            score: sq8::distance(r, offset, norm2),
+            id: c.id,
+        })
     }));
 
     if rescored.iter().any(|c| c.score.is_nan()) {

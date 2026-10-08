@@ -1,11 +1,13 @@
 //! Search, which picks the clusters to read, scans their 1-bit codes and rescores the best candidates with their 8-bit
 //! rows. A query runs in three steps:
-//! 1. Route: score every cluster center with its 4-bit code and keep the `nprobe` nearest.
+//! 1. Route: score every cluster center with its 4-bit code and keep the `nprobe` nearest, or those of them within the
+//!    reach.
 //! 2. Scan: estimate the distance to every vector in those clusters, 32 at a time, and keep the best candidates.
 //! 3. Rerank: rescore the candidates with their 8-bit rows and return the top `k`.
 //!
 //! Candidates and results are ordered by score and then internal id, so they never depend on the order of the scan.
 
+pub(crate) mod calibrate;
 pub(crate) mod candidates;
 pub(crate) mod cold;
 pub(crate) mod inmem;
@@ -23,7 +25,7 @@ use crate::quantization::sq4::QueryS8;
 use crate::{Hit, LeafId, Limits, Metric, SearchCtx, SearchParams};
 use candidates::{Candidate, Candidates};
 use rerank::rerank;
-use route::{Centers, route};
+use route::{Centers, route, within_reach};
 use scan::scan_list;
 
 /// The largest squared length a query's or a vector's offset from the mean may have, a quarter of the largest f32, so
@@ -90,32 +92,7 @@ pub(crate) fn run<'a>(
     } = ctx;
     let s = scratch_for(scratch, view.dim, view.lists.len(), limits);
     prepare_query(view, query, s)?;
-    route(
-        view.tier,
-        &view.centers,
-        &s.q8,
-        s.lut.k.t2,
-        params.nprobe,
-        &mut s.dots,
-        &mut s.routes,
-    );
-    s.candidates.reset(params.rerank.max(params.k));
-    let size = block_bytes(padded_dim(view.dim));
-
-    for r in &s.routes {
-        let list = view.lists[r.id as usize];
-        let blocks = &data.blocks[list.offset..list.offset + list.count.div_ceil(BLOCK) * size];
-        scan_list(
-            view.tier,
-            blocks,
-            list.count,
-            list.first_id,
-            &s.lut,
-            &mut s.candidates,
-            &mut s.survivors,
-        );
-    }
-
+    scan_in_place(view, data.blocks, params, s);
     let row = |id: u32| data.rows.row(id);
     rerank(
         s.candidates.as_slice(),
@@ -130,11 +107,55 @@ pub(crate) fn run<'a>(
     Ok(&hits[..])
 }
 
-/// Writes the `nprobe` clusters nearest the query into `out`, nearest first.
+/// Routes the query that `s` holds and scans the `params.nprobe` nearest clusters, or those of them within
+/// `params.reach`, reading their blocks in place from `blocks`. It leaves the best `max(params.rerank, params.k)`
+/// candidates in `s`.
+pub(crate) fn scan_in_place(view: &View, blocks: &[u8], params: &SearchParams, s: &mut Scratch) {
+    route(
+        view.tier,
+        &view.centers,
+        &s.q8,
+        s.lut.k.t2,
+        params.nprobe,
+        &mut s.dots,
+        &mut s.routes,
+    );
+    s.routes.truncate(within_reach(&s.routes, params.reach));
+    s.candidates.reset(params.rerank.max(params.k));
+    let Scratch {
+        routes,
+        lut,
+        candidates,
+        survivors,
+        ..
+    } = s;
+    scan_lists(view, blocks, routes.iter().map(|r| r.id), lut, candidates, survivors);
+}
+
+/// Scans the clusters `leaves`, reading their blocks in place from `blocks`, and offers their vectors to `candidates`.
+pub(crate) fn scan_lists(
+    view: &View,
+    blocks: &[u8],
+    leaves: impl Iterator<Item = LeafId>,
+    lut: &QueryLut,
+    candidates: &mut Candidates,
+    survivors: &mut [Candidate; BLOCK],
+) {
+    let size = block_bytes(padded_dim(view.dim));
+
+    for leaf in leaves {
+        let list = view.lists[leaf as usize];
+        let blocks = &blocks[list.offset..list.offset + list.count.div_ceil(BLOCK) * size];
+        scan_list(view.tier, blocks, list.count, list.first_id, lut, candidates, survivors);
+    }
+}
+
+/// Writes the `nprobe` clusters nearest the query into `out`, nearest first, keeping only those within `reach`.
 pub(crate) fn run_route(
     view: &View,
     query: &[f32],
     nprobe: usize,
+    reach: Option<f32>,
     ctx: &mut SearchCtx,
     out: &mut Vec<LeafId>,
 ) -> Result<(), Error> {
@@ -142,6 +163,7 @@ pub(crate) fn run_route(
         k: 0,
         nprobe,
         rerank: 0,
+        reach,
     };
     check_search(query, view.dim, &params, &ctx.limits)?;
 
@@ -158,7 +180,7 @@ pub(crate) fn run_route(
         &mut s.routes,
     );
     out.clear();
-    out.extend(s.routes.iter().map(|r| r.id));
+    out.extend(s.routes[..within_reach(&s.routes, reach)].iter().map(|r| r.id));
 
     Ok(())
 }
@@ -214,7 +236,12 @@ pub(crate) struct Scratch {
 }
 
 impl Scratch {
-    fn new(dim: usize, nlist: usize, limits: &Limits) -> Scratch {
+    /// Whether this scratch fits an index with this dimension and cluster count.
+    pub(crate) fn fits(&self, dim: usize, nlist: usize) -> bool {
+        (self.dim, self.nlist) == (dim, nlist)
+    }
+
+    pub(crate) fn new(dim: usize, nlist: usize, limits: &Limits) -> Scratch {
         let keep = limits.max_rerank.max(limits.max_k);
         Scratch {
             dim,
@@ -264,6 +291,10 @@ pub(crate) fn check_search(query: &[f32], dim: usize, params: &SearchParams, lim
 
     if !query.iter().all(|x| x.is_finite()) {
         return Err(invalid("the query has a value that isn't finite"));
+    }
+
+    if params.reach.is_some_and(|r| !(r.is_finite() && r >= 0.0)) {
+        return Err(invalid("the reach must be finite and at least 0"));
     }
 
     Ok(())

@@ -142,7 +142,8 @@ pub(crate) fn group(clusters: &mut Clusters, nparents: usize) {
 }
 
 /// A test's file in the system's temporary folder. The name holds the process id, so test runs don't clash. Dropping it
-/// deletes the file and any temporary files a build left next to it, even when the test fails.
+/// deletes the file, any temporary files a build left next to it, and its change log and lock file, even when the test
+/// fails.
 pub(crate) struct TempFile(std::path::PathBuf);
 
 impl std::ops::Deref for TempFile {
@@ -165,6 +166,8 @@ impl Drop for TempFile {
         temps_of(&self.0).iter().for_each(|t| {
             let _ = std::fs::remove_file(t);
         });
+        let _ = std::fs::remove_file(crate::update::log_path(&self.0));
+        let _ = std::fs::remove_file(crate::update::lock_path(&self.0));
     }
 }
 
@@ -336,6 +339,41 @@ impl<const WAVE: usize> Wave for EndsEarly<WAVE> {
             _ => {}
         }
 
+        self.inner.next(lane, file, ranges, arena)
+    }
+}
+
+thread_local! {
+    /// What a `Hooked` backend runs on its chosen submit, set by a test on the thread that then searches.
+    pub(crate) static HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A read backend for tests that reads like the portable one, except that submit number `WAVE`, counting from 1 across
+/// both lanes, first runs the hook in `HOOK`, eg. a change that lands in the middle of a search.
+#[derive(Default)]
+pub(crate) struct Hooked<const WAVE: usize> {
+    submits: usize,
+    inner: PortableWave,
+}
+
+impl<const WAVE: usize> Wave for Hooked<WAVE> {
+    fn page(&self) -> usize {
+        4096
+    }
+
+    fn submit(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<(), Error> {
+        self.submits += 1;
+
+        if self.submits == WAVE
+            && let Some(hook) = HOOK.with_borrow_mut(Option::take)
+        {
+            hook();
+        }
+
+        self.inner.submit(lane, file, ranges, arena)
+    }
+
+    fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<Option<usize>, Error> {
         self.inner.next(lane, file, ranges, arena)
     }
 }

@@ -1,5 +1,6 @@
 //! Building index files.
 
+pub(crate) mod kmeans;
 pub(crate) mod order;
 
 use std::fs::{self, File, OpenOptions};
@@ -7,10 +8,22 @@ use std::io::{Error, ErrorKind, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rayon::{ThreadPool, ThreadPoolBuilder};
+
 use crate::format;
-use crate::search::inmem::InMemory;
+use crate::search::inmem::{InMemory, check_settings};
 use crate::search::invalid;
-use crate::{BuildParams, Clusters, VectorSource};
+use crate::{BuildParams, Clusters, Metric, VectorSource};
+use kmeans::KMeans;
+
+/// Rounds of k-means.
+const ROUNDS: usize = 20;
+
+/// Clusters `src` with k-means, then builds the index like `build_with_clusters` and writes it to `out`.
+pub(crate) fn build(params: &BuildParams, src: &dyn VectorSource, out: &Path) -> Result<(), Error> {
+    let clusters = cluster(params, src, &threads(params.threads)?)?;
+    build_with_clusters(params, src, &clusters, out)
+}
 
 /// Builds the index from `src` and an imported clustering, and writes it to `out`.
 pub(crate) fn build_with_clusters(
@@ -20,8 +33,83 @@ pub(crate) fn build_with_clusters(
     out: &Path,
 ) -> Result<(), Error> {
     let index = InMemory::build(params, src, clusters)?;
-
     write(&index, out)
+}
+
+/// Finds about `params.vectors_per_list` vectors per cluster with k-means on all of `src`, then `params.parents` groups
+/// with k-means on the cluster centers, at most one group per cluster. Every setting is checked first, so a bad one
+/// fails before any clustering.
+pub(crate) fn cluster(params: &BuildParams, src: &dyn VectorSource, pool: &ThreadPool) -> Result<Clusters, Error> {
+    let (n, dim) = (src.count(), src.dim());
+    check_settings(n, dim, params.page_size)?;
+
+    if n == 0 || params.vectors_per_list == 0 || params.parents == 0 {
+        return Err(invalid(
+            "a build needs vectors, and at least one vector per cluster and one group",
+        ));
+    }
+
+    let nlist = n.div_ceil(params.vectors_per_list);
+
+    if params.parents.min(nlist) > usize::from(u16::MAX) {
+        return Err(invalid("an index holds at most 65535 groups"));
+    }
+
+    let leaves = KMeans {
+        k: nlist,
+        rounds: ROUNDS,
+        sample: usize::MAX,
+        spherical: false,
+        seed: params.seed,
+    };
+    let centroids = kmeans::train(&leaves, src, params.metric, pool)?;
+    let assignment = kmeans::assign(&centroids, src, params.metric, pool)?;
+    let groups = KMeans {
+        k: params.parents.min(leaves.k),
+        seed: params.seed.wrapping_add(1),
+        ..leaves
+    };
+    let centers = Slice { dim, data: &centroids };
+    let parents = kmeans::train(&groups, &centers, Metric::L2, pool)?;
+    let parent_of = kmeans::assign(&parents, &centers, Metric::L2, pool)?;
+
+    Ok(Clusters {
+        dim,
+        centroids,
+        assignment,
+        parents,
+        parent_of,
+    })
+}
+
+/// A pool of `threads` threads. With 0 it takes rayon's default, `RAYON_NUM_THREADS` when that is set and otherwise one
+/// thread per logical CPU.
+pub(crate) fn threads(threads: usize) -> Result<ThreadPool, Error> {
+    ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("coldivf-build-{i}"))
+        .build()
+        .map_err(Error::other)
+}
+
+/// Vectors already in memory, eg. the cluster centers.
+pub(crate) struct Slice<'a> {
+    pub(crate) dim: usize,
+    pub(crate) data: &'a [f32],
+}
+
+impl VectorSource for Slice<'_> {
+    fn count(&self) -> usize {
+        self.data.len() / self.dim
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn rows(&self, start: usize, rows: usize) -> &[f32] {
+        &self.data[start * self.dim..(start + rows) * self.dim]
+    }
 }
 
 /// Writes `index` to `out`. It writes a temporary file next to `out`, with the header last, syncs it, then renames it

@@ -3,9 +3,13 @@
 
 use std::io::Error;
 
+use rayon::ThreadPool;
+use rayon::prelude::*;
+
 use super::route::Centers;
 use super::{InPlace, LIMIT, List, RowPages, View, invalid, normalize, run, run_route};
 use crate::build::order::leaf_order;
+use crate::build::threads;
 use crate::kernels::Tier;
 use crate::quantization::rabitq::{BLOCK, Encoder, Factors, block_bytes, code_bytes, pack_block};
 use crate::quantization::rotation::Rotation;
@@ -22,6 +26,9 @@ pub(crate) const MAX_DIM: usize = 4080;
 /// Rows read from the source at a time.
 const CHUNK: usize = 4096;
 
+/// Chunks encoded at once for each thread.
+const BATCH: usize = 2;
+
 /// The largest page size.
 const MAX_PAGE: usize = 1 << 20;
 
@@ -29,6 +36,8 @@ pub(crate) struct InMemory {
     pub(crate) dim: usize,
     pub(crate) metric: Metric,
     pub(crate) seed: u64,
+    /// How many compactions the index has had.
+    pub(crate) epoch: u64,
     pub(crate) page_size: usize,
     pub(crate) mean: Vec<f32>,
     pub(crate) rotation: Rotation,
@@ -51,31 +60,34 @@ pub(crate) struct InMemory {
 
 impl InMemory {
     /// Builds the index from `src` and an imported clustering. It uses `params.metric`, `params.order`,
-    /// `params.page_size` and `params.seed`. The vectors in each cluster keep their input order, and a vector's id is
-    /// its input row.
+    /// `params.page_size`, `params.seed` and `params.threads`, and gives the same index for any number of threads. The
+    /// vectors in each cluster keep their input order, and a vector's id is its input row.
     pub(crate) fn build(params: &BuildParams, src: &dyn VectorSource, clusters: &Clusters) -> Result<InMemory, Error> {
-        let (n, dim) = (src.count(), src.dim());
-        let (nlist, nparents) = check_input(n, dim, clusters)?;
-        let metric = params.metric;
-        let rb = sq8::row_bytes(dim);
+        Self::build_ids(params, src, clusters, None)
+    }
 
-        if !params.page_size.is_multiple_of(4096) || params.page_size < rb || params.page_size > MAX_PAGE {
-            return Err(invalid(
-                "the page size must be a multiple of 4096, at most 1 MiB, that holds a row",
-            ));
+    /// The same, with `ids[r]` as the id of input row r instead of r itself.
+    pub(crate) fn build_ids(
+        params: &BuildParams,
+        src: &dyn VectorSource,
+        clusters: &Clusters,
+        ids: Option<&[u64]>,
+    ) -> Result<InMemory, Error> {
+        let (n, dim) = (src.count(), src.dim());
+
+        if ids.is_some_and(|ids| ids.len() != n) {
+            return Err(invalid("every vector needs an id"));
         }
 
-        let mut sum = vec![0f64; dim];
-
-        for_each_row(src, metric, |_, o| {
-            sum.iter_mut().zip(o).for_each(|(s, &x)| *s += f64::from(x));
-            Ok(())
-        })?;
-
-        let mean: Vec<f32> = sum
-            .iter()
-            .map(|&s| if n == 0 { 0.0 } else { (s / n as f64) as f32 })
+        check_settings(n, dim, params.page_size)?;
+        let (nlist, nparents) = check_input(n, dim, clusters)?;
+        let metric = params.metric;
+        let pool = threads(params.threads)?;
+        let chunks: Vec<&[f32]> = (0..n)
+            .step_by(CHUNK)
+            .map(|start| src.rows(start, CHUNK.min(n - start)))
             .collect();
+        let mean = mean(&chunks, dim, metric, &pool)?;
         let rotation = Rotation::new(dim, params.seed);
         let order = leaf_order(params.order, clusters, &mean);
         let mut position = vec![0u32; nlist];
@@ -87,45 +99,33 @@ impl InMemory {
         let d_pad = padded_dim(dim);
         let size = block_bytes(d_pad);
         let lists = lists(&clusters.assignment, &order, size);
-        let (cb, per_page) = (code_bytes(d_pad), params.page_size / rb);
-        let mut codes = vec![0u8; n * cb];
-        let mut factors = vec![Factors::EMPTY; n];
-        let mut rows = vec![0u8; n.div_ceil(per_page) * params.page_size];
-        let mut ids = vec![0u64; n];
+        // The vectors of each cluster keep their input order.
         let mut next: Vec<u32> = lists.iter().map(|l| l.first_id).collect();
-        let mut encoder = Encoder::new(&rotation, &mean);
-
-        for_each_row(src, metric, |r, o| {
-            let p = position[clusters.assignment[r] as usize] as usize;
-            let id = next[p] as usize;
-            next[p] += 1;
-            let f = encoder.encode(o, &mut codes[id * cb..(id + 1) * cb]);
-            let at = (id / per_page) * params.page_size + (id % per_page) * rb;
-            let row = &mut rows[at..at + rb];
-            sq8::write_row(o, &mean, r as u64, row);
-            if !(fits(f.f_add) && f.f_rescale.is_finite() && f.f_err.is_finite() && fits(sq8::norm2(row, dim))) {
-                return Err(invalid("a vector is too far from the mean to encode"));
-            }
-            factors[id] = f;
-            ids[id] = r as u64;
-            Ok(())
-        })?;
-
-        let mut blocks = vec![0u8; lists.last().map_or(0, |l| l.offset + l.count.div_ceil(BLOCK) * size)];
-
-        for list in &lists {
-            for b in 0..list.count.div_ceil(BLOCK) {
-                let first = list.first_id as usize + BLOCK * b;
-                let last = (first + BLOCK).min(list.first_id as usize + list.count);
-                let at = list.offset + b * size;
-                pack_block(
-                    &codes[first * cb..last * cb],
-                    &factors[first..last],
-                    d_pad,
-                    &mut blocks[at..at + size],
-                );
-            }
+        let id_of: Vec<u32> = clusters
+            .assignment
+            .iter()
+            .map(|&c| {
+                let p = position[c as usize] as usize;
+                next[p] += 1;
+                next[p] - 1
+            })
+            .collect();
+        let external = |r: usize| ids.map_or(r as u64, |ids| ids[r]);
+        let mut row_ids = vec![0u64; n];
+        id_of
+            .iter()
+            .enumerate()
+            .for_each(|(r, &id)| row_ids[id as usize] = external(r));
+        let Encoded { codes, factors, rows } = Encoding {
+            dim,
+            metric,
+            mean: &mean,
+            rotation: &rotation,
+            page_size: params.page_size,
+            ids,
         }
+        .run(&chunks, &id_of, &pool)?;
+        let blocks = pack(&lists, &codes, &factors, d_pad, &pool);
 
         let ccb = sq4::code_bytes(d_pad);
         let mut centers = vec![0u8; nlist * ccb];
@@ -156,6 +156,7 @@ impl InMemory {
             dim,
             metric,
             seed: params.seed,
+            epoch: 0,
             page_size: params.page_size,
             mean,
             rotation,
@@ -166,7 +167,7 @@ impl InMemory {
             lists,
             blocks,
             rows,
-            ids,
+            ids: row_ids,
             tier: Tier::best(),
         })
     }
@@ -211,15 +212,17 @@ impl InMemory {
         run(&self.view(), &self.in_place(), query, params, ctx)
     }
 
-    /// Writes the `nprobe` clusters nearest the query into `out`, nearest first, by file position.
+    /// Writes the `nprobe` clusters nearest the query into `out`, nearest first, by file position, keeping only those
+    /// within `reach`.
     pub(crate) fn route(
         &self,
         query: &[f32],
         nprobe: usize,
+        reach: Option<f32>,
         ctx: &mut SearchCtx,
         out: &mut Vec<LeafId>,
     ) -> Result<(), Error> {
-        run_route(&self.view(), query, nprobe, ctx, out)
+        run_route(&self.view(), query, nprobe, reach, ctx, out)
     }
 
     /// The same index with another kernel tier, so tests can check that every tier gives the same results.
@@ -230,12 +233,27 @@ impl InMemory {
     }
 }
 
-/// Checks the input and the clustering, and returns the number of clusters and of cluster groups.
-fn check_input(n: usize, dim: usize, clusters: &Clusters) -> Result<(usize, usize), Error> {
+/// Checks the dimension, the vector count and the page size, the settings that need no clustering.
+pub(crate) fn check_settings(n: usize, dim: usize, page_size: usize) -> Result<(), Error> {
     if !(MIN_DIM..=MAX_DIM).contains(&dim) {
         return Err(invalid("the dimension must be 128 to 4080"));
     }
 
+    if n > u32::MAX as usize - BLOCK {
+        return Err(invalid("an index holds at most 2^32 − 33 vectors"));
+    }
+
+    if !page_size.is_multiple_of(4096) || page_size < sq8::row_bytes(dim) || page_size > MAX_PAGE {
+        return Err(invalid(
+            "the page size must be a multiple of 4096, at most 1 MiB, that holds a row",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Checks the clustering of `n` vectors of `dim` values, and returns the number of clusters and of cluster groups.
+fn check_input(n: usize, dim: usize, clusters: &Clusters) -> Result<(usize, usize), Error> {
     if clusters.dim != dim {
         return Err(invalid("the clusters' dimension doesn't match the vectors"));
     }
@@ -261,10 +279,6 @@ fn check_input(n: usize, dim: usize, clusters: &Clusters) -> Result<(usize, usiz
         return Err(invalid("every cluster needs the id of an existing group"));
     }
 
-    if n > u32::MAX as usize - BLOCK {
-        return Err(invalid("an index holds at most 2^32 − 33 vectors"));
-    }
-
     if !clusters
         .centroids
         .iter()
@@ -277,31 +291,160 @@ fn check_input(n: usize, dim: usize, clusters: &Clusters) -> Result<(usize, usiz
     Ok((nlist, nparents))
 }
 
-/// Calls `f` with each input row, in order, normalized for cosine. It fails on a value that isn't finite, on a zero
-/// vector with cosine, or when `f` fails.
-fn for_each_row(
-    src: &dyn VectorSource,
-    metric: Metric,
-    mut f: impl FnMut(usize, &[f32]) -> Result<(), Error>,
-) -> Result<(), Error> {
-    let (n, dim) = (src.count(), src.dim());
-    let mut row = vec![0f32; dim];
+/// Copies the input vector `x` into `o`, normalized for cosine. It fails on a value that isn't finite, or on a zero
+/// vector with cosine.
+fn load(x: &[f32], metric: Metric, o: &mut [f32]) -> Result<(), Error> {
+    if !x.iter().all(|v| v.is_finite()) {
+        return Err(invalid("a vector has a value that isn't finite"));
+    }
 
-    for start in (0..n).step_by(CHUNK) {
-        let chunk = src.rows(start, CHUNK.min(n - start));
-        for (i, o) in chunk.chunks_exact(dim).enumerate() {
-            if !o.iter().all(|x| x.is_finite()) {
-                return Err(invalid("a vector has a value that isn't finite"));
-            }
-            row.copy_from_slice(o);
-            if metric == Metric::Cosine && !normalize(&mut row) {
-                return Err(invalid("a zero vector has no direction for cosine"));
-            }
-            f(start + i, &row)?;
-        }
+    o.copy_from_slice(x);
+
+    if metric == Metric::Cosine && !normalize(o) {
+        return Err(invalid("a zero vector has no direction for cosine"));
     }
 
     Ok(())
+}
+
+/// The mean of the input vectors, normalized for cosine. Each chunk is summed on its own and the sums are added in
+/// order, so the mean is the same for any number of threads.
+fn mean(chunks: &[&[f32]], dim: usize, metric: Metric, pool: &ThreadPool) -> Result<Vec<f32>, Error> {
+    let sums: Vec<Result<Vec<f64>, Error>> = pool.install(|| {
+        chunks
+            .par_iter()
+            .map(|chunk| {
+                let (mut sum, mut o) = (vec![0f64; dim], vec![0f32; dim]);
+                for x in chunk.chunks_exact(dim) {
+                    load(x, metric, &mut o)?;
+                    sum.iter_mut().zip(&o).for_each(|(s, &v)| *s += f64::from(v));
+                }
+                Ok(sum)
+            })
+            .collect()
+    });
+    let (mut total, mut n) = (vec![0f64; dim], 0usize);
+
+    for (chunk, sum) in chunks.iter().zip(sums) {
+        total.iter_mut().zip(sum?).for_each(|(t, s)| *t += s);
+        n += chunk.len() / dim;
+    }
+
+    Ok(total
+        .iter()
+        .map(|&t| if n == 0 { 0.0 } else { (t / n as f64) as f32 })
+        .collect())
+}
+
+/// What encoding a vector needs.
+struct Encoding<'a> {
+    dim: usize,
+    metric: Metric,
+    mean: &'a [f32],
+    rotation: &'a Rotation,
+    page_size: usize,
+    /// The id of each input row, when it isn't the row's number.
+    ids: Option<&'a [u64]>,
+}
+
+/// Vectors encoded into their 1-bit codes, their factors and their 8-bit rows. A chunk's are in input order, with its
+/// rows back to back. An index's are by internal id, with its rows in pages.
+struct Encoded {
+    codes: Vec<u8>,
+    factors: Vec<Factors>,
+    rows: Vec<u8>,
+}
+
+impl Encoding<'_> {
+    /// Encodes every input vector into its 1-bit code, its factors and its 8-bit row, and puts each at its internal id
+    /// `id_of[r]`. The threads encode a batch of chunks at a time, which this thread then puts in place in input order,
+    /// so only a few encoded chunks ever wait.
+    fn run(&self, chunks: &[&[f32]], id_of: &[u32], pool: &ThreadPool) -> Result<Encoded, Error> {
+        let n = id_of.len();
+        let (cb, rb) = (code_bytes(padded_dim(self.dim)), sq8::row_bytes(self.dim));
+        let per_page = self.page_size / rb;
+        let mut codes = vec![0u8; n * cb];
+        let mut factors = vec![Factors::EMPTY; n];
+        let mut rows = vec![0u8; n.div_ceil(per_page) * self.page_size];
+        let batch = BATCH * pool.current_num_threads();
+
+        for (b, group) in chunks.chunks(batch).enumerate() {
+            let encoded: Vec<Result<Encoded, Error>> = pool.install(|| {
+                group
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, chunk)| self.chunk(chunk, (b * batch + i) * CHUNK))
+                    .collect()
+            });
+            for (i, e) in encoded.into_iter().enumerate() {
+                let e = e?;
+                let first = (b * batch + i) * CHUNK;
+                for (j, f) in e.factors.iter().enumerate() {
+                    let id = id_of[first + j] as usize;
+                    codes[id * cb..(id + 1) * cb].copy_from_slice(&e.codes[j * cb..(j + 1) * cb]);
+                    factors[id] = *f;
+                    let at = (id / per_page) * self.page_size + (id % per_page) * rb;
+                    rows[at..at + rb].copy_from_slice(&e.rows[j * rb..(j + 1) * rb]);
+                }
+            }
+        }
+
+        Ok(Encoded { codes, factors, rows })
+    }
+
+    /// Encodes the vectors of one chunk, whose first input row is `first`.
+    fn chunk(&self, chunk: &[f32], first: usize) -> Result<Encoded, Error> {
+        let (dim, count) = (self.dim, chunk.len() / self.dim);
+        let (cb, rb) = (code_bytes(padded_dim(dim)), sq8::row_bytes(dim));
+        let mut e = Encoded {
+            codes: vec![0u8; count * cb],
+            factors: Vec::with_capacity(count),
+            rows: vec![0u8; count * rb],
+        };
+        let mut encoder = Encoder::new(self.rotation, self.mean);
+        let mut o = vec![0f32; dim];
+        let outputs = e.codes.chunks_exact_mut(cb).zip(e.rows.chunks_exact_mut(rb));
+
+        for (i, (x, (code, row))) in chunk.chunks_exact(dim).zip(outputs).enumerate() {
+            load(x, self.metric, &mut o)?;
+            let f = encoder.encode(&o, code);
+            let id = self.ids.map_or((first + i) as u64, |ids| ids[first + i]);
+            sq8::write_row(&o, self.mean, id, row);
+            if !(fits(f.f_add) && f.f_rescale.is_finite() && f.f_err.is_finite() && fits(sq8::norm2(row, dim))) {
+                return Err(invalid("a vector is too far from the mean to encode"));
+            }
+            e.factors.push(f);
+        }
+
+        Ok(e)
+    }
+}
+
+/// Packs each cluster's codes into its blocks, a cluster at a time on the pool's threads. The clusters' blocks follow
+/// one another.
+fn pack(lists: &[List], codes: &[u8], factors: &[Factors], d_pad: usize, pool: &ThreadPool) -> Vec<u8> {
+    let (cb, size) = (code_bytes(d_pad), block_bytes(d_pad));
+    let mut blocks = vec![0u8; lists.last().map_or(0, |l| l.offset + l.count.div_ceil(BLOCK) * size)];
+    let mut parts = Vec::with_capacity(lists.len());
+    let mut rest = &mut blocks[..];
+
+    for list in lists {
+        let (mine, tail) = std::mem::take(&mut rest).split_at_mut(list.count.div_ceil(BLOCK) * size);
+        parts.push(mine);
+        rest = tail;
+    }
+
+    pool.install(|| {
+        parts.into_par_iter().zip(lists).for_each(|(out, list)| {
+            for (b, block) in out.chunks_exact_mut(size).enumerate() {
+                let first = list.first_id as usize + BLOCK * b;
+                let last = (first + BLOCK).min(list.first_id as usize + list.count);
+                pack_block(&codes[first * cb..last * cb], &factors[first..last], d_pad, block);
+            }
+        })
+    });
+
+    blocks
 }
 
 /// Whether a squared length, eg. f_add or a row's n2, leaves a search room to add another one.

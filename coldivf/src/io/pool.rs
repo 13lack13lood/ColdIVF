@@ -1,7 +1,8 @@
 //! A backend that reads a wave's ranges on up to 16 threads at once, with positioned reads. It works on every system,
 //! and macOS falls back to it where `F_RDADVISE` doesn't work, eg. on FAT32 (File Allocation Table) or some network
-//! drives. Its threads start on its first wave and then wait for the next one. A wave finishes within `submit`, so
-//! every range is in when `submit` returns. On Windows the reads through one handle still run one at a time.
+//! drives. It starts a thread per range of a wave, up to 16, as waves need them, and keeps them waiting for the next
+//! wave. A wave finishes within `submit`, so every range is in when `submit` returns. On Windows the reads through one
+//! handle still run one at a time.
 
 use std::fs::File;
 use std::io::Error;
@@ -58,10 +59,16 @@ struct Job {
 unsafe impl Send for Job {}
 
 impl PoolWave {
-    /// Starts the threads that aren't running yet, and returns how many run. A thread the system refuses is tried again
-    /// on the next wave.
-    fn spawn(&mut self) -> usize {
-        while self.threads.len() < THREADS {
+    /// How many threads it has started.
+    #[cfg(test)]
+    pub(crate) fn started(&self) -> usize {
+        self.threads.len()
+    }
+
+    /// Starts threads until `want` of them run, up to 16, and returns how many run. A thread the system refuses is
+    /// tried again on the next wave.
+    fn spawn(&mut self, want: usize) -> usize {
+        while self.threads.len() < want.min(THREADS) {
             let (shared, t) = (Arc::clone(&self.shared), self.threads.len());
             let started = std::thread::Builder::new()
                 .name("coldivf-read".into())
@@ -84,7 +91,7 @@ impl Wave for PoolWave {
     /// Reads every range. The ranges must be packed in order in the arena, as `coalesce` lays them out.
     fn submit(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<(), Error> {
         self.lanes[lane].start(0);
-        let threads = self.spawn().min(ranges.len());
+        let threads = self.spawn(ranges.len()).min(ranges.len());
 
         if threads == 0 {
             ranges

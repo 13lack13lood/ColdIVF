@@ -10,6 +10,18 @@ publish.workspace = true
 # Exposes the in-RAM reference index to benchmark binaries.
 inmem = []
 
+# The command line tool. It shares the library's name, so only the library gets docs.
+[[bin]]
+name = "coldivf"
+path = "src/bin/coldivf.rs"
+doc = false
+
+# Counts allocations with its own allocator, so it runs as its own program.
+[[test]]
+name = "alloc"
+path = "tests/alloc.rs"
+harness = false
+
 [dependencies]
 # Pure Rust only, so the Mac can cross-compile and check every target.
 # libm: a correctly rounded fused multiply-add that gives the same bits on every platform.
@@ -20,9 +32,14 @@ zerocopy = { version = "0.8.60", features = ["derive"] }
 crc32fast = "1.5.0"
 # memmap2: maps an index file into memory.
 memmap2 = "0.9.11"
+# faer: the matrix products that find each vector's nearest cluster center during k-means.
+faer = { version = "0.24.4", default-features = false, features = ["std", "rayon"] }
+# rayon: the build's threads, for k-means and encoding.
+rayon = "1.12.0"
 
 [target.'cfg(unix)'.dependencies]
-# libc: F_NOCACHE and F_RDADVISE for the macOS reader, and posix_fadvise for read hints on Linux.
+# libc: F_NOCACHE and F_RDADVISE for the macOS reader, posix_fadvise for read hints on Linux, and
+# pthread_set_qos_class_self_np (macOS) and setpriority (Linux) for low-priority warm-ups.
 libc = "0.2.190"
 
 [target.'cfg(target_os = "linux")'.dependencies]

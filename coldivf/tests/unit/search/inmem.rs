@@ -68,6 +68,7 @@ fn reading_every_cluster_and_rescoring_every_vector_is_exact() {
             k: 10,
             nprobe: 8,
             rerank: 300,
+            reach: None,
         };
         for q in gaussian(&mut rng, 5, dim, |_| 1.0).chunks_exact(dim) {
             let hits = index.search(q, &all, &mut ctx).unwrap();
@@ -89,6 +90,7 @@ fn every_tier_gives_the_same_hits() {
         k: 10,
         nprobe: 4,
         rerank: 30,
+        reach: None,
     };
     let dim = 256;
     for q in gaussian(&mut rng, 10, dim, |_| 1.0).chunks_exact(dim) {
@@ -108,6 +110,7 @@ fn finds_most_true_neighbors_on_clustered_data() {
         k: 10,
         nprobe: 8,
         rerank: 200,
+        reach: None,
     };
 
     // Queries land near the data's clusters, the way real queries land near the documents they match.
@@ -196,11 +199,13 @@ fn a_search_can_return_nothing() {
             k: 0,
             nprobe: 4,
             rerank: 10,
+            reach: None,
         },
         SearchParams {
             k: 5,
             nprobe: 0,
             rerank: 10,
+            reach: None,
         },
     ] {
         assert!(index.search(q, &params, &mut ctx).unwrap().is_empty());
@@ -224,6 +229,7 @@ fn clusters_without_vectors_are_skipped() {
         k: 10,
         nprobe: 4,
         rerank: 100,
+        reach: None,
     };
     let q = &rows.data[..128];
     assert_eq!(
@@ -295,6 +301,7 @@ fn bad_input_is_rejected_with_invalid_input() {
         k: 5,
         nprobe: 3,
         rerank: 10,
+        reach: None,
     };
     let kind = |r: Result<&[Hit], Error>| r.map(|_| ()).unwrap_err().kind();
 
@@ -354,6 +361,7 @@ fn the_public_index_gives_the_same_hits() {
         k: 10,
         nprobe: 3,
         rerank: 20,
+        reach: None,
     };
     let q = &rows.data[..128];
     assert_eq!(
@@ -372,6 +380,7 @@ fn more_search_checks_reject_with_invalid_input_and_rerank_below_k_still_gives_k
         k: 5,
         nprobe: 3,
         rerank: 10,
+        reach: None,
     };
     let kind = |r: Result<&[Hit], Error>| r.map(|_| ()).unwrap_err().kind();
 
@@ -513,6 +522,7 @@ fn chained_and_id_order_find_the_same_hits() {
                 k: 10,
                 nprobe,
                 rerank: 40,
+                reach: None,
             };
             assert_eq!(
                 bits(by_id.search(q, &sp, &mut a).unwrap()),
@@ -565,6 +575,7 @@ fn one_ctx_serves_indexes_of_different_shapes() {
         k: 10,
         nprobe: 4,
         rerank: 30,
+        reach: None,
     };
     let mut shared = ctx(64);
 
@@ -588,13 +599,110 @@ fn route_lists_the_nearest_clusters_first() {
 
     let dim = 128;
     for q in gaussian(&mut rng, 4, dim, |_| 1.0).chunks_exact(dim) {
-        index.route(q, 12, &mut ctx, &mut full).unwrap();
+        index.route(q, 12, None, &mut ctx, &mut full).unwrap();
         let mut sorted = full.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, (0..12).collect::<Vec<u32>>());
         for n in [1, 3, 7] {
-            index.route(q, n, &mut ctx, &mut some).unwrap();
+            index.route(q, n, None, &mut ctx, &mut some).unwrap();
             assert_eq!(some, full[..n]);
         }
     }
+}
+
+#[test]
+fn every_batch_split_gives_the_same_index() {
+    // 20,000 vectors fill 5 chunks, which one thread encodes in 3 batches, two threads in 2 and eight threads in 1.
+    let mut rng = SplitMix64::new(14);
+    let (dim, n) = (128, 20_000);
+    let (mut rows, clusters) = clustered(&mut rng, n, dim, 20, 0.5);
+    // A far last row moves the mean, so a mean of only the first chunks would show.
+    rows.data[(n - 1) * dim..].iter_mut().for_each(|x| *x += 50.0);
+    let build = |threads| {
+        let p = BuildParams {
+            threads,
+            ..params(Metric::L2)
+        };
+        InMemory::build(&p, &rows, &clusters).unwrap()
+    };
+    let one = build(1);
+    let parts =
+        |index: &InMemory| -> Vec<Vec<u8>> { crate::format::encode(index).parts.iter().map(|p| p.to_vec()).collect() };
+
+    let want = parts(&one);
+    for threads in [2, 8] {
+        assert!(parts(&build(threads)) == want, "{threads} threads built another index");
+    }
+
+    let exact = mean(&rows.data, dim);
+    assert!(one.mean.iter().zip(&exact).all(|(a, b)| (a - b).abs() < 1e-5));
+    let data = one.in_place();
+    let mut ids = one.ids.clone();
+    ids.sort_unstable();
+    assert_eq!(ids, (0..n as u64).collect::<Vec<_>>());
+    for id in 0..n as u32 {
+        assert_eq!(sq8::id(data.rows.row(id), dim), one.ids[id as usize], "row {id}");
+    }
+}
+
+#[test]
+fn a_bad_vector_in_a_later_batch_fails_the_build() {
+    // Row 19,000 is in the third batch of a one-thread build, and too far from the mean to encode.
+    let (dim, n) = (128, 20_000);
+    let (mut rows, clusters) = clustered(&mut SplitMix64::new(15), n, dim, 4, 0.5);
+    rows.data[19_000 * dim..19_001 * dim].fill(1e19);
+
+    let err = InMemory::build(&params(Metric::L2), &rows, &clusters)
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(err.to_string(), "a vector is too far from the mean to encode");
+}
+
+#[test]
+fn a_reach_reads_only_the_clusters_within_it() {
+    let mut rng = SplitMix64::new(16);
+    let (dim, n, nlist) = (128, 2000, 32);
+    let (rows, clusters) = clustered(&mut rng, n, dim, nlist, 1.0);
+    let index = InMemory::build(&params(Metric::L2), &rows, &clusters).unwrap();
+    let (mut a, mut b) = (ctx(64), ctx(64));
+    let mut routes = Vec::new();
+
+    for q in gaussian(&mut rng, 10, dim, |_| 1.0).chunks_exact(dim) {
+        for reach in [0.0, 0.1, 0.3, 1.0] {
+            let reached = SearchParams {
+                k: 10,
+                nprobe: 20,
+                rerank: 40,
+                reach: Some(reach),
+            };
+            // The same search with exactly the clusters in reach.
+            index.route(q, 20, None, &mut a, &mut routes).unwrap();
+            let s = crate::search::scratch_for(&mut a.scratch, dim, nlist, &a.limits);
+            let count = crate::search::route::within_reach(&s.routes, Some(reach));
+            let fixed = SearchParams {
+                nprobe: count,
+                reach: None,
+                ..reached
+            };
+            assert_eq!(
+                bits(index.search(q, &reached, &mut a).unwrap()),
+                bits(index.search(q, &fixed, &mut b).unwrap())
+            );
+        }
+    }
+
+    let bad = SearchParams {
+        k: 10,
+        nprobe: 20,
+        rerank: 40,
+        reach: Some(f32::NAN),
+    };
+    assert_eq!(
+        index
+            .search(&rows.data[..dim], &bad, &mut a)
+            .map(|_| ())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidInput
+    );
 }

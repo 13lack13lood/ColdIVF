@@ -63,6 +63,7 @@ fn queries_reuse_every_read_buffer() {
             k: max_k,
             nprobe: max_nprobe,
             rerank: max_rerank,
+            reach: None,
         };
         // A fetch of up to `max_nprobe` leaves, repeats included, fits too.
         let leaves: Vec<u32> = (0..64).map(|i| i % 40).collect();
@@ -177,7 +178,7 @@ fn the_late_wave_skips_the_rows_the_early_wave_read() {
     let q = &gaussian(&mut SplitMix64::new(4), 1, 128, |_| 1.0)[..];
     let mut leaves = Vec::new();
 
-    index.route(q, 16, &mut ctx, &mut leaves).unwrap();
+    index.route(q, 16, None, &mut ctx, &mut leaves).unwrap();
     let mut fetched = index.fetch(&leaves, &mut ctx).unwrap();
     fetched.prefetch_rows(q, 40).unwrap();
     fetched.search(q, 10, 40).unwrap();
@@ -188,6 +189,7 @@ fn the_late_wave_skips_the_rows_the_early_wave_read() {
 #[test]
 fn a_row_page_takes_the_fewest_read_pages_its_offsets_allow() {
     let section = |offset, page_size| RowSection {
+        count: 1000,
         offset,
         row_bytes: 784,
         per_page: page_size / 784,
@@ -228,6 +230,7 @@ fn a_context_drops_the_reads_of_closed_indexes() {
             k: 5,
             nprobe: 4,
             rerank: 20,
+            reach: None,
         };
         index.search(&vec![0.5; dim], &sp, ctx).unwrap();
     };

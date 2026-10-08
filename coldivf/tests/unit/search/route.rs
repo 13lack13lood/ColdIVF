@@ -91,3 +91,24 @@ fn a_tie_between_two_centers_goes_to_the_lower_position() {
         }
     }
 }
+
+#[test]
+fn reach_keeps_the_clusters_near_enough_to_the_nearest() {
+    let routes = |scores: &[f32]| -> Vec<Candidate> {
+        scores
+            .iter()
+            .enumerate()
+            .map(|(i, &score)| Candidate { score, id: i as u32 })
+            .collect()
+    };
+    // Scores are squared distances, so a reach of 0.5 keeps scores up to 2.25 times the nearest one's.
+    let near = routes(&[4.0, 6.0, 9.0, 9.01, 20.0]);
+
+    assert_eq!(within_reach(&near, None), 5);
+    assert_eq!(within_reach(&near, Some(0.5)), 3);
+    assert_eq!(within_reach(&near, Some(0.0)), 1);
+    assert_eq!(within_reach(&near, Some(1e9)), 5);
+    assert_eq!(within_reach(&[], Some(0.5)), 0);
+    // A nearest score below 0 counts as 0, so only scores at most 0 stay, and the nearest always does.
+    assert_eq!(within_reach(&routes(&[-1.0, 0.0, 0.5]), Some(0.5)), 2);
+}

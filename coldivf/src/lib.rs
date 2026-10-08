@@ -5,11 +5,13 @@ mod format;
 mod index;
 mod io;
 mod kernels;
+mod multi;
 mod quantization;
 mod search;
+mod update;
 
 use std::io::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// How the index measures the distance between vectors.
@@ -50,6 +52,8 @@ pub struct BuildParams {
     /// Page size for packing the precise vector copies that rescoring reads. 4096 lets one file work on both
     /// 16 KiB-page Macs and 4 KiB-page PCs.
     pub page_size: usize,
+    /// Threads for clustering and encoding. 0 takes `RAYON_NUM_THREADS` when it is set, and otherwise one thread per
+    /// logical CPU. The file is the same for any number.
     pub threads: usize,
     pub seed: u64,
 }
@@ -81,9 +85,10 @@ impl Builder {
         Builder { params }
     }
 
-    /// Clusters, orders, encodes and writes `src` to `out`. It writes a temporary file, syncs it, then renames it.
+    /// Clusters, orders, encodes and writes `src` to `out`. k-means finds clusters of about `vectors_per_list` vectors,
+    /// and more k-means over their centers finds the groups. It writes a temporary file, syncs it, then renames it.
     pub fn build(&self, src: &dyn VectorSource, out: &Path) -> Result<(), Error> {
-        todo!()
+        build::build(&self.params, src, out)
     }
 
     /// The same, with an imported clustering.
@@ -100,9 +105,10 @@ pub struct Index {
 
 impl Index {
     /// Reads the header and the rotation, the first 16 KiB up to 2806 dimensions, and maps the file without loading it.
-    /// Nothing else is read until a query. Don't rewrite the file in place while it is open, eg. by copying over it.
-    /// The index reads it a little at a time, so it would pair the old cluster tables with the new vectors. A rebuild
-    /// that renames a new file over it is safe.
+    /// It also reads the file's change log, if it has one, which takes time and memory in proportion to the inserts
+    /// since the last compaction. Nothing else is read until a query. Don't rewrite the file in place while it is open,
+    /// eg. by copying over it. The index reads it a little at a time, so it would pair the old cluster tables with the
+    /// new vectors. A rebuild that renames a new file over it is safe.
     pub fn open(path: &Path) -> Result<Index, Error> {
         Ok(Index {
             inner: Arc::new(index::Inner::open(path)?),
@@ -117,41 +123,74 @@ impl Index {
     }
 
     /// Searches with the final query embedding. It picks the nearest clusters, reads them in one batch, scores
-    /// their vectors, then reads and rescores the best candidates in a second small batch. The hits live in `ctx`,
-    /// so a query allocates nothing.
+    /// their vectors, then reads and rescores the best candidates in a second small batch. On a warm index it scores
+    /// the clusters in place instead of reading them. The hits live in `ctx`, so a query allocates nothing.
     pub fn search<'a>(&self, query: &[f32], params: &SearchParams, ctx: &'a mut SearchCtx) -> Result<&'a [Hit], Error> {
+        if self.inner.is_warm() {
+            return self.inner.search_warm(query, params, ctx);
+        }
+
         self.inner.check(query, params, &ctx.limits)?;
 
         let mut leaves = std::mem::take(&mut ctx.leaves);
         let slot = self
-            .route(query, params.nprobe, ctx, &mut leaves)
+            .inner
+            .route(query, params.nprobe, params.reach, ctx, &mut leaves)
             .and_then(|()| self.inner.fetch(&leaves, ctx));
         ctx.leaves = leaves;
         self.inner.search_fetched(query, params, ctx, slot?)
     }
 
-    /// Writes the positions of the `nprobe` clusters `query` would read into `out`, nearest first.
-    pub fn route(&self, query: &[f32], nprobe: usize, ctx: &mut SearchCtx, out: &mut Vec<LeafId>) -> Result<(), Error> {
-        self.inner.route(query, nprobe, ctx, out)
+    /// Writes the positions of the clusters `query` would read into `out`, nearest first. They are the `nprobe`
+    /// nearest, or with a `reach`, those of them within it, as in [`SearchParams`].
+    pub fn route(
+        &self,
+        query: &[f32],
+        nprobe: usize,
+        reach: Option<f32>,
+        ctx: &mut SearchCtx,
+        out: &mut Vec<LeafId>,
+    ) -> Result<(), Error> {
+        self.inner.route(query, nprobe, reach, ctx, out)
     }
 
     /// Starts reading `leaves` in one batch. On macOS it returns while the reads are still running. On other systems,
     /// and on Mac drives that refuse read hints, eg. FAT32 (File Allocation Table), it returns once they are done. The
-    /// handle then ranks those clusters, and only those, for one or more queries. [`Index::search`] is `route`, then
-    /// `fetch`, then [`Fetched::search`].
+    /// handle then ranks those clusters, and only those, for one or more queries, along with any vectors inserted since
+    /// the last compaction. [`Index::search`] is `route` with the same `nprobe` and `reach`, then `fetch`, then
+    /// [`Fetched::search`]. On a warm index it gives the same hits, but scores the clusters in place.
     pub fn fetch<'a>(&'a self, leaves: &[LeafId], ctx: &'a mut SearchCtx) -> Result<Fetched<'a>, Error> {
         let slot = self.inner.fetch(leaves, ctx)?;
         Ok(Fetched { index: self, ctx, slot })
     }
 
-    /// Reads the whole index into the OS cache in the background. Once it is done, queries read it in place.
+    /// Reads every cluster's blocks into the operating system's cache on a background thread, in file order, and
+    /// returns at once. The thread runs at low priority on macOS and Linux. When it is done, the index is warm, and
+    /// searches score the clusters in place. A clear while it runs stops it, and so does a failed read, which nothing
+    /// reports. Either way the index stays cold. A call while a warm-up runs makes it run again if the index isn't warm
+    /// when it ends, and a call once the index is warm does nothing. On Mac drives that refuse read hints, eg. FAT32,
+    /// it can't fill the cache, so it stops at once.
     pub fn warm_up(&self) -> Result<(), Error> {
-        todo!()
+        self.inner.warm_up()
     }
 
-    /// Whether the whole file is known to be in memory. Memory pressure clears it again.
+    /// Whether every cluster's blocks are known to be in memory. A warm-up sets it, and so does `set_warm(true)`. A
+    /// macOS memory-pressure warning clears it, and so does `set_warm(false)`.
     pub fn is_warm(&self) -> bool {
-        todo!()
+        self.inner.is_warm()
+    }
+
+    /// Sets whether the index is warm, eg. clears it when the app knows the cache was emptied. A warm index with blocks
+    /// that aren't in memory still gives the same results, but its searches wait for each page.
+    pub fn set_warm(&self, warm: bool) {
+        self.inner.set_warm(warm);
+    }
+
+    /// Reads the whole file and checks every section against its checksum, then checks the cluster tables. A damaged
+    /// file fails with `InvalidData`. Searches skip the checksums, since they read only part of the file, but they
+    /// check the cluster tables when they first load them.
+    pub fn verify(&self) -> Result<(), Error> {
+        self.inner.verify()
     }
 }
 
@@ -165,7 +204,7 @@ pub struct InMemoryIndex {
 #[cfg(feature = "inmem")]
 impl InMemoryIndex {
     /// Builds the index from `src` and an imported clustering. It uses `params.metric`, `params.order`,
-    /// `params.page_size` and `params.seed`.
+    /// `params.page_size`, `params.seed` and `params.threads`.
     pub fn build(params: &BuildParams, src: &dyn VectorSource, clusters: &Clusters) -> Result<InMemoryIndex, Error> {
         Ok(InMemoryIndex {
             inner: search::inmem::InMemory::build(params, src, clusters)?,
@@ -188,6 +227,9 @@ pub struct SearchParams {
     pub nprobe: usize,
     /// Candidates to rescore with the more precise copy of each vector. 29 to 39 gives that same ~95%.
     pub rerank: usize,
+    /// When set, a search reads only the clusters whose distance from the query is at most (1 + reach) times the
+    /// nearest one's, up to `nprobe` of them, so easy queries read fewer. `None` reads exactly `nprobe`.
+    pub reach: Option<f32>,
 }
 
 /// One result, with the id given at build time and its score.
@@ -208,8 +250,9 @@ pub struct Limits {
 }
 
 /// Per-thread scratch space, reused across queries. It keeps one set of buffers per index shape, i.e. per dimension and
-/// cluster count, and one set of read buffers per index. Each is made on the first search that needs it, so run one
-/// search with each index before timing.
+/// cluster count, and one set of read buffers per index. A search over several collections also keeps a set of
+/// buffers for each of them, which later searches reuse for collections of the same shape. Each is made on the first
+/// search that needs it, so run one search with each index and each set of collections before timing.
 pub struct SearchCtx {
     limits: Limits,
     scratch: Vec<search::Scratch>,
@@ -217,6 +260,9 @@ pub struct SearchCtx {
     /// The clusters that a search routes to.
     leaves: Vec<LeafId>,
     hits: Vec<Hit>,
+    /// Each collection's part of a search over several, and the routes and candidates of all of them.
+    parts: Vec<multi::Part>,
+    picks: Vec<(search::candidates::Candidate, usize)>,
 }
 
 impl SearchCtx {
@@ -227,6 +273,8 @@ impl SearchCtx {
             reads: Vec::new(),
             leaves: Vec::with_capacity(limits.max_nprobe),
             hits: Vec::with_capacity(limits.max_k),
+            parts: Vec::new(),
+            picks: Vec::new(),
         }
     }
 }
@@ -235,9 +283,10 @@ impl SearchCtx {
 /// only with [`LeafOrder::Id`].
 pub type LeafId = u32;
 
-/// Clusters being read in one batch. Rank them for any number of queries. Nothing outside them is ever read.
-/// Use it to read once and rank several versions of a query, or to start reading from a guessed query before the
-/// final one is known. Dropping it cancels or finishes the pending reads.
+/// Clusters being read in one batch. Rank them for any number of queries. Nothing outside them is ever read, though the
+/// vectors inserted since the last compaction are ranked with them. Use it to read once and rank several versions of a
+/// query, or to start reading from a guessed query before the final one is known. Dropping it cancels or finishes the
+/// pending reads.
 pub struct Fetched<'a> {
     index: &'a Index,
     ctx: &'a mut SearchCtx,
@@ -255,7 +304,12 @@ impl<'a> Fetched<'a> {
     /// Ranks the fetched clusters for `query`. It scores every vector, reads any precise copies not read yet,
     /// rescores the best `rerank` candidates and returns the top `k`.
     pub fn search(self, query: &[f32], k: usize, rerank: usize) -> Result<&'a [Hit], Error> {
-        let params = SearchParams { k, nprobe: 0, rerank };
+        let params = SearchParams {
+            k,
+            nprobe: 0,
+            rerank,
+            reach: None,
+        };
         self.index.inner.search_fetched(query, &params, self.ctx, self.slot)
     }
 }
@@ -266,11 +320,18 @@ pub struct Collections {
 }
 
 impl Collections {
+    /// Opens every file of `paths`. It first asks the operating system to start reading every header at once, which
+    /// macOS and Linux do. The collections must share a dimension and a metric.
     pub fn open(paths: &[&Path]) -> Result<Collections, Error> {
-        todo!()
+        Ok(Collections {
+            indexes: multi::open(paths)?,
+        })
     }
 
-    /// Writes the top `k` across all collections into `out`, as (collection index, hit).
+    /// Writes the top `k` across all collections into `out`, as (collection index, hit), nearest first. `nprobe`,
+    /// `rerank` and `reach` count across all of them. The nearest clusters of any collection are read in one batch,
+    /// then the rows of the best candidates of any collection in one more. On macOS each batch reads every collection
+    /// at once. Elsewhere, and on Mac drives that refuse read hints, each collection's reads run in turn.
     pub fn search(
         &self,
         query: &[f32],
@@ -278,29 +339,76 @@ impl Collections {
         ctx: &mut SearchCtx,
         out: &mut Vec<(usize, Hit)>,
     ) -> Result<(), Error> {
-        todo!()
+        multi::search(&self.indexes, query, params, ctx, out)
     }
 }
 
-/// Inserts and deletes for one collection. They go to a crash-safe log next to the file, and the next query sees
-/// them. `compact` folds them into a new file.
-pub struct Writer {}
+/// Inserts and deletes for one collection. They go to a crash-safe log next to the file. The next search of any open
+/// index of the file in this process sees them, and so does any index opened later, in any process. `compact` folds
+/// them into a new file.
+pub struct Writer {
+    path: PathBuf,
+    index: Index,
+    log: update::Log,
+    /// For routing each insert to its nearest cluster.
+    ctx: SearchCtx,
+}
 
 impl Writer {
+    /// Opens the index at `path` for changes, with its log and its lock file next to it, eg. `index.coldivf.delta` and
+    /// `index.coldivf.lock`. Only one writer may hold an index at a time, in any process, and a second one fails with
+    /// `WouldBlock`. A path through a symbolic link names the file it leads to.
     pub fn open(path: &Path) -> Result<Writer, Error> {
-        todo!()
+        // The lock comes first, so no other writer can compact the file between the open and the log's replay.
+        let path = update::real_path(path);
+        let lock = update::lock(&path)?;
+        let index = Index::open(&path)?;
+        let log = update::Log::open(&path, index.inner.layout(), index.inner.changes(), lock)?;
+        let limits = Limits {
+            max_k: 1,
+            max_nprobe: 1,
+            max_rerank: 1,
+        };
+        Ok(Writer {
+            path,
+            index,
+            log,
+            ctx: SearchCtx::new(limits),
+        })
     }
 
+    /// Adds `vector` with the id `id`, replacing any earlier vector with that id. Every open index of the file in
+    /// this process sees it from its next search, and indexes opened later read it from the log. It survives the
+    /// process dying, and [`Writer::sync`] makes it survive a power loss too.
     pub fn insert(&mut self, id: u64, vector: &[f32]) -> Result<(), Error> {
-        todo!()
+        let inner = &self.index.inner;
+        let (leaf, code, factors, row) = inner.encode_insert(id, vector, &mut self.ctx)?;
+        update::insert(&mut self.log, inner.changes(), id, leaf, &code, factors, &row)
     }
 
+    /// Removes the vector with the id `id`, if there is one, the same way. Until a compaction, a deleted vector still
+    /// takes a place among the candidates that a search rescores.
     pub fn delete(&mut self, id: u64) -> Result<(), Error> {
-        todo!()
+        update::delete(&mut self.log, self.index.inner.changes(), id)
     }
 
+    /// Makes every change so far survive a power loss.
+    pub fn sync(&mut self) -> Result<(), Error> {
+        self.log.sync()
+    }
+
+    /// Rebuilds the index file with every change folded in, then empties the log. It keeps the clusters and decodes
+    /// every vector from its 8-bit copy, so it holds them all in memory as f32 while it builds the new index there
+    /// too, eg. about 4.2 GB at its peak for 1M vectors of 768 dimensions. Indexes opened before keep their view until
+    /// they open the file again.
     pub fn compact(&mut self) -> Result<(), Error> {
-        todo!()
+        let compacted = self.index.inner.compacted()?;
+        build::write(&compacted, &self.path)?;
+        // Until the log starts again, it names the old file, so a crash here loses nothing and replays nothing twice.
+        let index = Index::open(&self.path)?;
+        self.log.restart(index.inner.layout(), index.inner.changes())?;
+        self.index = index;
+        Ok(())
     }
 }
 
@@ -315,14 +423,20 @@ pub enum Target {
     QueryShare { recall_at_10: f32, share: f32 },
 }
 
-#[derive(Clone, Copy, Debug)]
+/// The search settings that `calibrate` picks. Use them in [`SearchParams`].
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Calibration {
     pub nprobe: usize,
     pub rerank: usize,
+    pub reach: Option<f32>,
 }
 
-/// Picks the cheapest `nprobe` and `rerank` that meet `target`. It measures them on sample `queries` (row-major,
-/// not part of the index). `truth` holds each query's true 10 nearest neighbors, from an exact search.
+/// Picks the cheapest `nprobe`, `rerank` and `reach` that meet `target` with 90% confidence. It measures them on
+/// sample `queries` (row-major, not part of the index), half of which order the settings and half of which test them.
+/// `truth` holds each query's true 10 nearest neighbors, from an exact search. A setting's cost is the bytes that a
+/// cold search with it reads, counting each rescored row as one page of the read backend, eg. 16 KiB on macOS. A
+/// setting with a reach wins only when the cheapest fixed one costs at least 1.1 times as much. A target that no
+/// setting meets with that confidence fails with `InvalidInput`, eg. with too few queries for a strict one.
 pub fn calibrate(index: &Index, queries: &[f32], truth: &[u32], target: Target) -> Result<Calibration, Error> {
-    todo!()
+    search::calibrate::calibrate(&index.inner, queries, truth, target)
 }

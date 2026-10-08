@@ -51,6 +51,24 @@ pub(crate) fn route(
     routes.sort_unstable_by(order);
 }
 
+/// How many of `routes`, nearest first, lie within `reach`. A cluster is within reach when its distance from the query
+/// is at most (1 + reach) times the nearest one's, and the nearest is always within reach. Each score estimates a
+/// squared distance, so the test compares it with (1 + reach)² times the nearest score, and a nearest score below 0
+/// counts as 0. `None` keeps every route.
+pub(crate) fn within_reach(routes: &[Candidate], reach: Option<f32>) -> usize {
+    reach_of(routes.iter().map(|r| r.score), reach)
+}
+
+/// The same, for the scores of routes nearest first.
+pub(crate) fn reach_of(mut scores: impl ExactSizeIterator<Item = f32>, reach: Option<f32>) -> usize {
+    let len = scores.len();
+    let (Some(reach), Some(first)) = (reach, scores.next()) else {
+        return len;
+    };
+    let limit = f64::from(first.max(0.0)) * (1.0 + f64::from(reach)).powi(2);
+    1 + scores.take_while(|&s| f64::from(s) <= limit).count()
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/search/route.rs"]
 mod tests;
