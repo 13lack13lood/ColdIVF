@@ -1,6 +1,11 @@
-//! Random data and exact reference math for the unit tests.
+//! Random data, exact reference math, index files and test read backends for the unit tests.
+
+use std::fs::File;
+use std::io::Error;
 
 use super::SplitMix64;
+use crate::io::portable::PortableWave;
+use crate::io::{LANES, Range, Wave, read_at};
 use crate::{BuildParams, Clusters, LeafOrder, Metric, VectorSource};
 
 impl SplitMix64 {
@@ -187,4 +192,150 @@ pub(crate) fn temps_of(out: &std::path::Path) -> Vec<std::path::PathBuf> {
             n.starts_with(&prefix) && n.ends_with(".tmp")
         })
         .collect()
+}
+
+/// An in-memory index of `n` vectors around `nlist` centers in 3 groups, written to the test file `name` and opened
+/// again.
+pub(crate) fn written(
+    name: &str,
+    params: &BuildParams,
+    n: usize,
+    dim: usize,
+    nlist: usize,
+) -> (crate::search::inmem::InMemory, crate::index::Inner, TempFile) {
+    let mut rng = SplitMix64::new(1);
+    let (rows, mut clusters) = clustered(&mut rng, n, dim, nlist, 0.5);
+    group(&mut clusters, 3);
+    let index = crate::search::inmem::InMemory::build(params, &rows, &clusters).unwrap();
+
+    let path = temp_file(name);
+    crate::build::write(&index, &path).unwrap();
+    let file = crate::index::Inner::open(&path).unwrap();
+    (index, file, path)
+}
+
+/// A read backend for tests. Each submit fills its ranges' arena bytes with junk, then each call to `next` reads one
+/// range, in a random order, as a backend whose reads complete out of order would. Bytes used before their range
+/// arrives are junk.
+pub(crate) struct Shuffled {
+    orders: [Vec<usize>; LANES],
+    rng: SplitMix64,
+}
+
+impl Default for Shuffled {
+    fn default() -> Shuffled {
+        Shuffled {
+            orders: Default::default(),
+            rng: SplitMix64::new(1),
+        }
+    }
+}
+
+impl Wave for Shuffled {
+    fn page(&self) -> usize {
+        8192
+    }
+
+    fn submit(&mut self, lane: usize, _file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<(), Error> {
+        ranges.iter().for_each(|r| arena[r.at..r.at + r.len].fill(0xA5));
+        let order = &mut self.orders[lane];
+        order.clear();
+        order.extend(0..ranges.len());
+        shuffle(order, &mut self.rng);
+        Ok(())
+    }
+
+    fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<Option<usize>, Error> {
+        let Some(i) = self.orders[lane].pop() else {
+            return Ok(None);
+        };
+        let r = ranges[i];
+        read_at(file, &mut arena[r.at..r.at + r.len], r.offset)?;
+        Ok(Some(i))
+    }
+}
+
+/// A read backend for tests that reads like the portable one, except that submit number `SUBMIT` fails, and so does the
+/// first wait for a range of submit number `WAVE`, counting from 1 across both lanes. A 0 fails nothing. A later
+/// submit on the same lane ends the failing wave.
+#[derive(Default)]
+pub(crate) struct Faulty<const SUBMIT: usize, const WAVE: usize> {
+    submits: usize,
+    /// The lane of submit number `WAVE`, until its first wait fails.
+    failing: Option<usize>,
+    inner: PortableWave,
+}
+
+impl<const SUBMIT: usize, const WAVE: usize> Wave for Faulty<SUBMIT, WAVE> {
+    fn page(&self) -> usize {
+        4096
+    }
+
+    fn submit(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<(), Error> {
+        self.submits += 1;
+
+        if self.failing == Some(lane) {
+            self.failing = None;
+        }
+
+        if self.submits == WAVE {
+            self.failing = Some(lane);
+        }
+
+        if self.submits == SUBMIT {
+            self.inner.submit(lane, file, &[], arena)?;
+            return Err(Error::other("a test submit failed"));
+        }
+
+        self.inner.submit(lane, file, ranges, arena)
+    }
+
+    fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<Option<usize>, Error> {
+        if self.failing == Some(lane) {
+            self.failing = None;
+            return Err(Error::other("a test read failed"));
+        }
+
+        self.inner.next(lane, file, ranges, arena)
+    }
+}
+
+/// A read backend for tests that reads like the portable one, except that submit number `WAVE` hands over one range
+/// fewer than it has, as a backend that lost a completion would. A later submit on the same lane ends that wave.
+#[derive(Default)]
+pub(crate) struct EndsEarly<const WAVE: usize> {
+    submits: usize,
+    /// The lane of submit number `WAVE`, and how many of its ranges are left to hand over.
+    short: Option<(usize, usize)>,
+    inner: PortableWave,
+}
+
+impl<const WAVE: usize> Wave for EndsEarly<WAVE> {
+    fn page(&self) -> usize {
+        4096
+    }
+
+    fn submit(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<(), Error> {
+        self.submits += 1;
+
+        if self.short.is_some_and(|(short, _)| short == lane) {
+            self.short = None;
+        }
+
+        if self.submits == WAVE {
+            self.short = Some((lane, ranges.len().saturating_sub(1)));
+        }
+
+        self.inner.submit(lane, file, ranges, arena)
+    }
+
+    fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<Option<usize>, Error> {
+        match &mut self.short {
+            Some((short, 0)) if *short == lane => return Ok(None),
+            Some((short, left)) if *short == lane => *left -= 1,
+            _ => {}
+        }
+
+        self.inner.next(lane, file, ranges, arena)
+    }
 }

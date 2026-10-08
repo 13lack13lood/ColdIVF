@@ -4,7 +4,7 @@
 use std::io::Error;
 
 use super::route::Centers;
-use super::{LIMIT, List, RowPages, View, invalid, normalize, run, run_route};
+use super::{InPlace, LIMIT, List, RowPages, View, invalid, normalize, run, run_route};
 use crate::build::order::leaf_order;
 use crate::kernels::Tier;
 use crate::quantization::rabitq::{BLOCK, Encoder, Factors, block_bytes, code_bytes, pack_block};
@@ -171,9 +171,8 @@ impl InMemory {
         })
     }
 
-    /// What a search reads.
+    /// What a search reads from the tables.
     pub(crate) fn view(&self) -> View<'_> {
-        let row_bytes = sq8::row_bytes(self.dim);
         View {
             dim: self.dim,
             metric: self.metric,
@@ -184,6 +183,14 @@ impl InMemory {
                 factors: &self.center_factors,
             },
             lists: &self.lists,
+            tier: self.tier,
+        }
+    }
+
+    /// The blocks and rows.
+    pub(crate) fn in_place(&self) -> InPlace<'_> {
+        let row_bytes = sq8::row_bytes(self.dim);
+        InPlace {
             blocks: &self.blocks,
             rows: RowPages {
                 bytes: &self.rows,
@@ -191,7 +198,6 @@ impl InMemory {
                 per_page: self.page_size / row_bytes,
                 page_size: self.page_size,
             },
-            tier: self.tier,
         }
     }
 
@@ -202,7 +208,7 @@ impl InMemory {
         params: &SearchParams,
         ctx: &'a mut SearchCtx,
     ) -> Result<&'a [Hit], Error> {
-        run(&self.view(), query, params, ctx)
+        run(&self.view(), &self.in_place(), query, params, ctx)
     }
 
     /// Writes the `nprobe` clusters nearest the query into `out`, nearest first, by file position.

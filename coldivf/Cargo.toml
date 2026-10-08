@@ -21,6 +21,10 @@ crc32fast = "1.5.0"
 # memmap2: maps an index file into memory.
 memmap2 = "0.9.11"
 
+[target.'cfg(unix)'.dependencies]
+# libc: F_NOCACHE and F_RDADVISE for the macOS reader, and posix_fadvise for read hints on Linux.
+libc = "0.2.190"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # io-uring: the Linux backend for batched reads.
 

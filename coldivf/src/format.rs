@@ -18,12 +18,12 @@
 use std::borrow::Cow;
 use std::io::{Error, ErrorKind};
 use std::mem::size_of;
-use std::ops::Range;
 
 use zerocopy::byteorder::little_endian::{F32, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::Metric;
+use crate::io::Span;
 use crate::quantization::rabitq::{BLOCK, EPS0, block_bytes};
 use crate::quantization::rotation::{ROUNDS, Rotation};
 use crate::quantization::sq4::{self, CenterFactors};
@@ -121,23 +121,6 @@ struct Extent {
 
 const _: () = assert!(size_of::<Header>() == 324 && size_of::<Entry>() == 24 && size_of::<Extent>() == 16);
 
-/// Where a section sits in the file.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Span {
-    pub(crate) offset: usize,
-    pub(crate) len: usize,
-}
-
-impl Span {
-    pub(crate) fn end(&self) -> usize {
-        self.offset + self.len
-    }
-
-    pub(crate) fn range(&self) -> Range<usize> {
-        self.offset..self.end()
-    }
-}
-
 /// What a checked header says.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Layout {
@@ -160,8 +143,8 @@ impl Layout {
 
 /// The cluster tables from the centers and extents sections, checked before any kernel uses them.
 pub(crate) struct Tables {
-    /// Where the clusters' 4-bit codes sit in the file.
-    pub(crate) codes: Span,
+    /// The clusters' 4-bit codes.
+    pub(crate) codes: Vec<u8>,
     pub(crate) factors: Vec<CenterFactors>,
     pub(crate) parent_of: Vec<u16>,
     pub(crate) lists: Vec<List>,
@@ -435,15 +418,21 @@ pub(crate) fn read_rotation(bytes: &[u8], layout: &Layout) -> Result<(Rotation, 
     Ok((Rotation::from_signs(dim, signs)?, mean))
 }
 
-/// Reads the centers and extents sections from the whole file `file` and checks them.
-pub(crate) fn read_tables(file: &[u8], layout: &Layout) -> Result<Tables, Error> {
-    let span = layout.span(Part::Centers);
-    let centers = &file[span.range()];
+/// Where the cluster tables sit, from the clusters' 4-bit codes after the group rows in the centers section to the end
+/// of the extents.
+pub(crate) fn tables_span(layout: &Layout) -> Span {
+    let start = layout.span(Part::Centers).offset + layout.nparents * sq8::center_row_bytes(layout.dim);
+    Span {
+        offset: start,
+        len: layout.span(Part::Extents).end() - start,
+    }
+}
+
+/// Checks the cluster tables in `bytes`, read from `tables_span`, and keeps the 4-bit codes from them.
+pub(crate) fn read_tables(mut bytes: Vec<u8>, layout: &Layout) -> Result<Tables, Error> {
     let nlist = layout.nlist;
-    let codes_start = layout.nparents * sq8::center_row_bytes(layout.dim);
     let codes_len = nlist * sq4::code_bytes(padded_dim(layout.dim));
-    let arrays = codes_start + codes_len;
-    let f32_at = |array: usize, i: usize| read_f32(centers, arrays + 4 * (array * nlist + i));
+    let f32_at = |array: usize, i: usize| read_f32(&bytes, codes_len + 4 * (array * nlist + i));
 
     let factors: Vec<CenterFactors> = (0..nlist)
         .map(|i| CenterFactors {
@@ -452,9 +441,9 @@ pub(crate) fn read_tables(file: &[u8], layout: &Layout) -> Result<Tables, Error>
             norm2: f32_at(2, i),
         })
         .collect();
-    let groups = arrays + 12 * nlist;
+    let groups = codes_len + 12 * nlist;
     let parent_of: Vec<u16> = (0..nlist)
-        .map(|i| u16::from_le_bytes([centers[groups + 2 * i], centers[groups + 2 * i + 1]]))
+        .map(|i| u16::from_le_bytes([bytes[groups + 2 * i], bytes[groups + 2 * i + 1]]))
         .collect();
 
     let factors_ok = factors
@@ -465,14 +454,16 @@ pub(crate) fn read_tables(file: &[u8], layout: &Layout) -> Result<Tables, Error>
         return Err(damaged("a cluster's factors or group are out of range"));
     }
 
+    let extents = layout.span(Part::Extents).offset - tables_span(layout).offset;
+    let lists = check_extents(&bytes[extents..], layout)?;
+    bytes.truncate(codes_len);
+    bytes.shrink_to_fit();
+
     Ok(Tables {
-        codes: Span {
-            offset: span.offset + codes_start,
-            len: codes_len,
-        },
+        codes: bytes,
         factors,
         parent_of,
-        lists: check_extents(&file[layout.span(Part::Extents).range()], layout)?,
+        lists,
     })
 }
 

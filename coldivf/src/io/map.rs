@@ -17,13 +17,4 @@ impl Map {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.0
     }
-
-    /// Asks the operating system (OS) to start reading `len` bytes from `offset` in the background. Only Unix systems
-    /// take the hint, and a refused hint changes nothing, so errors are ignored.
-    pub(crate) fn will_need(&self, offset: usize, len: usize) {
-        #[cfg(unix)]
-        let _ = self.0.advise_range(memmap2::Advice::WillNeed, offset, len);
-        #[cfg(not(unix))]
-        let _ = (offset, len);
-    }
 }

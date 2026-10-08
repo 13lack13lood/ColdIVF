@@ -7,6 +7,7 @@
 //! Candidates and results are ordered by score and then internal id, so they never depend on the order of the scan.
 
 pub(crate) mod candidates;
+pub(crate) mod cold;
 pub(crate) mod inmem;
 pub(crate) mod rerank;
 pub(crate) mod route;
@@ -56,7 +57,8 @@ impl<'a> RowPages<'a> {
     }
 }
 
-/// What a search reads from an index. The bytes are the same whether the index is in RAM or in a mapped file.
+/// What a search reads from an index's tables. They are the same whether the index is in RAM, in a mapped file or read
+/// cold.
 pub(crate) struct View<'a> {
     pub(crate) dim: usize,
     pub(crate) metric: Metric,
@@ -64,22 +66,28 @@ pub(crate) struct View<'a> {
     pub(crate) rotation: &'a Rotation,
     pub(crate) centers: Centers<'a>,
     pub(crate) lists: &'a [List],
-    /// Every cluster's blocks.
-    pub(crate) blocks: &'a [u8],
-    pub(crate) rows: RowPages<'a>,
     pub(crate) tier: Tier,
 }
 
-/// Searches `view` for the `params.k` nearest vectors. The hits live in `ctx`.
+/// Every cluster's blocks and every row, read in place from RAM or a mapped file.
+pub(crate) struct InPlace<'a> {
+    pub(crate) blocks: &'a [u8],
+    pub(crate) rows: RowPages<'a>,
+}
+
+/// Searches `view` for the `params.k` nearest vectors, reading the blocks and rows from `data`. The hits live in `ctx`.
 pub(crate) fn run<'a>(
     view: &View,
+    data: &InPlace,
     query: &[f32],
     params: &SearchParams,
     ctx: &'a mut SearchCtx,
 ) -> Result<&'a [Hit], Error> {
     check_search(query, view.dim, params, &ctx.limits)?;
 
-    let SearchCtx { limits, scratch, hits } = ctx;
+    let SearchCtx {
+        limits, scratch, hits, ..
+    } = ctx;
     let s = scratch_for(scratch, view.dim, view.lists.len(), limits);
     prepare_query(view, query, s)?;
     route(
@@ -96,7 +104,7 @@ pub(crate) fn run<'a>(
 
     for r in &s.routes {
         let list = view.lists[r.id as usize];
-        let blocks = &view.blocks[list.offset..list.offset + list.count.div_ceil(BLOCK) * size];
+        let blocks = &data.blocks[list.offset..list.offset + list.count.div_ceil(BLOCK) * size];
         scan_list(
             view.tier,
             blocks,
@@ -108,7 +116,7 @@ pub(crate) fn run<'a>(
         );
     }
 
-    let row = |id: u32| view.rows.row(id);
+    let row = |id: u32| data.rows.row(id);
     rerank(
         s.candidates.as_slice(),
         row,
@@ -157,7 +165,7 @@ pub(crate) fn run_route(
 
 /// Normalizes the query for cosine, then writes its offset q − μ, that offset rotated and its two quantized forms into
 /// `s`.
-fn prepare_query(view: &View, query: &[f32], s: &mut Scratch) -> Result<(), Error> {
+pub(crate) fn prepare_query(view: &View, query: &[f32], s: &mut Scratch) -> Result<(), Error> {
     s.query.copy_from_slice(query);
 
     if view.metric == Metric::Cosine && !normalize(&mut s.query) {

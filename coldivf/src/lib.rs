@@ -100,8 +100,9 @@ pub struct Index {
 
 impl Index {
     /// Reads the header and the rotation, the first 16 KiB up to 2806 dimensions, and maps the file without loading it.
-    /// Nothing else is read until a query. Don't rewrite the file in place while it is open, eg. by copying over it,
-    /// since the index reads it through a memory map. A rebuild that renames a new file over it is safe.
+    /// Nothing else is read until a query. Don't rewrite the file in place while it is open, eg. by copying over it.
+    /// The index reads it a little at a time, so it would pair the old cluster tables with the new vectors. A rebuild
+    /// that renames a new file over it is safe.
     pub fn open(path: &Path) -> Result<Index, Error> {
         Ok(Index {
             inner: Arc::new(index::Inner::open(path)?),
@@ -109,16 +110,24 @@ impl Index {
     }
 
     /// Call this when the query text arrives. It starts reading the cluster centers, so that read overlaps the
-    /// embedding model.
+    /// embedding model. Once a search has loaded them, it does nothing.
     pub fn prepare(&self, ctx: &mut SearchCtx) -> Result<(), Error> {
-        self.inner.prepare()
+        self.inner.prepare();
+        Ok(())
     }
 
     /// Searches with the final query embedding. It picks the nearest clusters, reads them in one batch, scores
     /// their vectors, then reads and rescores the best candidates in a second small batch. The hits live in `ctx`,
     /// so a query allocates nothing.
     pub fn search<'a>(&self, query: &[f32], params: &SearchParams, ctx: &'a mut SearchCtx) -> Result<&'a [Hit], Error> {
-        self.inner.search(query, params, ctx)
+        self.inner.check(query, params, &ctx.limits)?;
+
+        let mut leaves = std::mem::take(&mut ctx.leaves);
+        let slot = self
+            .route(query, params.nprobe, ctx, &mut leaves)
+            .and_then(|()| self.inner.fetch(&leaves, ctx));
+        ctx.leaves = leaves;
+        self.inner.search_fetched(query, params, ctx, slot?)
     }
 
     /// Writes the positions of the `nprobe` clusters `query` would read into `out`, nearest first.
@@ -126,10 +135,13 @@ impl Index {
         self.inner.route(query, nprobe, ctx, out)
     }
 
-    /// Starts reading `leaves` in one batch and returns right away. The handle then ranks those clusters, and only
-    /// those, for one or more queries. [`Index::search`] is `route`, then `fetch`, then [`Fetched::search`].
+    /// Starts reading `leaves` in one batch. On macOS it returns while the reads are still running. On other systems,
+    /// and on Mac drives that refuse read hints, eg. FAT32 (File Allocation Table), it returns once they are done. The
+    /// handle then ranks those clusters, and only those, for one or more queries. [`Index::search`] is `route`, then
+    /// `fetch`, then [`Fetched::search`].
     pub fn fetch<'a>(&'a self, leaves: &[LeafId], ctx: &'a mut SearchCtx) -> Result<Fetched<'a>, Error> {
-        todo!()
+        let slot = self.inner.fetch(leaves, ctx)?;
+        Ok(Fetched { index: self, ctx, slot })
     }
 
     /// Reads the whole index into the OS cache in the background. Once it is done, queries read it in place.
@@ -191,14 +203,19 @@ pub struct Limits {
     pub max_k: usize,
     /// Also the most clusters one `fetch` may read.
     pub max_nprobe: usize,
+    /// Also the most candidates whose rows one `prefetch_rows` may read.
     pub max_rerank: usize,
 }
 
 /// Per-thread scratch space, reused across queries. It keeps one set of buffers per index shape, i.e. per dimension and
-/// cluster count, made on the first search with that shape. Run one search with each index before timing.
+/// cluster count, and one set of read buffers per index. Each is made on the first search that needs it, so run one
+/// search with each index before timing.
 pub struct SearchCtx {
     limits: Limits,
     scratch: Vec<search::Scratch>,
+    reads: Vec<search::cold::Reads>,
+    /// The clusters that a search routes to.
+    leaves: Vec<LeafId>,
     hits: Vec<Hit>,
 }
 
@@ -207,6 +224,8 @@ impl SearchCtx {
         SearchCtx {
             limits,
             scratch: Vec::new(),
+            reads: Vec::new(),
+            leaves: Vec::with_capacity(limits.max_nprobe),
             hits: Vec::with_capacity(limits.max_k),
         }
     }
@@ -222,19 +241,22 @@ pub type LeafId = u32;
 pub struct Fetched<'a> {
     index: &'a Index,
     ctx: &'a mut SearchCtx,
+    /// Where the index's reads sit in `ctx`.
+    slot: usize,
 }
 
 impl<'a> Fetched<'a> {
     /// Starts reading the precise copies of the `n` best candidates for `query`. It ranks candidates by their quick
     /// 1-bit estimate, and waits for the clusters to arrive first.
     pub fn prefetch_rows(&mut self, query: &[f32], n: usize) -> Result<(), Error> {
-        todo!()
+        self.index.inner.prefetch_rows(query, n, self.ctx, self.slot)
     }
 
     /// Ranks the fetched clusters for `query`. It scores every vector, reads any precise copies not read yet,
     /// rescores the best `rerank` candidates and returns the top `k`.
     pub fn search(self, query: &[f32], k: usize, rerank: usize) -> Result<&'a [Hit], Error> {
-        todo!()
+        let params = SearchParams { k, nprobe: 0, rerank };
+        self.index.inner.search_fetched(query, &params, self.ctx, self.slot)
     }
 }
 

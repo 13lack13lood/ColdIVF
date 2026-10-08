@@ -49,8 +49,8 @@ fn the_header_reads_back_what_was_written() {
     let (rotation, mean) = read_rotation(&bytes[layout.span(Part::Rotation).range()], &layout).unwrap();
     assert_eq!((rotation, mean), (index.rotation.clone(), index.mean.clone()));
 
-    let tables = read_tables(&bytes, &layout).unwrap();
-    assert_eq!(&bytes[tables.codes.range()], &index.centers[..]);
+    let tables = read_tables(bytes[tables_span(&layout).range()].to_vec(), &layout).unwrap();
+    assert_eq!(tables.codes, index.centers);
     assert_eq!(
         (tables.factors, tables.parent_of, tables.lists),
         (index.center_factors, index.parent_of, index.lists)

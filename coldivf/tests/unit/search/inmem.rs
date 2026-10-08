@@ -31,10 +31,10 @@ fn exact_8_bit(index: &InMemory, query: &[f32], k: usize) -> Vec<Hit> {
     let offset: Vec<f32> = q.iter().zip(&index.mean).map(|(&x, &m)| x - m).collect();
     let norm2 = offset.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>() as f32;
 
-    let view = index.view();
+    let data = index.in_place();
     let mut all: Vec<Candidate> = (0..index.ids.len() as u32)
         .map(|id| Candidate {
-            score: sq8::distance(view.rows.row(id), &offset, norm2),
+            score: sq8::distance(data.rows.row(id), &offset, norm2),
             id,
         })
         .collect();
@@ -43,7 +43,7 @@ fn exact_8_bit(index: &InMemory, query: &[f32], k: usize) -> Vec<Hit> {
     all.iter()
         .take(k)
         .map(|c| Hit {
-            id: sq8::id(view.rows.row(c.id), index.dim),
+            id: sq8::id(data.rows.row(c.id), index.dim),
             score: if index.metric == Metric::Cosine {
                 1.0 - c.score / 2.0
             } else {
@@ -528,7 +528,7 @@ fn a_build_reads_every_chunk_and_keeps_every_id() {
     let (dim, n) = (128, 4100);
     let (rows, clusters) = clustered(&mut rng, n, dim, 3, 0.5);
     let index = InMemory::build(&params(Metric::L2), &rows, &clusters).unwrap();
-    let view = index.view();
+    let data = index.in_place();
 
     let mut ids = index.ids.clone();
     ids.sort_unstable();
@@ -536,7 +536,7 @@ fn a_build_reads_every_chunk_and_keeps_every_id() {
 
     // Each row decodes to its own input vector, within half a step, so no row came from the wrong chunk.
     for id in 0..n as u32 {
-        let (row, ext) = (view.rows.row(id), index.ids[id as usize] as usize);
+        let (row, ext) = (data.rows.row(id), index.ids[id as usize] as usize);
         assert_eq!(sq8::id(row, dim), ext as u64);
         let scale = f64::from(sq8::scale(row, dim));
         for (i, (&x, &m)) in rows.data[ext * dim..(ext + 1) * dim]

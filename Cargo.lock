@@ -13,6 +13,7 @@ name = "coldivf"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "libc",
  "libm",
  "memmap2",
  "zerocopy",
