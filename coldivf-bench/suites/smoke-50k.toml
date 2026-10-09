@@ -1,0 +1,489 @@
+# A smoke test of the whole harness at 50K on the dev set. Every adapter builds one index at its default settings, with
+# only the settings it needs and has no default for filled in, runs a warm grid of 5 settings (1 where a system has no
+# search setting) and 5 true-cold (C0) trials, and every system that has the disk-resident steady state (C1) runs 5
+# trials of it too. Both drift references run at the start and the end. It checks the code, not the machine, so its
+# gate only warns, swap leaves points valid, and builds use 4 threads to share the machine.
+#
+# Every C0 cell first searches a 5K dummy of its own config, as the full runs do with a 50K one. ColdIVF's binaries
+# search no dummy and have no C1, so its cells leave both out. Run the driver with the research environment's Python, and
+# set $COLDIVF_BENCH_VENVS to the folder that holds venv-lance13, the environment of lancedb 0.40 with pylance 13.
+
+phase = "smoke"
+dataset = "cohere-768-cosine"
+n = 50000
+index_root = "data/bench.noindex/smoke"
+
+[gate]
+mode = "warn"
+top_samples = 2
+top_interval_s = 2
+invalid_vm = []
+
+[refs]
+mode = "on"
+wave_trials = 10
+coldivf_index = "data/cohere-50k.coldivf"
+coldivf_dataset = "cohere-768-cosine"
+coldivf_n = 50000
+coldivf_params = { nprobe = 32, rerank = 39 }
+coldivf_trials = 10
+
+[[system]]
+name = "coldivf"
+adapter = "coldivf"
+
+  [[system.build]]
+  config_id = "tl160"
+  config = { clustering = "two-level", vectors_per_list = 160 }
+  threads = 4
+  disk_gb = 1
+  timeout_s = 900
+
+  [[system.warm]]
+  config_id = "tl160"
+  grid = { nprobe = [8, 16, 32, 64, 128], rerank = [39] }
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "tl160"
+  params = { nprobe = 32, rerank = 39 }
+  trials = 5
+
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+
+  [[system.build]]
+  config_id = "vpl160-rq1"
+  config = { vectors_per_list = 160, bits = 1 }
+  threads = 4
+  disk_gb = 1
+  timeout_s = 900
+
+  [[system.warm]]
+  config_id = "vpl160-rq1"
+  grid = { nprobe = [8, 16, 32, 64, 128], k_factor = [4] }
+  passes = 2
+  warmup = 200
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "vpl160-rq1"
+  params = { nprobe = 32, k_factor = 4 }
+  trials = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "vpl160-rq1"
+  regime = "c1"
+  params = { nprobe = 32, k_factor = 4 }
+  trials = 5
+  group = "live"
+
+[[system]]
+name = "faiss-hnsw"
+adapter = "faiss_hnsw"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 1
+  timeout_s = 900
+
+  [[system.warm]]
+  config_id = "default"
+  grid = { ef_search = [16, 32, 64, 128, 256] }
+  passes = 2
+  warmup = 200
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "default"
+  params = { ef_search = 64 }
+  trials = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "default"
+  regime = "c1"
+  params = { ef_search = 64 }
+  trials = 5
+  group = "live"
+
+[[system]]
+name = "usearch"
+adapter = "usearch_hnsw"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 1
+  timeout_s = 900
+
+  [[system.warm]]
+  config_id = "default"
+  grid = { expansion_search = [16, 32, 64, 128, 256] }
+  passes = 2
+  warmup = 200
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "default"
+  params = { expansion_search = 64 }
+  trials = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "default"
+  regime = "c1"
+  params = { expansion_search = 64 }
+  trials = 5
+  group = "live"
+
+[[system]]
+name = "qdrant-edge"
+adapter = "qdrant_shard"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 2
+  timeout_s = 900
+
+  [[system.warm]]
+  config_id = "default"
+  grid = { hnsw_ef = [16, 32, 64, 128, 256], oversampling = [2] }
+  passes = 2
+  warmup = 200
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "default"
+  params = { hnsw_ef = 64, oversampling = 2 }
+  trials = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "default"
+  regime = "c1"
+  params = { hnsw_ef = 64, oversampling = 2 }
+  trials = 5
+  group = "live"
+
+[[system]]
+name = "astervec"
+adapter = "astervec_lsm"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 1
+  timeout_s = 900
+
+  [[system.warm]]
+  config_id = "default"
+  grid = { ef = [16, 32, 64, 128, 256] }
+  passes = 2
+  warmup = 200
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "default"
+  params = { ef = 64 }
+  trials = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "default"
+  regime = "c1"
+  params = { ef = 64 }
+  trials = 5
+  group = "live"
+
+[[system]]
+name = "diskann"
+adapter = "diskann"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 1
+  timeout_s = 900
+
+  [[system.warm]]
+  config_id = "default"
+  grid = { list = [10, 20, 50, 100, 200], beam = [4] }
+  passes = 2
+  warmup = 200
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "default"
+  params = { list = 100, beam = 4 }
+  trials = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "default"
+  regime = "c1"
+  params = { list = 100, beam = 4 }
+  trials = 5
+  group = "live"
+
+# Lance's cold cells use its default compute pool, 10 threads on this 12-core Mac.
+[[system]]
+name = "lancedb"
+adapter = "lancedb"
+python = "${COLDIVF_BENCH_VENVS}/venv-lance13/bin/python3"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 1
+  timeout_s = 900
+
+  [[system.warm]]
+  config_id = "default"
+  grid = { nprobes = [8, 16, 32, 64, 128], refine_factor = [4] }
+  passes = 2
+  warmup = 200
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "default"
+  params = { nprobes = 32, refine_factor = 4 }
+  trials = 5
+  threads = 10
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "default"
+  regime = "c1"
+  params = { nprobes = 32, refine_factor = 4 }
+  trials = 5
+  threads = 10
+  group = "live"
+
+[[system]]
+name = "paimon"
+adapter = "paimon"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 1
+  timeout_s = 900
+
+  [[system.warm]]
+  config_id = "default"
+  grid = { nprobe = [8, 16, 32, 64, 128] }
+  passes = 2
+  warmup = 200
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "default"
+  params = { nprobe = 32 }
+  trials = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "default"
+  regime = "c1"
+  params = { nprobe = 32 }
+  trials = 5
+  group = "live"
+
+[[system]]
+name = "rabitq-ivf"
+adapter = "rabitq_ivf"
+
+  [[system.build]]
+  config_id = "vpl160-b5"
+  config = { vectors_per_list = 160, bits = 5 }
+  threads = 4
+  disk_gb = 1
+  timeout_s = 900
+
+  [[system.warm]]
+  config_id = "vpl160-b5"
+  grid = { nprobe = [8, 16, 32, 64, 128] }
+  passes = 2
+  warmup = 200
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "vpl160-b5"
+  params = { nprobe = 32 }
+  trials = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "vpl160-b5"
+  regime = "c1"
+  params = { nprobe = 32 }
+  trials = 5
+  group = "live"
+
+[[system]]
+name = "rabitq-hnsw"
+adapter = "rabitq_hnsw"
+
+  [[system.build]]
+  config_id = "b4"
+  config = { bits = 4 }
+  threads = 4
+  disk_gb = 1
+  timeout_s = 900
+
+  [[system.warm]]
+  config_id = "b4"
+  grid = { ef = [16, 32, 64, 128, 256] }
+  passes = 2
+  warmup = 200
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "b4"
+  params = { ef = 64 }
+  trials = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "b4"
+  regime = "c1"
+  params = { ef = 64 }
+  trials = 5
+  group = "live"
+
+[[system]]
+name = "symphonyqg"
+adapter = "symphonyqg"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 1
+  timeout_s = 900
+
+  [[system.warm]]
+  config_id = "default"
+  grid = { ef = [16, 32, 64, 128, 256] }
+  passes = 2
+  warmup = 200
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "default"
+  params = { ef = 64 }
+  trials = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "default"
+  regime = "c1"
+  params = { ef = 64 }
+  trials = 5
+  group = "live"
+
+# turbovec, sqlite-vec's exact scan and flat take no search setting, so their warm grids hold one setting.
+[[system]]
+name = "turbovec"
+adapter = "turbovec"
+
+  [[system.build]]
+  config_id = "b4"
+  config = { bits = 4 }
+  threads = 4
+  disk_gb = 1
+  timeout_s = 900
+
+  [[system.warm]]
+  config_id = "b4"
+  settings = [{}]
+  passes = 2
+  warmup = 200
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "b4"
+  params = {}
+  trials = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "b4"
+  regime = "c1"
+  params = {}
+  trials = 5
+  group = "live"
+
+[[system]]
+name = "sqlite-vec"
+adapter = "sqlite_vec"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 1
+  timeout_s = 900
+
+  [[system.warm]]
+  config_id = "default"
+  settings = [{}]
+  passes = 1
+  warmup = 50
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "default"
+  params = {}
+  trials = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "default"
+  regime = "c1"
+  params = {}
+  trials = 5
+  group = "live"
+
+[[system]]
+name = "flat"
+adapter = "flat"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 1
+  timeout_s = 900
+
+  [[system.warm]]
+  config_id = "default"
+  settings = [{}]
+  passes = 1
+  warmup = 50
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "default"
+  params = {}
+  trials = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "default"
+  regime = "c1"
+  params = {}
+  trials = 5
+  group = "live"
