@@ -1,13 +1,11 @@
 //! Unit tests for calibration.
 
-use std::sync::Arc;
-
 use super::*;
 use crate::build::write;
 use crate::quantization::SplitMix64;
-use crate::quantization::testutil::{TempFile, clustered, dist2, group, params, temp_file};
+use crate::quantization::testutil::{Rows, TempFile, clustered, dist2, gaussian, group, params, temp_file};
 use crate::search::inmem::InMemory;
-use crate::{Index, Metric, SearchCtx};
+use crate::{Anchor, BuildParams, Clusters, Index, Metric, SearchCtx};
 
 /// The tests' vector dimension.
 const DIM: usize = 128;
@@ -17,16 +15,25 @@ const DIM: usize = 128;
 /// cluster, and with 2 the clusters overlap.
 fn sample(name: &str, n: usize, nlist: usize, nq: usize, spread: f64) -> (Index, TempFile, Vec<f32>, Vec<u32>) {
     let mut rng = SplitMix64::new(31);
-    let dim = DIM;
-    let (rows, mut clusters) = clustered(&mut rng, n, dim, nlist, spread);
+    let (rows, mut clusters) = clustered(&mut rng, n, DIM, nlist, spread);
     group(&mut clusters, 3);
-    let memory = InMemory::build(&params(Metric::L2), &rows, &clusters).unwrap();
+    let (index, path) = index_of(name, &params(Metric::L2), &rows, &clusters);
+    let (queries, truth) = near(&mut rng, &rows, nq);
+    (index, path, queries, truth)
+}
+
+/// The index of `rows` in `clusters`, written to the test file `name` and opened.
+fn index_of(name: &str, settings: &BuildParams, rows: &Rows, clusters: &Clusters) -> (Index, TempFile) {
+    let memory = InMemory::build(settings, rows, clusters).unwrap();
     let path = temp_file(name);
     write(&memory, &path).unwrap();
-    let index = Index {
-        inner: Arc::new(Inner::open(&path).unwrap()),
-    };
+    let index = Index::of(Inner::open(&path).unwrap());
+    (index, path)
+}
 
+/// `nq` queries, each a vector of `rows` moved a little, and their exact 10 nearest neighbors among `rows`.
+fn near(rng: &mut SplitMix64, rows: &Rows, nq: usize) -> (Vec<f32>, Vec<u32>) {
+    let (dim, n) = (rows.dim, rows.data.len() / rows.dim);
     let mut queries = Vec::with_capacity(nq * dim);
     for _ in 0..nq {
         let r = (rng.next_u64() % n as u64) as usize;
@@ -49,7 +56,7 @@ fn sample(name: &str, n: usize, nlist: usize, nq: usize, spread: f64) -> (Index,
             exact[..TRUTH].iter().map(|e| e.1).collect::<Vec<_>>()
         })
         .collect();
-    (index, path, queries, truth)
+    (queries, truth)
 }
 
 /// The share of a query's true 10 nearest neighbors that a real search with `c` finds.
@@ -71,7 +78,7 @@ fn ctx() -> SearchCtx {
     SearchCtx::new(Limits {
         max_k: TRUTH,
         max_nprobe: 64,
-        max_rerank: 256,
+        max_rerank: 2048,
     })
 }
 
@@ -99,8 +106,9 @@ fn each_setting_s_recall_matches_a_real_search() {
             })
         })
         .collect();
-    let tables = index.inner.tables().unwrap();
-    let (view, data) = (index.inner.view(tables), index.inner.in_place());
+    let inner = index.inner();
+    let tables = inner.tables().unwrap();
+    let (view, data) = (inner.view(tables), inner.in_place());
     // Rows cost 5000 bytes here, which no page size is, so the cost must come from this argument.
     let runs = Evaluator::new(&view, &data, 64, 5000)
         .run_all(&queries, &truth, &settings)
@@ -137,11 +145,12 @@ fn a_calibrated_setting_meets_its_target_on_new_queries() {
             share: 0.9,
         },
     ];
-    let tables = index.inner.tables().unwrap();
-    let (view, data) = (index.inner.view(tables), index.inner.in_place());
+    let inner = index.inner();
+    let tables = inner.tables().unwrap();
+    let (view, data) = (inner.view(tables), inner.in_place());
 
     for target in targets {
-        let c = calibrate(&index.inner, cal_q, cal_t, target).unwrap();
+        let c = calibrate(&index.inner(), cal_q, cal_t, target).unwrap();
         let recalls: Vec<f32> = test_q
             .chunks_exact(dim)
             .zip(test_t.as_chunks::<TRUTH>().0)
@@ -162,7 +171,7 @@ fn a_calibrated_setting_meets_its_target_on_new_queries() {
             rerank: 256,
             reach: None,
         };
-        let runs = Evaluator::new(&view, &data, 64, index.inner.read_page())
+        let runs = Evaluator::new(&view, &data, 64, index.inner().read_page())
             .run_all(cal_q, cal_t, &[c, most])
             .unwrap();
         assert!(runs.cost(0, 2) * 4.0 < runs.cost(1, 2), "{c:?}");
@@ -172,17 +181,24 @@ fn a_calibrated_setting_meets_its_target_on_new_queries() {
 #[test]
 fn a_lower_target_never_costs_more() {
     let (index, _path, queries, truth) = sample("calibrate-cost.coldivf", 3000, 64, 200, 1.0);
-    let low = calibrate(&index.inner, &queries, &truth, Target::MeanRecall { recall_at_10: 0.7 }).unwrap();
+    let low = calibrate(
+        &index.inner(),
+        &queries,
+        &truth,
+        Target::MeanRecall { recall_at_10: 0.7 },
+    )
+    .unwrap();
     let high = calibrate(
-        &index.inner,
+        &index.inner(),
         &queries,
         &truth,
         Target::MeanRecall { recall_at_10: 0.95 },
     )
     .unwrap();
-    let tables = index.inner.tables().unwrap();
-    let (view, data) = (index.inner.view(tables), index.inner.in_place());
-    let runs = Evaluator::new(&view, &data, 64, index.inner.read_page())
+    let inner = index.inner();
+    let tables = inner.tables().unwrap();
+    let (view, data) = (inner.view(tables), inner.in_place());
+    let runs = Evaluator::new(&view, &data, 64, index.inner().read_page())
         .run_all(&queries, &truth, &[low, high])
         .unwrap();
 
@@ -266,6 +282,115 @@ fn the_reach_grid_caps_the_clusters_read_near_the_best_fixed_setting() {
     caps.dedup();
     assert_eq!(caps, [100, 120]);
     assert!(grid.iter().all(|c| [10, 12, 14].contains(&c.rerank)));
+
+    // They also stop at the most clusters a fixed setting reads, so no setting needs a larger context than those.
+    let deep = Calibration {
+        nprobe: 3072,
+        rerank: 2048,
+        reach: None,
+    };
+    let grid = reach_grid(&deep, 10_000);
+    let mut caps: Vec<usize> = grid.iter().map(|c| c.nprobe).collect();
+    caps.dedup();
+    assert_eq!(caps, [3072, 3840, 4096]);
+    assert!(grid.iter().all(|c| [1024, 1536, 2048].contains(&c.rerank)));
+}
+
+#[test]
+fn the_grids_reach_4096_clusters_and_2048_candidates_in_steps_of_at_most_1_5() {
+    // Past the first step, from 1 to 2, each cluster count is at most 1.5 times the one before, and so is each depth.
+    for grid in [&NPROBES[1..], &RERANKS[..]] {
+        assert!(grid.windows(2).all(|w| w[0] < w[1] && 2 * w[1] <= 3 * w[0]), "{grid:?}");
+    }
+
+    assert_eq!((NPROBES[NPROBES.len() - 1], RERANKS[RERANKS.len() - 1]), (4096, 2048));
+
+    // The fixed settings stop at the index's cluster count, or at 4096 for a larger index, with each count once.
+    let tail = |nlist: usize| {
+        let all = fixed_nprobes(nlist);
+        all[all.len().saturating_sub(3)..].to_vec()
+    };
+    assert_eq!(tail(120), [96, 112, 120]);
+    assert_eq!(tail(4096), [2048, 3072, 4096]);
+    assert_eq!(tail(10_000), [2048, 3072, 4096]);
+    assert_eq!(fixed_nprobes(1), [1]);
+}
+
+#[test]
+fn rescoring_counts_up_to_2048_candidates() {
+    // Vectors spread wide around 3 centers make the 1-bit estimates rank many true neighbors far down, so only a deep
+    // rescore finds them.
+    let (index, _path, queries, truth) = sample("calibrate-deep.coldivf", 6000, 3, 40, 4.0);
+    let settings = [256, 2048].map(|rerank| Calibration {
+        nprobe: 3,
+        rerank,
+        reach: None,
+    });
+    let inner = index.inner();
+    let tables = inner.tables().unwrap();
+    let (view, data) = (inner.view(tables), inner.in_place());
+    let runs = Evaluator::new(&view, &data, 3, 4096)
+        .run_all(&queries, &truth, &settings)
+        .unwrap();
+    let (mut ctx, mut deeper) = (ctx(), 0);
+    let pairs = queries.as_chunks::<DIM>().0.iter().zip(truth.as_chunks::<TRUTH>().0);
+
+    for (q, (query, t)) in pairs.enumerate() {
+        for (i, c) in settings.iter().enumerate() {
+            let want = recall_of(&index, &mut ctx, query, t, c);
+            assert_eq!(runs.recall[q * 2 + i], want, "query {q}, {c:?}");
+        }
+        deeper += usize::from(runs.recall[q * 2 + 1] > runs.recall[q * 2]);
+    }
+
+    // The deeper rescore finds more for some queries, so the two depths really differ here.
+    assert!(deeper > 0, "no query found more with the deeper rescore");
+}
+
+#[test]
+fn a_target_that_needs_4096_clusters_gets_them() {
+    // Each vector goes to one of 4300 clusters at random, so the route says nothing about where a query's neighbors
+    // are, and a search finds about the share of the clusters it reads. A mean recall of 0.8 then needs more than the
+    // 3072 clusters before 4096. The codes are measured from the mean, so they don't depend on the clusters.
+    let mut rng = SplitMix64::new(41);
+    let (n, nlist, cal, test) = (6000, 4300, 160, 60);
+    let (rows, _) = clustered(&mut rng, n, DIM, 30, 1.0);
+    let mut clusters = Clusters {
+        dim: DIM,
+        centroids: gaussian(&mut rng, nlist, DIM, |_| 1.0),
+        assignment: (0..n).map(|_| (rng.next_u64() % nlist as u64) as u32).collect(),
+        parents: Vec::new(),
+        parent_of: Vec::new(),
+    };
+    group(&mut clusters, 3);
+    let settings = BuildParams {
+        anchor: Anchor::Mean,
+        ..params(Metric::L2)
+    };
+    let (index, _path) = index_of("calibrate-wide.coldivf", &settings, &rows, &clusters);
+    let (queries, truth) = near(&mut rng, &rows, cal + test);
+    let (cal_q, test_q) = queries.split_at(cal * DIM);
+    let (cal_t, test_t) = truth.split_at(cal * TRUTH);
+
+    let c = calibrate(&index.inner(), cal_q, cal_t, Target::MeanRecall { recall_at_10: 0.8 }).unwrap();
+    assert_eq!(c.nprobe, 4096, "{c:?}");
+
+    // A context sized for the largest settings that calibration tries runs the pick, which meets the target on new
+    // queries.
+    let mut ctx = SearchCtx::new(Limits {
+        max_k: TRUTH,
+        max_nprobe: 4096,
+        max_rerank: 2048,
+    });
+    let found: f32 = test_q
+        .as_chunks::<DIM>()
+        .0
+        .iter()
+        .zip(test_t.as_chunks::<TRUTH>().0)
+        .map(|(q, t)| recall_of(&index, &mut ctx, q, t, &c))
+        .sum();
+    let mean = found / test as f32;
+    assert!(mean >= 0.8, "{c:?} gave a mean recall of {mean}");
 }
 
 #[test]
@@ -276,7 +401,7 @@ fn a_target_out_of_reach_fails_with_invalid_input() {
         share: 0.999,
     };
 
-    let err = calibrate(&index.inner, &queries, &truth, strict).unwrap_err();
+    let err = calibrate(&index.inner(), &queries, &truth, strict).unwrap_err();
     assert_eq!(
         err.to_string(),
         "no setting meets the target with 90% confidence on these queries"
@@ -287,7 +412,7 @@ fn a_target_out_of_reach_fails_with_invalid_input() {
 fn bad_arguments_fail_with_invalid_input() {
     let (index, _path, queries, truth) = sample("calibrate-bad.coldivf", 1000, 16, 60, 1.0);
     let mean = Target::MeanRecall { recall_at_10: 0.8 };
-    let message = |q: &[f32], t: &[u32], target| calibrate(&index.inner, q, t, target).unwrap_err().to_string();
+    let message = |q: &[f32], t: &[u32], target| calibrate(&index.inner(), q, t, target).unwrap_err().to_string();
     let (count, length) = (
         "calibration needs at least 2 queries and 10 true neighbors for each",
         "the queries' length isn't a multiple of the index's dimension",
@@ -299,7 +424,7 @@ fn bad_arguments_fail_with_invalid_input() {
     let share = |recall_at_10, share| Target::QueryShare { recall_at_10, share };
 
     // The same queries with good arguments pass, so each failure below comes from its argument.
-    calibrate(&index.inner, &queries, &truth, mean).unwrap();
+    calibrate(&index.inner(), &queries, &truth, mean).unwrap();
     assert_eq!(message(&queries, &truth[1..], mean), count);
     assert_eq!(message(&queries[..DIM], &truth[..TRUTH], mean), count);
     assert_eq!(message(&queries[1..], &truth, mean), length);

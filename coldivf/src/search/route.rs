@@ -1,13 +1,31 @@
 //! Routing, which picks the clusters a query reads.
 
-use super::candidates::{Candidate, order};
-use crate::kernels::{Tier, sq4_dots};
-use crate::quantization::sq4::{CenterFactors, QueryS8, route_score};
+use super::candidates::{Candidate, Candidates, order};
+use crate::LeafId;
+use crate::kernels::{Tier, center_distance2, sq4_dots};
+use crate::quantization::sq4::{CenterFactors, QueryS8, QueryS32, route_score};
 
 /// The 4-bit codes of every cluster center, back to back, and the factors stored with them.
 pub(crate) struct Centers<'a> {
     pub(crate) codes: &'a [u8],
     pub(crate) factors: &'a [CenterFactors],
+    /// Each center's `decoded_norm2`, for codes measured from the clusters' centers. It is empty with the mean anchor.
+    pub(crate) norms: &'a [f64],
+}
+
+impl<'a> Centers<'a> {
+    /// The codes and the factors of cluster `leaf`'s center.
+    pub(crate) fn center(&self, leaf: LeafId) -> (&'a [u8], &'a CenterFactors) {
+        let (i, size) = (leaf as usize, self.codes.len() / self.factors.len());
+        (&self.codes[i * size..(i + 1) * size], &self.factors[i])
+    }
+
+    /// ‖q − ĉ‖² for the center ĉ that cluster `leaf`'s codes decode to, from the query's fixed point `q`, on `tier`. It
+    /// needs `norms`, so only codes measured from the clusters' centers ask for it.
+    pub(crate) fn distance2(&self, tier: Tier, leaf: LeafId, q: &QueryS32) -> f64 {
+        let (codes, f) = self.center(leaf);
+        center_distance2(tier, codes, f, self.norms[leaf as usize], q)
+    }
 }
 
 /// Scores every cluster center and leaves the `nprobe` nearest in `routes`, nearest first. Ties go to the lower cluster
@@ -48,6 +66,43 @@ pub(crate) fn route(
 
     routes.select_nth_unstable_by(nprobe - 1, order);
     routes.truncate(nprobe);
+    routes.sort_unstable_by(order);
+}
+
+/// The cluster centers that a search scores at a time, so that none of its buffers grows with the cluster count.
+pub(crate) const CHUNK: usize = 1024;
+
+/// Scores every cluster center, `CHUNK` at a time, and leaves the `nprobe` nearest in `routes`, nearest first, exactly
+/// as `route` does. `dots` has room for `CHUNK` dot products, and `best`, which keeps the nearest as the scores come,
+/// for `nprobe` of them, so neither depends on the cluster count.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn route_chunked(
+    tier: Tier,
+    centers: &Centers,
+    q8: &QueryS8,
+    t2: f32,
+    nprobe: usize,
+    dots: &mut [i32],
+    best: &mut Candidates,
+    routes: &mut Vec<Candidate>,
+) {
+    let size = q8.q8.len() / 2;
+    best.reset(nprobe);
+
+    for (c, codes) in centers.codes.chunks(CHUNK * size).enumerate() {
+        let dots = &mut dots[..codes.len() / size];
+        sq4_dots(tier, codes, &q8.q8, dots);
+        for (i, &dot) in dots.iter().enumerate() {
+            let id = c * CHUNK + i;
+            best.push(Candidate {
+                score: route_score(t2, &centers.factors[id], q8, dot),
+                id: id as u32,
+            });
+        }
+    }
+
+    routes.clear();
+    routes.extend_from_slice(best.as_slice());
     routes.sort_unstable_by(order);
 }
 

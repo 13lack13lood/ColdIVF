@@ -3,17 +3,18 @@
 
 use std::fs::File;
 use std::io::Error;
-use std::ptr;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use super::candidates::Candidate;
-use super::scan::scan_list;
+use super::scan::scan_leaf;
 use super::{List, Scratch, View};
-use crate::format::{Layout, Part};
-use crate::index::Inner;
-use crate::io::{Range, Span, Wave, arena_bound, coalesce};
+use crate::format::{Layout, Part, Tables};
+use crate::index::{Inner, Shared};
+use crate::io::{Arena, Range, Span, Wave, arena_bound, coalesce};
 use crate::quantization::rabitq::{BLOCK, block_bytes};
 use crate::quantization::{padded_dim, sq8};
+use crate::trace::{Clock, ReadPath};
 use crate::{LeafId, Limits};
 
 /// The backend lane of the cluster wave and the late row wave, which never overlap.
@@ -23,10 +24,20 @@ const MAIN: usize = 0;
 const EARLY: usize = 1;
 
 /// One search context's reads of one index. Its arenas are sized once from the context's limits, so a query allocates
-/// nothing.
+/// nothing. The cluster arena also needs the cluster tables, so reads made before they load make it later, in `size`.
+/// When the index moves to a new generation, the reads are planned again in place, and keep their arenas and their
+/// backend's threads. Only a cluster arena that the new generation's largest clusters outgrow grows, with room to
+/// spare.
 pub(crate) struct Reads {
-    /// The index it reads. Holding it keeps the index's allocation alive, so no later index can take its address.
-    owner: Weak<Inner>,
+    /// The cell of the index it reads, held weakly so it tells when the index closed, and the cell's number, which
+    /// keys the reads in a context. Numbers are never used twice, unlike addresses.
+    owner: Weak<Shared>,
+    cell: u64,
+    /// The number of the generation that the reads are planned for, and of the one that the cluster arena was sized
+    /// for, or 0 before the cluster tables of any loaded.
+    generation: u64,
+    sized_for: u64,
+    /// It comes before the batches, so it drops first and waits for any reads still landing in their arenas.
     wave: Box<dyn Wave>,
     page: usize,
     file_len: usize,
@@ -48,53 +59,155 @@ pub(crate) struct Reads {
     early_used: bool,
     /// The row pages that the final query needs and the early wave didn't read.
     late: Batch,
+    /// How long the last scan waited for its clusters to arrive, measured only with the `bench` feature.
+    waited: Duration,
+    /// How many searches read their rows through these reads, and the backend's hits when the last search began.
+    searches: usize,
+    hits_at: usize,
 }
 
 impl Reads {
-    /// Reads of the index `owner`, with the file layout `layout` and the clusters `lists`, through `wave`.
+    /// Reads of the index `owner`, with the file layout `layout` and the cluster tables `tables`, through `wave`.
     pub(crate) fn new(
         owner: &Arc<Inner>,
         wave: Box<dyn Wave>,
         layout: &Layout,
         file_len: usize,
-        lists: &[List],
+        tables: &Tables,
+        limits: &Limits,
+    ) -> Reads {
+        let mut reads = Reads::ahead(owner, wave, layout, file_len, limits);
+        reads.size(owner.cold_file(), tables, limits);
+        reads
+    }
+
+    /// The same, made before the cluster tables load, eg. by `Index::prepare` of a cold index. It readies the backend
+    /// for the file and makes every arena but the cluster arena, which `size` makes once the tables are loaded.
+    pub(crate) fn ahead(
+        owner: &Arc<Inner>,
+        wave: Box<dyn Wave>,
+        layout: &Layout,
+        file_len: usize,
         limits: &Limits,
     ) -> Reads {
         let page = wave.page();
-        let block = block_bytes(padded_dim(layout.dim));
         let rows = RowSection::new(layout);
         let keep = limits.max_rerank.max(limits.max_k);
-        // The arena must hold the largest clusters that one fetch may read.
-        let mut lens: Vec<usize> = lists.iter().map(|l| l.count.div_ceil(BLOCK) * block).collect();
-        let most = limits.max_nprobe.min(lens.len());
-
-        if most < lens.len() {
-            lens.select_nth_unstable_by(most, |a, b| b.cmp(a));
-        }
-
         let row_arena = keep * rows.room(page);
-        Reads {
-            owner: Arc::downgrade(owner),
+        let mut reads = Reads {
+            owner: owner.owner(),
+            cell: owner.cell(),
+            generation: owner.uid(),
+            sized_for: 0,
             wave,
             page,
             file_len,
             codes: layout.span(Part::Codes).offset,
-            block,
+            block: block_bytes(padded_dim(layout.dim)),
             rows,
-            clusters: Batch::new(limits.max_nprobe, arena_bound(lens[..most].iter().copied(), page)),
+            clusters: Batch::new(limits.max_nprobe, 0),
             clusters_in: true,
             failed: false,
             early: Batch::new(keep, row_arena),
             early_pending: false,
             early_used: false,
             late: Batch::new(keep, row_arena),
+            waited: Duration::ZERO,
+            searches: 0,
+            hits_at: 0,
+        };
+        let Reads { wave, early, late, .. } = &mut reads;
+        wave.ready(owner.cold_file(), &[early.arena.memory(), late.arena.memory()], keep);
+        reads
+    }
+
+    /// Makes the cluster arena for the generation that the reads are planned for, unless it is made. It holds the
+    /// largest clusters of `tables`, those that one fetch may read, and a quarter more, and the backend may then
+    /// register it along with the others. For a later generation it keeps the arena that it has when the largest
+    /// clusters fit, and makes one half again as large as they need when they don't.
+    pub(crate) fn size(&mut self, file: &File, tables: &Tables, limits: &Limits) {
+        if self.sized_for == self.generation {
+            return;
         }
+
+        let most = limits.max_nprobe.min(tables.largest.len());
+        let lens = tables.largest[..most].iter().map(|&b| b as usize * self.block);
+        let bound = arena_bound(lens, self.page);
+
+        if self.sized_for == 0 {
+            self.clusters.arena = Arena::new(bound + bound / 4);
+        } else if bound > self.clusters.arena.len() {
+            self.clusters.arena = Arena::new(bound + bound / 2);
+        }
+
+        self.sized_for = self.generation;
+        let keep = limits.max_rerank.max(limits.max_k);
+        let Reads {
+            wave,
+            clusters,
+            early,
+            late,
+            ..
+        } = self;
+        let arenas = [clusters.arena.memory(), early.arena.memory(), late.arena.memory()];
+        wave.ready(file, &arenas, limits.max_nprobe.max(keep));
+    }
+
+    /// Does the backend's setup that may wait, eg. registering the arenas with the kernel, once a search has read its
+    /// rows through these reads, so a process that searches once never pays for it.
+    pub(crate) fn prepare(&mut self) {
+        if self.sized() && self.searches > 0 {
+            self.wave.prepare();
+        }
+    }
+
+    /// Whether the cluster arena is made for the generation that the reads are planned for.
+    pub(crate) fn sized(&self) -> bool {
+        self.sized_for == self.generation
+    }
+
+    /// The number of the generation that the reads are planned for.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Plans the reads again in place for `owner`, a newer generation of the index they read, with the file layout
+    /// `layout`. It forgets every wave and keeps every arena. The cluster arena waits for `size`, which checks it
+    /// against the new generation's clusters. A row arena grows only if the new file packs its rows in larger pieces
+    /// of read pages, which a new generation never does.
+    pub(crate) fn replan(&mut self, owner: &Inner, layout: &Layout, file_len: usize, limits: &Limits) {
+        self.forget();
+        (self.generation, self.file_len) = (owner.uid(), file_len);
+        self.codes = layout.span(Part::Codes).offset;
+        self.block = block_bytes(padded_dim(layout.dim));
+        self.rows = RowSection::new(layout);
+        let keep = limits.max_rerank.max(limits.max_k);
+        let row_arena = keep * self.rows.room(self.page);
+
+        if row_arena > self.early.arena.len() {
+            (self.early.arena, self.late.arena) = (Arena::new(row_arena), Arena::new(row_arena));
+        }
+
+        let Reads { wave, early, late, .. } = self;
+        wave.ready(owner.cold_file(), &[early.arena.memory(), late.arena.memory()], keep);
+    }
+
+    /// The backend and how it is set up.
+    pub(crate) fn read_path(&self) -> ReadPath {
+        self.wave.read_path()
+    }
+
+    /// The ranges that came from the backend's own copies of pages since the last search began. A backend that set
+    /// itself up again since counts from 0.
+    pub(crate) fn hits(&self) -> usize {
+        self.wave.hits().saturating_sub(self.hits_at)
     }
 
     /// Starts reading the blocks of `leaves`, each of which must be under the cluster count. A cluster without vectors
     /// needs no read.
     pub(crate) fn fetch(&mut self, file: &File, lists: &[List], leaves: &[LeafId]) -> Result<(), Error> {
         (self.clusters_in, self.failed, self.early_pending) = (false, true, false);
+        self.hits_at = self.wave.hits();
         self.early.clear();
         self.late.clear();
         let c = &mut self.clusters;
@@ -112,7 +225,7 @@ impl Reads {
             }
         }));
         coalesce(&c.spans, self.page, self.file_len, &mut c.ranges, &mut c.at);
-        self.wave.submit(MAIN, file, &c.ranges, &mut c.arena)?;
+        self.wave.submit(MAIN, file, &c.ranges, c.arena.memory())?;
         (self.clusters_in, self.failed) = (c.ranges.is_empty(), false);
         Ok(())
     }
@@ -120,6 +233,7 @@ impl Reads {
     /// Forgets every fetch and row wave, eg. before a search that scans its clusters in place and reads only rows.
     pub(crate) fn forget(&mut self) {
         (self.clusters_in, self.failed, self.early_pending) = (true, false, false);
+        self.hits_at = self.wave.hits();
         self.clusters.clear();
         self.early.clear();
         self.late.clear();
@@ -135,15 +249,19 @@ impl Reads {
         let c = &mut self.clusters;
 
         if self.clusters_in {
+            self.waited = Duration::ZERO;
             (0..c.ranges.len()).for_each(|i| scan_range(c, i, view, s));
             return Ok(());
         }
 
         self.failed = true;
-        let mut arrived = 0;
+        let (mut arrived, mut clock) = (0, Clock::start());
+        self.waited = Duration::ZERO;
 
-        while let Some(i) = self.wave.next(MAIN, file, &c.ranges, &mut c.arena)? {
+        while let Some(i) = self.wave.next(MAIN, file, &c.ranges, c.arena.memory())? {
+            self.waited += clock.lap();
             scan_range(c, i, view, s);
+            clock.lap();
             arrived += 1;
         }
 
@@ -165,7 +283,7 @@ impl Reads {
         e.keys.dedup();
         self.rows.plan(e, self.page, self.file_len);
 
-        if let Err(err) = self.wave.submit(EARLY, file, &e.ranges, &mut e.arena) {
+        if let Err(err) = self.wave.submit(EARLY, file, &e.ranges, e.arena.memory()) {
             e.clear();
             return Err(err);
         }
@@ -175,14 +293,15 @@ impl Reads {
     }
 
     /// Reads the rows of `candidates`. It starts reading the rows that the early wave didn't before it waits for the
-    /// early rows, and it skips the wait when none of them are needed.
-    pub(crate) fn read_rows(&mut self, file: &File, candidates: &[Candidate]) -> Result<(), Error> {
-        self.start_rows(file, candidates)?;
+    /// early rows, and it skips the wait when none of them are needed. With `warm`, eg. for a warm index, the rows are
+    /// likely in the operating system's cache, so they are read through it.
+    pub(crate) fn read_rows(&mut self, file: &File, candidates: &[Candidate], warm: bool) -> Result<(), Error> {
+        self.start_rows(file, candidates, warm)?;
         self.finish_rows(file)
     }
 
     /// Starts reading the rows of `candidates` that the early wave didn't, so other reads can start before the wait.
-    pub(crate) fn start_rows(&mut self, file: &File, candidates: &[Candidate]) -> Result<(), Error> {
+    pub(crate) fn start_rows(&mut self, file: &File, candidates: &[Candidate], warm: bool) -> Result<(), Error> {
         let (e, l) = (&mut self.early, &mut self.late);
         l.keys.clear();
         l.keys.extend(self.rows.pages(candidates));
@@ -192,7 +311,11 @@ impl Reads {
         l.keys.retain(|p| e.keys.binary_search(p).is_err());
         self.rows.plan(l, self.page, self.file_len);
         self.early_used = l.keys.len() < needed;
-        self.wave.submit(MAIN, file, &l.ranges, &mut l.arena)
+
+        match warm {
+            true => self.wave.submit_cached(MAIN, file, &l.ranges, l.arena.memory()),
+            false => self.wave.submit(MAIN, file, &l.ranges, l.arena.memory()),
+        }
     }
 
     /// Waits for the rows that `start_rows` started, and for the early rows when some of them are needed.
@@ -202,7 +325,24 @@ impl Reads {
         }
 
         self.early_pending = false;
-        drain(&mut *self.wave, MAIN, file, &mut self.late)
+        drain(&mut *self.wave, MAIN, file, &mut self.late)?;
+        self.searches += 1;
+        Ok(())
+    }
+
+    /// How long the last scan waited for its clusters to arrive.
+    pub(crate) fn waited(&self) -> Duration {
+        self.waited
+    }
+
+    /// The bytes and the ranges of the last cluster wave.
+    pub(crate) fn cluster_traffic(&self) -> (usize, usize) {
+        traffic(&self.clusters)
+    }
+
+    /// The bytes and the ranges of the last row wave that the final query needed.
+    pub(crate) fn row_traffic(&self) -> (usize, usize) {
+        traffic(&self.late)
     }
 
     /// The row of internal id `id`, which one of the row waves read.
@@ -219,14 +359,23 @@ impl Reads {
             }
         };
         let at = b.at[j] + (id as usize % self.rows.per_page) * self.rows.row_bytes;
-        &b.arena[at..at + self.rows.row_bytes]
+        b.arena.part(at, self.rows.row_bytes)
     }
 }
 
-/// The slot in `slots` of the reads of `index`, made with `make` if there isn't one yet. Making one first drops the
-/// reads of indexes that have closed.
-pub(crate) fn reads_for(slots: &mut Vec<Reads>, index: &Arc<Inner>, make: impl FnOnce() -> Reads) -> usize {
-    if let Some(i) = slots.iter().position(|r| ptr::eq(r.owner.as_ptr(), Arc::as_ptr(index))) {
+/// The slot in `slots` of the reads of `index`, made with `make` if there isn't one yet, and planned again in place if
+/// it was planned for another generation of the same index. Making one first drops the reads of indexes that have
+/// closed.
+pub(crate) fn reads_for(
+    slots: &mut Vec<Reads>,
+    index: &Arc<Inner>,
+    limits: &Limits,
+    make: impl FnOnce() -> Reads,
+) -> usize {
+    if let Some(i) = slots.iter().position(|r| r.cell == index.cell()) {
+        if slots[i].generation != index.uid() {
+            slots[i].replan(index, index.layout(), index.file_len(), limits);
+        }
         return i;
     }
 
@@ -235,13 +384,18 @@ pub(crate) fn reads_for(slots: &mut Vec<Reads>, index: &Arc<Inner>, make: impl F
     slots.len() - 1
 }
 
+/// The bytes and the ranges of `batch`'s wave.
+fn traffic(batch: &Batch) -> (usize, usize) {
+    (batch.ranges.iter().map(|r| r.len).sum(), batch.ranges.len())
+}
+
 /// One wave's plan. Span j is the cluster or row page `keys[j]`, and its bytes land at `arena[at[j]..]`.
 struct Batch {
     keys: Vec<u32>,
     spans: Vec<Span>,
     at: Vec<usize>,
     ranges: Vec<Range>,
-    arena: Vec<u8>,
+    arena: Arena,
 }
 
 impl Batch {
@@ -251,7 +405,7 @@ impl Batch {
             spans: Vec::with_capacity(spans),
             at: Vec::with_capacity(spans),
             ranges: Vec::with_capacity(spans),
-            arena: vec![0; bytes],
+            arena: Arena::new(bytes),
         }
     }
 
@@ -323,14 +477,13 @@ fn scan_range(c: &Batch, i: usize, view: &View, s: &mut Scratch) {
     let end = c.ranges.get(i + 1).map_or(c.spans.len(), |r| r.tag);
 
     for j in c.ranges[i].tag..end {
-        let list = view.lists[c.keys[j] as usize];
-        let blocks = &c.arena[c.at[j]..c.at[j] + c.spans[j].len];
-        scan_list(
-            view.tier,
+        let blocks = c.arena.part(c.at[j], c.spans[j].len);
+        scan_leaf(
+            view,
+            c.keys[j],
             blocks,
-            list.count,
-            list.first_id,
-            &s.lut,
+            &mut s.lut,
+            &s.q32,
             &mut s.candidates,
             &mut s.survivors,
         );
@@ -341,7 +494,7 @@ fn scan_range(c: &Batch, i: usize, view: &View, s: &mut Scratch) {
 fn drain(wave: &mut dyn Wave, lane: usize, file: &File, b: &mut Batch) -> Result<(), Error> {
     let mut arrived = 0;
 
-    while wave.next(lane, file, &b.ranges, &mut b.arena)?.is_some() {
+    while wave.next(lane, file, &b.ranges, b.arena.memory())?.is_some() {
         arrived += 1;
     }
 

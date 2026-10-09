@@ -96,6 +96,18 @@ pub(crate) fn id(row: &[u8], dim: usize) -> u64 {
     u64::from_le_bytes(b)
 }
 
+/// Writes the vector that a row stores into `out`, μ + scale·c, rounded to f32, where `mean` is μ and `out` has the
+/// dimension's length. The index keeps no other copy of a vector, so maintenance measures a moved vector's 1-bit code
+/// from this.
+pub(crate) fn decode(row: &[u8], mean: &[f32], out: &mut [f32]) {
+    let dim = out.len();
+    let s = scale(row, dim);
+
+    for ((o, &m), &c) in out.iter_mut().zip(mean).zip(&row[..dim]) {
+        *o = m + s * f32::from(c as i8);
+    }
+}
+
 /// The squared distance from a query to a row's decoded copy. `q_off` is q − μ and `q_norm2` is ‖q − μ‖². The dot
 /// product keeps 16 running sums, where sum k takes dimensions k, k + 16, k + 32 and so on, then adds them in halves.
 /// A SIMD version can follow the same order and match it bit for bit.

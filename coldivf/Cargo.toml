@@ -9,6 +9,8 @@ publish.workspace = true
 [features]
 # Exposes the in-RAM reference index to benchmark binaries.
 inmem = []
+# Times each stage of a search into `SearchCtx::trace`, and exposes the control paths that benchmarks compare with.
+bench = []
 
 # The command line tool. It shares the library's name, so only the library gets docs.
 [[bin]]
@@ -36,14 +38,17 @@ memmap2 = "0.9.11"
 faer = { version = "0.24.4", default-features = false, features = ["std", "rayon"] }
 # rayon: the build's threads, for k-means and encoding.
 rayon = "1.12.0"
+# arc-swap: the generation that each open index holds now, which searches load without a lock and a commit swaps.
+arc-swap = "1.9.2"
 
 [target.'cfg(unix)'.dependencies]
-# libc: F_NOCACHE and F_RDADVISE for the macOS reader, posix_fadvise for read hints on Linux, and
-# pthread_set_qos_class_self_np (macOS) and setpriority (Linux) for low-priority warm-ups.
+# libc: F_NOCACHE and F_RDADVISE for the macOS reader, O_DIRECT, statx, posix_fadvise and MADV_POPULATE_READ for the
+# Linux one, and pthread_set_qos_class_self_np (macOS) and setpriority (Linux) for low-priority warm-ups.
 libc = "0.2.190"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # io-uring: the Linux backend for batched reads.
+io-uring = "0.7.15"
 
 [target.'cfg(windows)'.dependencies]
 # windows-sys: the Windows backend for batched reads, using IoRing or I/O completion ports (IOCP).

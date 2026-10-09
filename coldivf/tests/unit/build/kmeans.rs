@@ -4,7 +4,7 @@ use std::io::ErrorKind;
 
 use super::*;
 use crate::build::threads;
-use crate::quantization::testutil::{Rows, clustered, dist2, gaussian};
+use crate::quantization::testutil::{Rows, clustered, dist2, dot, gaussian};
 use crate::search::normalize;
 
 fn settings(k: usize, rounds: usize) -> KMeans {
@@ -58,6 +58,56 @@ fn every_vector_goes_to_its_nearest_center() {
             );
         }
     }
+}
+
+#[test]
+fn nearest_keeps_the_m_nearest_centers_in_order() {
+    let mut rng = SplitMix64::new(12);
+    let (dim, n, k, m) = (24, 700, 1100, 5);
+    let rows = gaussian(&mut rng, n, dim, |_| 1.0);
+    let centers = gaussian(&mut rng, k, dim, |_| 1.0);
+    let src = Rows {
+        dim,
+        data: rows.clone(),
+    };
+    let (best, scores) = nearest(&centers, &src, Metric::L2, m, &threads(3).unwrap()).unwrap();
+    assert_eq!((best.len(), scores.len()), (n * m, n * m));
+
+    for (r, x) in rows.chunks_exact(dim).enumerate() {
+        let mut by: Vec<(f64, u32)> = centers
+            .chunks_exact(dim)
+            .enumerate()
+            .map(|(c, y)| (dist2(x, y), c as u32))
+            .collect();
+        by.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (ids, s) = (&best[r * m..(r + 1) * m], &scores[r * m..(r + 1) * m]);
+        assert!(s.windows(2).all(|w| w[0] <= w[1]), "row {r}: {s:?}");
+        for (j, &c) in ids.iter().enumerate() {
+            let d = dist2(x, &centers[c as usize * dim..(c as usize + 1) * dim]);
+            assert!(
+                (d - by[j].0).abs() <= 1e-3 * by[j].0,
+                "row {r}, place {j}: {c} at {d}, not {:?}",
+                by[j]
+            );
+            let norm = dot(x, x);
+            assert!(
+                (f64::from(s[j]) + norm - d).abs() <= 1e-3 * d.max(1.0),
+                "row {r}, place {j}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nearest_keeps_the_lower_of_tied_centers_first() {
+    let src = Rows {
+        dim: 2,
+        data: vec![0.0, 0.0],
+    };
+    let centers = [3.0, 0.0, 1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 3.0];
+    let (best, scores) = nearest(&centers, &src, Metric::L2, 4, &threads(1).unwrap()).unwrap();
+    assert_eq!(best, [1, 2, 3, 0]);
+    assert_eq!(scores, [1.0, 1.0, 1.0, 9.0]);
 }
 
 #[test]

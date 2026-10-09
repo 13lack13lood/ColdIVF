@@ -12,15 +12,22 @@ use crate::build::write;
 use crate::format::Part;
 use crate::index::Inner;
 use crate::quantization::SplitMix64;
+use crate::quantization::rabitq::unpack_lane;
 use crate::quantization::testutil::{HOOK, Hooked, Rows, TempFile, clustered, gaussian, group, params, temp_file};
 use crate::search::inmem::InMemory;
-use crate::{Collections, Index, Limits, Metric, SearchCtx, SearchParams, Writer};
+use crate::{Anchor, BuildParams, Collections, Index, Limits, Metric, SearchCtx, SearchParams, Writer};
+use log::HEADER_BYTES;
 
 /// An index file of 600 clustered vectors with ids 0 to 599, and those vectors.
 fn sample(name: &str, metric: Metric) -> (TempFile, Rows) {
+    sample_with(name, &params(metric))
+}
+
+/// The same, built with `p`.
+fn sample_with(name: &str, p: &BuildParams) -> (TempFile, Rows) {
     let (rows, mut clusters) = clustered(&mut SplitMix64::new(51), 600, 128, 12, 1.0);
     group(&mut clusters, 3);
-    let index = InMemory::build(&params(metric), &rows, &clusters).unwrap();
+    let index = InMemory::build(p, &rows, &clusters).unwrap();
     let path = temp_file(name);
     write(&index, &path).unwrap();
     let _ = std::fs::remove_file(log_path(&path));
@@ -54,7 +61,7 @@ fn found(index: &Index, path: &Path, q: &[f32]) -> Vec<u64> {
     let warm: Vec<u64> = index.search(q, &sp, &mut c).unwrap().iter().map(|h| h.id).collect();
     index.set_warm(false);
     let mapped: Vec<u64> = index
-        .inner
+        .inner()
         .search_mapped(q, &sp, &mut c)
         .unwrap()
         .iter()
@@ -180,8 +187,16 @@ fn compaction_folds_the_changes_into_the_file() {
         reach: None,
     };
 
-    for metric in [Metric::L2, Metric::Cosine] {
-        let (path, rows) = sample(&format!("compact-{metric:?}.coldivf"), metric);
+    for (metric, anchor) in [
+        (Metric::L2, Anchor::Cluster),
+        (Metric::Cosine, Anchor::Cluster),
+        (Metric::L2, Anchor::Mean),
+    ] {
+        let p = BuildParams {
+            anchor,
+            ..params(metric)
+        };
+        let (path, rows) = sample_with(&format!("compact-{metric:?}-{anchor:?}.coldivf"), &p);
         let mut writer = Writer::open(&path).unwrap();
         // Inserts near data rows, so each belongs in one cluster, but far enough from them that the 8-bit copies keep
         // each insert nearest to its own vector.
@@ -204,21 +219,25 @@ fn compaction_folds_the_changes_into_the_file() {
         };
         writer.compact().unwrap();
         let index = Index::open(&path).unwrap();
-        let layout = index.inner.layout();
+        let inner = index.inner();
+        let layout = inner.layout();
         assert_eq!(
-            (layout.count, layout.epoch, layout.nlist),
-            (600 - 10 + 20 - 1, 1, 12),
+            (layout.count, layout.epoch, layout.nlist, layout.anchor),
+            (600 - 10 + 20 - 1, 1, 12, anchor),
             "{metric:?}"
         );
-        assert_eq!(index.inner.changes().read().len(), 0);
-        let ((bytes, file), data) = (index.inner.parts(), index.inner.in_place());
+        assert_eq!(inner.changes().read().len(), 0);
+        let ((bytes, file), data) = (inner.parts(), inner.in_place());
         let ids = &bytes[file.span(Part::Ids).range()];
         let id_of = |i: usize| sq8::id(data.rows.row(i as u32), dim).to_le_bytes();
         assert!(
             (0..file.count).all(|i| ids[8 * i..8 * i + 8] == id_of(i)),
             "the id section disagrees with the rows"
         );
-        assert_eq!(std::fs::metadata(log_path(&path)).unwrap().len(), HEADER_BYTES as u64);
+        // The commit deleted the old file's log, and the new generation's log holds only its header.
+        assert!(!log_path(&path).exists());
+        let log = &inner.located().log;
+        assert_eq!(std::fs::metadata(log).unwrap().len(), log::HEADER_2_BYTES as u64);
         let after: Vec<Vec<u64>> = queries.iter().map(|q| found(&index, &path, q)).collect();
         assert_eq!(after.iter().map(|ids| ids[0]).collect::<Vec<_>>(), before, "{metric:?}");
         assert!(
@@ -356,9 +375,7 @@ fn a_search_sees_the_changes_as_they_were_when_it_scanned() {
     };
     // A cold search reads the clusters, then the rows. This backend replaces row 5 with an insert of the same
     // vector just before the rows, so after the search scanned the old copy and before it rescores it.
-    let hooked = Index {
-        inner: Arc::new(Inner::open(&path).unwrap().with_wave(|| Box::<Hooked<2>>::default())),
-    };
+    let hooked = Index::of(Inner::open(&path).unwrap().with_wave(|| Box::<Hooked<2>>::default()));
     let (w, v) = (Rc::clone(&writer), q.clone());
     HOOK.set(Some(Box::new(move || w.borrow_mut().insert(5, &v).unwrap())));
 
@@ -367,9 +384,9 @@ fn a_search_sees_the_changes_as_they_were_when_it_scanned() {
 
     // The same in a search over several collections, with the next change.
     let set = Collections {
-        indexes: vec![Index {
-            inner: Arc::new(Inner::open(&path).unwrap().with_wave(|| Box::<Hooked<2>>::default())),
-        }],
+        indexes: vec![Index::of(
+            Inner::open(&path).unwrap().with_wave(|| Box::<Hooked<2>>::default()),
+        )],
     };
     let (w, v) = (Rc::clone(&writer), q.clone());
     HOOK.set(Some(Box::new(move || w.borrow_mut().insert(5, &v).unwrap())));
@@ -379,7 +396,7 @@ fn a_search_sees_the_changes_as_they_were_when_it_scanned() {
     assert_eq!(one(&index), 1);
 
     // On its own, a later change hides only what came before it.
-    let mut delta = Delta::new(index.inner.layout());
+    let mut delta = Delta::new(index.inner().layout(), Version::One);
     let seen = delta.seen();
     delta.delete(5);
     assert!(delta.is_live(5, 0, seen) && !delta.is_live(5, 0, delta.seen()));
@@ -509,4 +526,112 @@ fn every_path_to_a_file_shares_its_log_and_its_lock() {
     Writer::open(&link).unwrap().insert(7777, &v).unwrap();
     assert!(!log_path(&link).exists());
     assert!(std::fs::metadata(log_path(&path)).unwrap().len() > HEADER_BYTES as u64);
+}
+
+#[test]
+fn an_insert_scores_like_the_same_vector_built_into_the_file() {
+    let (dim, n, d_pad) = (128, 600, padded_dim(128));
+    let (rows, mut clusters) = clustered(&mut SplitMix64::new(66), n, dim, 12, 1.0);
+    group(&mut clusters, 3);
+    let (cb, size) = (code_bytes(d_pad), block_bytes(d_pad));
+    let queries = gaussian(&mut SplitMix64::new(67), 4, dim, |_| 1.0);
+
+    for anchor in [Anchor::Cluster, Anchor::Mean] {
+        let p = BuildParams {
+            anchor,
+            ..params(Metric::L2)
+        };
+        let memory = InMemory::build(&p, &rows, &clusters).unwrap();
+        let path = temp_file(&format!("same-score-{anchor:?}.coldivf"));
+        write(&memory, &path).unwrap();
+        let _ = std::fs::remove_file(log_path(&path));
+        let index = Index::open(&path).unwrap();
+        let mut writer = Writer::open(&path).unwrap();
+        let mut c = ctx();
+        // Rows that route to the cluster the build put them in go in again under new ids, so insert i has internal id
+        // n + i. Each pair holds the row's internal id in the file and its cluster.
+        let mut pairs = Vec::new();
+        for r in 0..80 {
+            let v = &rows.data[r * dim..(r + 1) * dim];
+            let built = memory.ids.iter().position(|&id| id == r as u64).unwrap() as u32;
+            let leaf = memory.lists.partition_point(|l| l.first_id + l.count as u32 <= built);
+            let mut routed = Vec::new();
+            index.route(v, 1, None, &mut c, &mut routed).unwrap();
+            if routed[0] as usize == leaf {
+                writer.insert(10_000 + r as u64, v).unwrap();
+                pairs.push((built, leaf));
+            }
+        }
+        assert!(
+            pairs.len() >= 60,
+            "{anchor:?}: only {} rows route to their own cluster",
+            pairs.len()
+        );
+
+        // Each insert has the code and the factors of its row in the file.
+        let inner = index.inner();
+        let delta = inner.changes().read();
+        let mut bits = vec![0u8; cb];
+        for (i, &(built, leaf)) in pairs.iter().enumerate() {
+            let list = memory.lists[leaf];
+            let j = (built - list.first_id) as usize;
+            let block = &memory.blocks[list.offset + j / BLOCK * size..list.offset + (j / BLOCK + 1) * size];
+            let factors = unpack_lane(block, d_pad, j % BLOCK, &mut bits);
+            assert_eq!(delta.codes[i * cb..(i + 1) * cb], bits, "{anchor:?}: insert {i}");
+            assert_eq!(delta.factors[i], factors, "{anchor:?}: insert {i}");
+        }
+        drop(delta);
+
+        // So every search path gives each insert the estimate of its row in the file.
+        for q in queries.chunks_exact(dim).chain(rows.data[..2 * dim].chunks_exact(dim)) {
+            for how in ["mapped", "cold", "warm"] {
+                index.set_warm(how == "warm");
+                match how {
+                    "mapped" => index.inner().search_mapped(q, &everything(), &mut c).map(|_| ()),
+                    _ => index.search(q, &everything(), &mut c).map(|_| ()),
+                }
+                .unwrap();
+                let s = c.scratch.iter().find(|s| s.fits(dim)).unwrap();
+                let score = |id: u32| {
+                    let found = s.candidates.as_slice().iter().find(|x| x.id == id);
+                    found.map(|x| x.score.to_bits())
+                };
+                for (i, &(built, _)) in pairs.iter().enumerate() {
+                    let insert = (n + i) as u32;
+                    assert!(
+                        score(built).is_some(),
+                        "{anchor:?}, {how}: row {built} isn't a candidate"
+                    );
+                    assert_eq!(
+                        score(built),
+                        score(insert),
+                        "{anchor:?}, {how}: rows {built} and {insert}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn an_open_while_a_run_reads_the_changes_waits_for_nothing() {
+    let (path, rows) = sample("held-open.coldivf", Metric::L2);
+    let mut writer = Writer::open(&path).unwrap();
+    writer.insert(9000, &rows.data[..128]).unwrap();
+    // A maintenance run holds the read lock of the changes for its whole length, as this guard does. An open that
+    // waited for the write lock would make every later search of the file wait too.
+    let inner = writer.index.inner();
+    let guard = inner.changes().read();
+    let (send, opened) = std::sync::mpsc::channel();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let (index, mut c) = (Index::open(&path).unwrap(), ctx());
+            let hits = index.search(&rows.data[..128], &everything(), &mut c).unwrap();
+            send.send(hits.iter().map(|h| h.id).collect::<Vec<u64>>()).unwrap();
+        });
+        let hits = opened.recv_timeout(std::time::Duration::from_secs(10));
+        drop(guard);
+        assert!(hits.is_ok_and(|h| h.contains(&9000)), "the open waited for the run");
+    });
 }

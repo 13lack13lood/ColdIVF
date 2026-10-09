@@ -2,17 +2,18 @@
 //! for every file's cluster tables, reads the nearest clusters of any file in one wave, then reads the rows of the best
 //! candidates overall in one more.
 
-use std::fs::File;
 use std::io::Error;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
-use crate::format::FIRST_READ;
-use crate::io;
+use crate::index::{Inner, Opening, Shared};
 use crate::search::candidates::{Candidate, order};
 use crate::search::rerank::rerank_live;
-use crate::search::route::{reach_of, route};
+use crate::search::route::{reach_of, route_chunked};
 use crate::search::{Scratch, invalid, prepare_query, scan_lists};
-use crate::update::Seen;
+use crate::trace::{Clock, Trace};
+use crate::update::{Seen, real_path};
 use crate::{Hit, Index, LeafId, Limits, Metric, SearchCtx, SearchParams};
 
 /// One collection's part of a search over several, kept in the search context.
@@ -34,9 +35,9 @@ pub(crate) struct Part {
 }
 
 impl Part {
-    fn new(dim: usize, nlist: usize, limits: &Limits) -> Part {
+    fn new(dim: usize, limits: &Limits) -> Part {
         Part {
-            s: Scratch::new(dim, nlist, limits),
+            s: Scratch::new(dim, 0, limits),
             leaves: Vec::with_capacity(limits.max_nprobe),
             chosen: Vec::with_capacity(limits.max_rerank.max(limits.max_k)),
             hits: Vec::with_capacity(limits.max_k),
@@ -48,18 +49,28 @@ impl Part {
     }
 }
 
-/// Opens every file of `paths`. It first hints every file's first page, so the header reads of all of them overlap.
+/// Opens every file of `paths`. It opens all of them and starts every header read before it waits for any.
 pub(crate) fn open(paths: &[&Path]) -> Result<Vec<Index>, Error> {
     if paths.is_empty() {
         return Err(invalid("a set of collections needs at least one file"));
     }
 
-    for path in paths {
-        io::will_need(&File::open(path)?, 0, FIRST_READ);
-    }
+    let opening = paths.iter().map(|p| Opening::start(p)).collect::<Result<Vec<_>, _>>()?;
+    let mut indexes: Vec<Index> = Vec::with_capacity(paths.len());
 
-    let indexes = paths.iter().map(|p| Index::open(p)).collect::<Result<Vec<_>, _>>()?;
-    let shape = |i: &Index| (i.inner.dim(), i.inner.metric());
+    for (o, p) in opening.into_iter().zip(paths) {
+        let (real, inner) = (real_path(p), o.finish(p)?);
+        // Each collection of a set has reads of its own in a search context, which are keyed by the shared cell, so a
+        // path that the set holds twice gets a cell of its own the second time.
+        let shared = Shared::adopt(&real, inner);
+        let twice = indexes.iter().any(|i| Arc::ptr_eq(&i.shared, &shared));
+        let shared = match twice {
+            true => Shared::alone(&real, Inner::open(p)?, None),
+            false => shared,
+        };
+        indexes.push(Index { shared });
+    }
+    let shape = |i: &Index| (i.inner().dim(), i.inner().metric());
 
     if indexes.iter().any(|i| shape(i) != shape(&indexes[0])) {
         return Err(invalid("the collections must share a dimension and a metric"));
@@ -69,7 +80,8 @@ pub(crate) fn open(paths: &[&Path]) -> Result<Vec<Index>, Error> {
 }
 
 /// Searches `indexes` together for the `params.k` nearest vectors overall, and writes them into `out` as (collection,
-/// hit), nearest first. Ties go to the lower collection.
+/// hit), nearest first. Ties go to the lower collection. It loads each collection's current generation once, and
+/// searches those generations whatever commits meanwhile.
 pub(crate) fn search(
     indexes: &[Index],
     query: &[f32],
@@ -77,14 +89,40 @@ pub(crate) fn search(
     ctx: &mut SearchCtx,
     out: &mut Vec<(usize, Hit)>,
 ) -> Result<(), Error> {
-    indexes[0].inner.check(query, params, &ctx.limits)?;
+    // The context keeps the list's room, so the loads allocate nothing once a search of as many collections ran.
+    let mut loaded = std::mem::take(&mut ctx.loaded);
+    loaded.extend(indexes.iter().map(|i| i.shared.load_full()));
+    let result = search_loaded(&loaded, query, params, ctx, out);
+    loaded.clear();
+    ctx.loaded = loaded;
+    result
+}
 
-    // One hint for every collection's cluster tables, which then load one by one. Every collection's reads exist
-    // before any slot is kept, since making reads drops those of closed indexes and moves the rest.
-    indexes.iter().for_each(|i| i.inner.prepare());
+/// The same, for the loaded generations `indexes`.
+fn search_loaded(
+    indexes: &[Arc<Inner>],
+    query: &[f32],
+    params: &SearchParams,
+    ctx: &mut SearchCtx,
+    out: &mut Vec<(usize, Hit)>,
+) -> Result<(), Error> {
+    indexes[0].check(query, params, &ctx.limits)?;
+
+    ctx.trace = Trace::default();
+    let mut clock = Clock::start();
+    // One hint for every collection's cluster tables, which then load one by one.
+    indexes.iter().for_each(|i| i.prepare());
 
     for index in indexes {
-        index.inner.reads(index.inner.tables()?, ctx);
+        index.tables()?;
+    }
+
+    ctx.trace.tables = clock.lap();
+
+    // Every collection's reads exist before any slot is kept, since making reads drops those of closed indexes and
+    // moves the rest.
+    for index in indexes {
+        index.reads(index.tables()?, ctx);
     }
 
     let keep = params.rerank.max(params.k);
@@ -94,32 +132,40 @@ pub(crate) fn search(
         .reserve(indexes.len() * limits.max_nprobe.max(limits.max_rerank).max(limits.max_k));
 
     for (f, index) in indexes.iter().enumerate() {
-        let tables = index.inner.tables()?;
-        let view = index.inner.view(tables);
-        let slot = index.inner.reads(tables, ctx);
-        // The parts past the collections are spares, so a context that searches other sets keeps a part for each
-        // shape it has seen.
+        let tables = index.tables()?;
+        let (dim, nlist) = (index.dim(), tables.lists.len());
+        let slot = index.reads(tables, ctx);
+        // The parts past the collections are spares, so a context that searches other sets keeps as many parts of
+        // each dimension as the most collections of it that one search had. Each part fits itself to the collection's
+        // cluster count, which every maintenance run changes.
         let parts = &mut ctx.parts;
-        match (f..parts.len()).find(|&j| parts[j].s.fits(view.dim, view.lists.len())) {
+        match (f..parts.len()).find(|&j| parts[j].s.dim() == dim) {
             Some(j) => parts.swap(f, j),
             None => {
-                parts.push(Part::new(view.dim, view.lists.len(), &limits));
+                parts.push(Part::new(dim, &limits));
                 let last = parts.len() - 1;
                 parts.swap(f, last);
             }
         }
-        let part = &mut parts[f];
-        (part.slot, part.warm) = (slot, index.inner.is_warm());
-        let s = &mut part.s;
+        parts[f].s.fit(nlist);
+        (parts[f].slot, parts[f].warm) = (slot, index.is_warm());
+    }
+
+    ctx.trace.buffers = clock.lap();
+
+    for (f, index) in indexes.iter().enumerate() {
+        let view = index.view(index.tables()?);
+        let s = &mut ctx.parts[f].s;
         // Each collection measures the query against its own mean and rotation.
         prepare_query(&view, query, s)?;
-        route(
+        route_chunked(
             view.tier,
             &view.centers,
             &s.q8,
-            s.lut.k.t2,
+            s.lut.mean.t2,
             params.nprobe,
-            &mut s.dots,
+            &mut s.chunk,
+            &mut s.best,
             &mut s.routes,
         );
         ctx.picks.extend(s.routes.iter().map(|&r| (r, f)));
@@ -143,38 +189,54 @@ pub(crate) fn search(
         ctx.parts[f].leaves.push(c.id);
     }
 
+    ctx.trace.route = clock.lap();
+
     // One wave of cluster reads across every cold collection, then each scans its clusters as they arrive. A warm one
     // scans in place.
     for (f, index) in indexes.iter().enumerate() {
         if !ctx.parts[f].warm {
-            let SearchCtx { parts, reads, .. } = ctx;
-            index.inner.fetch_into(&parts[f].leaves, &mut reads[parts[f].slot])?;
+            let SearchCtx {
+                parts, reads, trace, ..
+            } = ctx;
+            let r = &mut reads[parts[f].slot];
+            index.fetch_into(&parts[f].leaves, r)?;
+            let (bytes, ranges) = r.cluster_traffic();
+            trace.cluster_bytes += bytes;
+            trace.cluster_ranges += ranges;
         }
     }
 
+    ctx.trace.submit = clock.lap();
+
     for (f, index) in indexes.iter().enumerate() {
-        let tables = index.inner.tables()?;
-        let view = index.inner.view(tables);
-        let SearchCtx { parts, reads, .. } = ctx;
+        let tables = index.tables()?;
+        let view = index.view(tables);
+        let SearchCtx {
+            parts, reads, trace, ..
+        } = ctx;
         let part = &mut parts[f];
         part.s.candidates.reset(keep);
+        trace.scanned += part.leaves.iter().map(|&l| view.lists[l as usize].count).sum::<usize>();
         if part.warm {
             let Scratch {
                 lut,
+                q32,
                 candidates,
                 survivors,
                 ..
             } = &mut part.s;
-            let leaves = part.leaves.iter().copied();
-            scan_lists(&view, index.inner.in_place().blocks, leaves, lut, candidates, survivors);
+            let (blocks, leaves) = (index.in_place().blocks, part.leaves.iter().copied());
+            scan_lists(&view, blocks, leaves, lut, q32, candidates, survivors);
             reads[part.slot].forget();
         } else {
-            reads[part.slot].scan(index.inner.cold_file(), &view, &mut part.s)?;
+            let r = &mut reads[part.slot];
+            r.scan(index.cold_file(), &view, &mut part.s)?;
+            trace.wave += r.waited();
         }
-        part.seen = index
-            .inner
-            .scan_delta(&index.inner.changes().read(), &view, &mut part.s);
+        part.seen = index.scan_delta(&index.changes().read(), &view, &mut part.s);
     }
+
+    ctx.trace.scan = clock.lap().saturating_sub(ctx.trace.wave);
 
     // The best candidates overall, then one wave for their rows.
     ctx.picks.clear();
@@ -197,22 +259,30 @@ pub(crate) fn search(
     }
 
     for (f, index) in indexes.iter().enumerate() {
-        let SearchCtx { parts, reads, .. } = ctx;
-        let part = &parts[f];
-        reads[part.slot].start_rows(index.inner.cold_file(), &part.chosen)?;
+        let SearchCtx {
+            parts, reads, trace, ..
+        } = ctx;
+        let r = &mut reads[parts[f].slot];
+        r.start_rows(index.cold_file(), &parts[f].chosen, parts[f].warm)?;
+        let (bytes, ranges) = r.row_traffic();
+        trace.row_bytes += bytes;
+        trace.row_ranges += ranges;
     }
+
+    let (mut rows, mut rerank) = (clock.lap(), Duration::ZERO);
 
     // Each collection rescores its share, and the hits merge by distance.
     for (f, index) in indexes.iter().enumerate() {
-        let view = index.inner.view(index.inner.tables()?);
+        let view = index.view(index.tables()?);
         let SearchCtx { parts, reads, .. } = ctx;
         let slot = parts[f].slot;
         let (part, r) = (&mut parts[f], &mut reads[slot]);
-        r.finish_rows(index.inner.cold_file())?;
+        r.finish_rows(index.cold_file())?;
+        rows += clock.lap();
         // Each collection's lock is taken alone and only for its rescore, which reads nothing from the disk.
-        let (delta, seen) = (index.inner.changes().read(), part.seen);
-        let row = |id: u32| index.inner.row_of(&delta, id, |id| r.row(id));
-        let live = |id: u32, row: &[u8]| index.inner.is_live(&delta, id, row, seen);
+        let (delta, seen) = (index.changes().read(), part.seen);
+        let row = |id: u32| index.row_of(&delta, id, |id| r.row(id));
+        let live = |id: u32, row: &[u8]| index.is_live(&delta, id, row, seen);
         let s = &mut part.s;
         let (offset, rescored) = (&s.offset, &mut s.rescored);
         rerank_live(
@@ -225,14 +295,11 @@ pub(crate) fn search(
             rescored,
             &mut part.hits,
         )?;
+        rerank += clock.lap();
     }
 
-    merge(
-        &mut ctx.parts[..indexes.len()],
-        indexes[0].inner.metric(),
-        params.k,
-        out,
-    );
+    merge(&mut ctx.parts[..indexes.len()], indexes[0].metric(), params.k, out);
+    (ctx.trace.rows, ctx.trace.rerank) = (rows, rerank + clock.lap());
     Ok(())
 }
 

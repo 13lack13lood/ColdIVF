@@ -1,7 +1,10 @@
 //! Unit tests for the 1-bit codes.
 
 use super::*;
+use crate::kernels::{Tier, center_distance2};
 use crate::quantization::SplitMix64;
+use crate::quantization::sq4::{self, CenterFactors, QueryS32};
+use crate::quantization::sq8;
 use crate::quantization::testutil::{dist2, gaussian, mean};
 
 /// The codes of `rows`, back to back, and their factors.
@@ -134,6 +137,202 @@ fn estimates_are_unbiased_and_error_bars_cover_95_percent() {
     }
 }
 
+/// Checks est against the exact distance for codes measured from cluster centers, on 8 clusters whose centers have
+/// standard deviation 2·sigma(k) on axis k and whose vectors sit sigma(k) from their center. Each code is measured
+/// from its cluster's center as its 4-bit codes decode, and each query takes its distance to that center as t2. The
+/// queries sit spread·sigma(k) from a center. With `own`, only the pairs of each query's own cluster count.
+fn check_cluster_error(dim: usize, sigma: impl Fn(usize) -> f64, spread: f64, own: bool, name: &str) {
+    let (mut rng, nlist) = (SplitMix64::new(5), 8);
+    let centers = gaussian(&mut rng, nlist, dim, |k| 2.0 * sigma(k));
+    let mut around = |n: usize, spread: f64| {
+        let of: Vec<usize> = (0..n).map(|_| (rng.next_u64() % nlist as u64) as usize).collect();
+        let offsets = gaussian(&mut rng, n, dim, |k| spread * sigma(k));
+        let rows: Vec<f32> = (0..n * dim)
+            .map(|i| centers[of[i / dim] * dim + i % dim] + offsets[i])
+            .collect();
+        (rows, of)
+    };
+    let (rows, cluster_of) = around(1000, 1.0);
+    let (queries, query_of) = around(40, spread);
+    let mu = mean(&rows, dim);
+    let rotation = Rotation::new(dim, 6);
+    let (ccb, cb) = (sq4::code_bytes(padded_dim(dim)), code_bytes(padded_dim(dim)));
+    let (mut center_codes, mut decoded) = (vec![0u8; nlist * ccb], vec![0f32; nlist * dim]);
+    let (mut y, mut tmp) = (vec![0f32; dim], vec![0f32; dim]);
+    let center_factors: Vec<CenterFactors> = (0..nlist)
+        .map(|c| {
+            rotate_offset(&rotation, &centers[c * dim..(c + 1) * dim], &mu, &mut y, &mut tmp);
+            let codes = &mut center_codes[c * ccb..(c + 1) * ccb];
+            let f = sq4::encode(&y, codes);
+            sq4::decode(codes, &f, &mut decoded[c * dim..(c + 1) * dim]);
+            f
+        })
+        .collect();
+    let mut encoder = Encoder::new(&rotation, &mu);
+    let mut codes = vec![0u8; cluster_of.len() * cb];
+    let factors: Vec<Factors> = rows
+        .chunks_exact(dim)
+        .zip(codes.chunks_exact_mut(cb))
+        .zip(&cluster_of)
+        .map(|((o, bits), &c)| encoder.encode_from(o, &decoded[c * dim..(c + 1) * dim], bits))
+        .collect();
+    let (mut query, mut q32) = (QueryLut::new(dim), QueryS32::new(dim));
+    let (mut sum, mut sum_sq, mut covered, mut pairs) = (0f64, 0f64, 0usize, 0usize);
+    for (q, &near) in queries.chunks_exact(dim).zip(&query_of) {
+        let t = rotate_offset(&rotation, q, &mu, &mut y, &mut tmp);
+        query.prepare(&y, t);
+        q32.prepare(&y, t * t);
+        let consts: Vec<QueryConsts> = (0..nlist)
+            .map(|c| {
+                let (codes, f) = (&center_codes[c * ccb..(c + 1) * ccb], &center_factors[c]);
+                query.anchored(center_distance2(
+                    Tier::SCALAR,
+                    codes,
+                    f,
+                    sq4::decoded_norm2(codes, f, dim),
+                    &q32,
+                ))
+            })
+            .collect();
+        for (i, (o, f)) in rows.chunks_exact(dim).zip(&factors).enumerate() {
+            if own && cluster_of[i] != near {
+                continue;
+            }
+            let k = &consts[cluster_of[i]];
+            let err = f64::from(est(code_sum(&codes[i * cb..(i + 1) * cb], &query.qu), f, k)) - dist2(q, o);
+            sum += err;
+            sum_sq += err * err;
+            covered += usize::from(err.abs() <= f64::from(f.f_err) * f64::from(k.t));
+            pairs += 1;
+        }
+    }
+    let (bias, rms) = (sum / pairs as f64, (sum_sq / pairs as f64).sqrt());
+    let coverage = covered as f64 / pairs as f64;
+    assert!(
+        bias.abs() <= 0.1 * rms,
+        "{name} at dim {dim}: the mean error is {bias}, against an rms error of {rms}"
+    );
+    assert!(
+        (0.92..=0.96).contains(&coverage),
+        "{name} at dim {dim}: the error bar covers {coverage} of {pairs} pairs"
+    );
+}
+
+#[test]
+fn estimates_from_cluster_centers_are_unbiased_and_error_bars_cover_95_percent() {
+    for dim in [200, 768] {
+        check_cluster_error(dim, |_| 1.0, 1.0, false, "isotropic");
+        check_cluster_error(dim, |k| (k as f64 + 1.0).powf(-0.75), 1.0, false, "anisotropic");
+        // Close to a center, t2 is small against T², so much of each estimate's error comes from the query's 4-bit
+        // values, whose error grows with T. The bar only holds ~95% of these pairs when it counts that error.
+        check_cluster_error(dim, |_| 1.0, 0.3, true, "isotropic, close to a center");
+    }
+}
+
+/// Like `check_cluster_error`, but with every code measured from its vector's 8-bit row as the row decodes, as
+/// maintenance measures the code of a vector that moved to another cluster. The estimates must stay unbiased, and the
+/// error bar must cover ~95% of pairs, against the distance to the row and to the original vector alike.
+fn check_row_error(dim: usize, sigma: impl Fn(usize) -> f64, name: &str) {
+    let (mut rng, nlist) = (SplitMix64::new(15), 8);
+    let centers = gaussian(&mut rng, nlist, dim, |k| 2.0 * sigma(k));
+    let mut around = |n: usize| {
+        let of: Vec<usize> = (0..n).map(|_| (rng.next_u64() % nlist as u64) as usize).collect();
+        let offsets = gaussian(&mut rng, n, dim, &sigma);
+        let rows: Vec<f32> = (0..n * dim)
+            .map(|i| centers[of[i / dim] * dim + i % dim] + offsets[i])
+            .collect();
+        (rows, of)
+    };
+    let (rows, cluster_of) = around(1000);
+    let (queries, _) = around(40);
+    let mu = mean(&rows, dim);
+    let rotation = Rotation::new(dim, 16);
+    let (ccb, cb) = (sq4::code_bytes(padded_dim(dim)), code_bytes(padded_dim(dim)));
+    let (mut center_codes, mut decoded) = (vec![0u8; nlist * ccb], vec![0f32; nlist * dim]);
+    let (mut y, mut tmp) = (vec![0f32; dim], vec![0f32; dim]);
+    let center_factors: Vec<CenterFactors> = (0..nlist)
+        .map(|c| {
+            rotate_offset(&rotation, &centers[c * dim..(c + 1) * dim], &mu, &mut y, &mut tmp);
+            let codes = &mut center_codes[c * ccb..(c + 1) * ccb];
+            let f = sq4::encode(&y, codes);
+            sq4::decode(codes, &f, &mut decoded[c * dim..(c + 1) * dim]);
+            f
+        })
+        .collect();
+    let mut row = vec![0u8; sq8::row_bytes(dim)];
+    let from_rows: Vec<f32> = rows
+        .chunks_exact(dim)
+        .flat_map(|o| {
+            sq8::write_row(o, &mu, 0, &mut row);
+            let mut o8 = vec![0f32; dim];
+            sq8::decode(&row, &mu, &mut o8);
+            o8
+        })
+        .collect();
+    let mut encoder = Encoder::new(&rotation, &mu);
+    let mut codes = vec![0u8; cluster_of.len() * cb];
+    let factors: Vec<Factors> = from_rows
+        .chunks_exact(dim)
+        .zip(codes.chunks_exact_mut(cb))
+        .zip(&cluster_of)
+        .map(|((o8, bits), &c)| encoder.encode_from(o8, &decoded[c * dim..(c + 1) * dim], bits))
+        .collect();
+    let (mut query, mut q32) = (QueryLut::new(dim), QueryS32::new(dim));
+    // The sum and sum of squares of the errors, and the pairs covered, against the rows and the original vectors.
+    let mut stats = [(0f64, 0f64, 0usize); 2];
+    let mut pairs = 0usize;
+
+    for q in queries.chunks_exact(dim) {
+        let t = rotate_offset(&rotation, q, &mu, &mut y, &mut tmp);
+        query.prepare(&y, t);
+        q32.prepare(&y, t * t);
+        let consts: Vec<QueryConsts> = (0..nlist)
+            .map(|c| {
+                let (codes, f) = (&center_codes[c * ccb..(c + 1) * ccb], &center_factors[c]);
+                query.anchored(center_distance2(
+                    Tier::SCALAR,
+                    codes,
+                    f,
+                    sq4::decoded_norm2(codes, f, dim),
+                    &q32,
+                ))
+            })
+            .collect();
+        for (i, f) in factors.iter().enumerate() {
+            let k = &consts[cluster_of[i]];
+            let e = f64::from(est(code_sum(&codes[i * cb..(i + 1) * cb], &query.qu), f, k));
+            let truths = [&from_rows[i * dim..(i + 1) * dim], &rows[i * dim..(i + 1) * dim]];
+            for (s, o) in stats.iter_mut().zip(truths) {
+                let err = e - dist2(q, o);
+                (s.0, s.1) = (s.0 + err, s.1 + err * err);
+                s.2 += usize::from(err.abs() <= f64::from(f.f_err) * f64::from(k.t));
+            }
+            pairs += 1;
+        }
+    }
+
+    for ((sum, sum_sq, covered), against) in stats.into_iter().zip(["the rows", "the original vectors"]) {
+        let (bias, rms) = (sum / pairs as f64, (sum_sq / pairs as f64).sqrt());
+        let coverage = covered as f64 / pairs as f64;
+        assert!(
+            bias.abs() <= 0.1 * rms,
+            "{name} at dim {dim}, against {against}: the mean error is {bias}, against an rms error of {rms}"
+        );
+        assert!(
+            (0.92..=0.96).contains(&coverage),
+            "{name} at dim {dim}, against {against}: the error bar covers {coverage} of {pairs} pairs"
+        );
+    }
+}
+
+#[test]
+fn codes_measured_from_8_bit_rows_keep_their_error_bars() {
+    for dim in [200, 768] {
+        check_row_error(dim, |_| 1.0, "isotropic");
+        check_row_error(dim, |k| (k as f64 + 1.0).powf(-0.75), "anisotropic");
+    }
+}
+
 /// Asserts that `got` is within `rel` of `want`, relative to `scale`.
 fn close(got: f64, want: f64, scale: f64, rel: f64, what: &str) {
     assert!((got - want).abs() <= rel * scale, "{what}: {got} against {want}");
@@ -221,6 +420,16 @@ fn factors_and_query_follow_the_formulas() {
         );
         close(f64::from(k.t), t, t, 1e-7, "T");
         close(f64::from(k.t2), t * t, t * t, 1e-7, "T²");
+        // e² follows its formula, and from a cluster's center t² is t2 + e².
+        let err2: f64 = (0..dim)
+            .map(|j| (v_l + delta * f64::from(query.qu[j]) - y[j]).powi(2))
+            .sum();
+        let e2 = t * t * (d - 1.0) * err2 / (d * (1.0 - 2.0 / std::f64::consts::PI));
+        close(query.e2, e2, e2, 1e-9, "e²");
+        let anchored = query.anchored(0.25 * t * t);
+        close(f64::from(anchored.t), (0.25 * t * t + e2).sqrt(), t, 1e-6, "t");
+        close(f64::from(anchored.t2), 0.25 * t * t, t * t, 1e-7, "t2");
+        assert_eq!((anchored.k_s, anchored.k_p, anchored.k_c), (k.k_s, k.k_p, k.k_c));
         for (i, f) in factors.iter().enumerate() {
             let s = code_sum(&codes[i * cb..(i + 1) * cb], &query.qu);
             let ip = f64::from(k.k_s) * f64::from(s) + f64::from(k.k_p) * f64::from(f.f_pop) + f64::from(k.k_c);

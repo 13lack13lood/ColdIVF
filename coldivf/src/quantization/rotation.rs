@@ -130,6 +130,42 @@ impl Rotation {
             output.copy_from_slice(input);
         }
     }
+
+    /// Undoes the rotation of `v` in place, so it gives back what `apply_in_place` rotated, up to rounding. `tmp` is
+    /// scratch space of the same length. It runs the rounds backwards and undoes each step in the opposite order. Each
+    /// block's scaled transform is its own inverse.
+    pub(crate) fn invert_in_place(&self, v: &mut [f32], tmp: &mut [f32]) {
+        let dim = self.dim;
+        assert!(v.len() == dim && tmp.len() == dim);
+
+        let (mut input, mut output) = (v, tmp);
+
+        for round in (0..ROUNDS).rev() {
+            // A round's shuffle flips the signs for the next round after it moves the values.
+            if let Some(masks) = self.masks.get((round + 1) * dim..(round + 2) * dim) {
+                flip(input, masks);
+            }
+            let mut to = 0;
+            for &x in input.iter() {
+                output[to] = x;
+                to += self.step;
+                if to >= dim {
+                    to -= dim;
+                }
+            }
+            std::mem::swap(&mut input, &mut output);
+            for &(start, size, scale) in &self.blocks {
+                fwht_scaled(&mut input[start..start + size], scale);
+            }
+        }
+
+        flip(input, &self.masks[..dim]);
+
+        // After an odd number of rounds the result is in `tmp`.
+        if ROUNDS % 2 == 1 {
+            output.copy_from_slice(input);
+        }
+    }
 }
 
 /// Flips the sign of each value whose mask is set.

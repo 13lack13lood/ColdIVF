@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use coldivf::{BuildParams, Builder, LeafOrder, Metric, VectorSource};
+use coldivf::{Anchor, BuildParams, Builder, LeafOrder, Metric, VectorSource};
 
 struct Rows {
     dim: usize,
@@ -52,6 +52,7 @@ fn verify_prints_a_line_for_each_file_and_fails_on_a_damaged_one() {
         vectors_per_list: 50,
         parents: 2,
         order: LeafOrder::Chained,
+        anchor: Anchor::Cluster,
         page_size: 4096,
         threads: 1,
         seed: 3,
@@ -77,6 +78,51 @@ fn verify_prints_a_line_for_each_file_and_fails_on_a_damaged_one() {
     // Anything but `verify` and at least one file is a usage error.
     for args in [&[][..], &[verify], &["check".as_ref(), good_path]] {
         assert_eq!(run(args).0, 2, "{args:?}");
+    }
+}
+
+#[test]
+fn verify_checks_the_anchor_byte() {
+    let dim = 128;
+    let data: Vec<f32> = (0..300 * dim)
+        .map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0)
+        .collect();
+    let file = |name: &str| TempFile(std::env::temp_dir().join(format!("coldivf-cli-{}-{name}", std::process::id())));
+    let verify = "verify".as_ref();
+
+    for anchor in [Anchor::Cluster, Anchor::Mean] {
+        let (good, bad) = (
+            file(&format!("{anchor:?}.coldivf")),
+            file(&format!("{anchor:?}-bad.coldivf")),
+        );
+        let params = BuildParams {
+            metric: Metric::L2,
+            vectors_per_list: 50,
+            parents: 2,
+            order: LeafOrder::Chained,
+            anchor,
+            page_size: 4096,
+            threads: 1,
+            seed: 3,
+        };
+        let rows = Rows {
+            dim,
+            data: data.clone(),
+        };
+        Builder::new(params).build(&rows, &good.0).unwrap();
+        assert_eq!(
+            run(&[verify, good.0.as_os_str()]),
+            (0, format!("{}: ok\n", good.0.display()))
+        );
+
+        // Byte 41 of the header is the anchor, and the checksum of the header's first 320 bytes follows them.
+        let mut bytes = std::fs::read(&good.0).unwrap();
+        bytes[41] = 2;
+        let crc = crc32fast::hash(&bytes[..320]);
+        bytes[320..324].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&bad.0, &bytes).unwrap();
+        let want = format!("{}: the header names an unknown anchor\n", bad.0.display());
+        assert_eq!(run(&[verify, bad.0.as_os_str()]), (1, want), "{anchor:?}");
     }
 }
 

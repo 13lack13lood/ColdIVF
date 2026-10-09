@@ -7,9 +7,10 @@ use crate::build::write;
 use crate::quantization::SplitMix64;
 use crate::quantization::testutil::{Rows, TempFile, clustered, gaussian, group, params, temp_file};
 use crate::search::inmem::InMemory;
-use crate::{Collections, Limits};
+use crate::{Anchor, BuildParams, Collections, Limits};
 
-/// `count` index files of `n` vectors each, from different data, with their in-memory indexes and their vectors.
+/// `count` index files of `n` vectors each, from different data, with their in-memory indexes and their vectors. The
+/// files take the cluster anchor and the mean anchor in turn, so a set of them searches both together.
 fn files(name: &str, metric: Metric, count: usize, n: usize, dim: usize) -> (Vec<InMemory>, Vec<TempFile>, Vec<Rows>) {
     let mut rng = SplitMix64::new(41);
     let (mut memory, mut paths, mut data) = (Vec::new(), Vec::new(), Vec::new());
@@ -17,7 +18,11 @@ fn files(name: &str, metric: Metric, count: usize, n: usize, dim: usize) -> (Vec
     for i in 0..count {
         let (rows, mut clusters) = clustered(&mut rng, n, dim, 12, 1.0);
         group(&mut clusters, 3);
-        let index = InMemory::build(&params(metric), &rows, &clusters).unwrap();
+        let p = BuildParams {
+            anchor: [Anchor::Cluster, Anchor::Mean][i % 2],
+            ..params(metric)
+        };
+        let index = InMemory::build(&p, &rows, &clusters).unwrap();
         let path = temp_file(&format!("multi-{name}-{i}.coldivf"));
         write(&index, &path).unwrap();
         memory.push(index);
@@ -166,9 +171,12 @@ fn warm_and_cold_collections_search_alike() {
     for q in gaussian(&mut SplitMix64::new(45), 6, 128, |_| 1.0).chunks_exact(dim) {
         set.indexes.iter().for_each(|i| i.set_warm(false));
         set.search(q, &sp, &mut a, &mut cold).unwrap();
-        set.indexes[1].set_warm(true);
-        set.search(q, &sp, &mut a, &mut warm).unwrap();
-        assert_eq!(bits(&warm), bits(&cold));
+        // The first file takes the cluster anchor and the second the mean.
+        for (f, what) in [(1, "the mean file warm"), (0, "both warm")] {
+            set.indexes[f].set_warm(true);
+            set.search(q, &sp, &mut a, &mut warm).unwrap();
+            assert_eq!(bits(&warm), bits(&cold), "{what}");
+        }
     }
 }
 
@@ -327,4 +335,100 @@ fn a_context_shared_with_other_searches_keeps_each_collection_s_reads_apart() {
     // A set of another dimension, then this set again.
     assert_eq!(hits_of(&wide_set, &wide_q, &sp, &mut c), wide_want);
     assert_eq!(hits_of(&set, &q, &sp, &mut c), want);
+}
+
+#[cfg(feature = "bench")]
+#[test]
+fn a_search_of_several_collections_traces_its_own_stages_and_reads() {
+    let (_, paths, _) = files("trace", Metric::L2, 2, 500, 128);
+    let set = Collections::open(&refs(&paths)).unwrap();
+    let q = gaussian(&mut SplitMix64::new(50), 1, 128, |_| 1.0);
+    let sp = SearchParams {
+        k: 10,
+        nprobe: 8,
+        rerank: 60,
+        reach: None,
+    };
+    let (zero, page) = (std::time::Duration::ZERO, set.indexes[0].inner().read_page());
+    let mut c = ctx();
+    // A search of one index leaves its trace first, and the set's search must start a new one.
+    Index::open(&paths[0]).unwrap().search(&q, &sp, &mut c).unwrap();
+
+    for warm in [false, true] {
+        set.indexes[1].set_warm(warm);
+        let start = std::time::Instant::now();
+        set.search(&q, &sp, &mut c, &mut Vec::new()).unwrap();
+        let took = start.elapsed();
+        let t = c.trace();
+        assert!(
+            t.tables + t.buffers + t.route + t.submit + t.wave + t.scan + t.rows + t.rerank <= took,
+            "{t:?}"
+        );
+        // The set's first search loads its tables and makes its parts and its read buffers.
+        assert!(warm || (t.tables > zero && t.buffers > zero), "{t:?}");
+        assert!(t.route > zero && t.submit > zero && t.scan > zero && t.rows > zero && t.rerank > zero);
+        // On macOS the clusters arrive while the scan waits for them.
+        assert!(cfg!(not(target_os = "macos")) || t.wave > zero, "{t:?}");
+        assert!(t.row_ranges > 0 && t.row_bytes.is_multiple_of(page) && t.row_bytes >= t.row_ranges * page);
+
+        // It scanned every collection's clusters but read only the cold ones', the same bytes that a fetch of them
+        // from each index alone reads.
+        let (mut scanned, mut read) = (0, (0, 0));
+        for (f, index) in set.indexes.iter().enumerate() {
+            let leaves = c.parts[f].leaves.clone();
+            let inner = index.inner();
+            let lists = &inner.tables().unwrap().lists;
+            scanned += leaves.iter().map(|&l| lists[l as usize].count).sum::<usize>();
+            if f == 0 || !warm {
+                let mut alone = ctx();
+                index.fetch(&leaves, &mut alone).unwrap();
+                read = (
+                    read.0 + alone.trace().cluster_bytes,
+                    read.1 + alone.trace().cluster_ranges,
+                );
+            }
+        }
+        assert_eq!(
+            (t.scanned, t.cluster_bytes, t.cluster_ranges),
+            (scanned, read.0, read.1)
+        );
+    }
+}
+
+#[test]
+fn a_context_keeps_a_part_per_collection_whatever_their_cluster_counts() {
+    let (dim, mut rng) = (128, SplitMix64::new(47));
+    let paths: Vec<TempFile> = [8, 12, 16]
+        .into_iter()
+        .map(|nlist| {
+            let (rows, mut clusters) = clustered(&mut rng, 400, dim, nlist, 1.0);
+            group(&mut clusters, 3);
+            let path = temp_file(&format!("multi-counts-{nlist}.coldivf"));
+            write(&InMemory::build(&params(Metric::L2), &rows, &clusters).unwrap(), &path).unwrap();
+            path
+        })
+        .collect();
+    let sp = SearchParams {
+        k: 10,
+        nprobe: 6,
+        rerank: 60,
+        reach: None,
+    };
+    let q = gaussian(&mut SplitMix64::new(48), 1, dim, |_| 1.0);
+    let mut shared = ctx();
+
+    // Every maintenance run changes a file's cluster count, so one context meets sets of other counts in turn.
+    for round in 0..2 {
+        for [a, b] in [[0, 1], [2, 0], [1, 2]] {
+            let set = Collections::open(&[&paths[a], &paths[b]]).unwrap();
+            let want = hits_of(&set, &q, &sp, &mut ctx());
+            assert_eq!(
+                hits_of(&set, &q, &sp, &mut shared),
+                want,
+                "round {round}, files {a} and {b}"
+            );
+        }
+    }
+
+    assert_eq!(shared.parts.len(), 2, "a part per collection of a set");
 }

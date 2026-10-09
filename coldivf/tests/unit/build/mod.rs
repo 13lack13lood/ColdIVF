@@ -3,10 +3,10 @@
 use std::io::ErrorKind;
 
 use super::*;
-use crate::Metric;
 use crate::format::{read_header, verify};
 use crate::quantization::SplitMix64;
 use crate::quantization::testutil::{Rows, clustered, dist2, gaussian, params, temp_file, temps_of};
+use crate::{Clustering, Metric};
 
 #[test]
 fn a_built_file_checks_out() {
@@ -84,48 +84,65 @@ fn the_builder_finds_clusters_that_search_well() {
         parents: 4,
         ..params(Metric::L2)
     };
-    let out = temp_file("kmeans.coldivf");
-    crate::Builder::new(settings).build(&rows, &out).unwrap();
-
-    let bytes = fs::read(&out).unwrap();
-    let layout = read_header(&bytes, bytes.len()).unwrap();
-    assert_eq!((layout.count, layout.nlist, layout.nparents), (3000, 20, 4));
-    let index = crate::Index::open(&out).unwrap();
-    index.verify().unwrap();
-    let mut ctx = crate::SearchCtx::new(crate::Limits {
-        max_k: 10,
-        max_nprobe: 20,
-        max_rerank: 100,
-    });
     let some = crate::SearchParams {
         k: 10,
         nprobe: 5,
         rerank: 100,
         reach: None,
     };
-
     // Queries land near the data, and a quarter of the clusters holds most of their true neighbors.
-    let mut found = 0;
-    for _ in 0..20 {
-        let r = (rng.next_u64() % n as u64) as usize;
-        let q: Vec<f32> = rows.data[r * dim..(r + 1) * dim]
-            .iter()
-            .map(|&x| x + (rng.normal() * 0.3) as f32)
-            .collect();
-        let mut exact: Vec<(f64, u64)> = rows
-            .data
-            .chunks_exact(dim)
-            .enumerate()
-            .map(|(i, o)| (dist2(&q, o), i as u64))
-            .collect();
-        exact.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let truth: Vec<u64> = exact.iter().take(10).map(|e| e.1).collect();
-        let hits = index.search(&q, &some, &mut ctx).unwrap();
-        found += hits.iter().filter(|h| truth.contains(&h.id)).count();
-    }
+    let queries: Vec<(Vec<f32>, Vec<u64>)> = (0..20)
+        .map(|_| {
+            let r = (rng.next_u64() % n as u64) as usize;
+            let q: Vec<f32> = rows.data[r * dim..(r + 1) * dim]
+                .iter()
+                .map(|&x| x + (rng.normal() * 0.3) as f32)
+                .collect();
+            let mut exact: Vec<(f64, u64)> = rows
+                .data
+                .chunks_exact(dim)
+                .enumerate()
+                .map(|(i, o)| (dist2(&q, o), i as u64))
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+            (q, exact.iter().take(10).map(|e| e.1).collect())
+        })
+        .collect();
 
-    let recall = found as f64 / 200.0;
-    assert!(recall >= 0.9, "found {recall} of the true 10 nearest neighbors");
+    for clustering in [Clustering::Flat, Clustering::TwoLevel] {
+        let out = temp_file(&format!("kmeans-{clustering:?}.coldivf"));
+        crate::Builder::new(settings.clone())
+            .clustering(clustering)
+            .build(&rows, &out)
+            .unwrap();
+        let bytes = fs::read(&out).unwrap();
+        let layout = read_header(&bytes, bytes.len()).unwrap();
+        // Two-level clustering rounds up in each group, which adds at most a cluster per group.
+        assert!(
+            layout.count == 3000 && (20..=24).contains(&layout.nlist),
+            "{clustering:?}"
+        );
+        assert_eq!(layout.nparents, 4, "{clustering:?}");
+        let index = crate::Index::open(&out).unwrap();
+        index.verify().unwrap();
+        let mut ctx = crate::SearchCtx::new(crate::Limits {
+            max_k: 10,
+            max_nprobe: 20,
+            max_rerank: 100,
+        });
+        let found: usize = queries
+            .iter()
+            .map(|(q, truth)| {
+                let hits = index.search(q, &some, &mut ctx).unwrap();
+                hits.iter().filter(|h| truth.contains(&h.id)).count()
+            })
+            .sum();
+        let recall = found as f64 / 200.0;
+        assert!(
+            recall >= 0.9,
+            "{clustering:?} found {recall} of the true 10 nearest neighbors"
+        );
+    }
 }
 
 #[test]
@@ -237,6 +254,98 @@ fn clustering_runs_k_means_with_the_documented_settings() {
     assert_eq!((clusters.assignment, clusters.parent_of), (assignment, parent_of));
 }
 
+#[test]
+fn building_from_the_clusters_a_build_finds_writes_the_same_file() {
+    let (rows, _) = clustered(&mut SplitMix64::new(11), 2000, 128, 10, 1.0);
+    let settings = BuildParams {
+        vectors_per_list: 200,
+        parents: 3,
+        order: crate::LeafOrder::Chained,
+        ..params(Metric::Cosine)
+    };
+
+    for clustering in [Clustering::Flat, Clustering::TwoLevel] {
+        let builder = crate::Builder::new(settings.clone()).clustering(clustering);
+        let (built, again) = (
+            temp_file(&format!("found-{clustering:?}.coldivf")),
+            temp_file(&format!("found-again-{clustering:?}.coldivf")),
+        );
+        builder.build(&rows, &built).unwrap();
+        let clusters = builder.cluster(&rows, &again).unwrap();
+        // Clustering alone writes no index and leaves nothing next to where it would go.
+        assert!(!again.exists() && temps_of(&again).is_empty(), "{clustering:?}");
+        builder.build_with_clusters(&rows, &clusters, &again).unwrap();
+        assert_eq!(fs::read(&built).unwrap(), fs::read(&again).unwrap(), "{clustering:?}");
+    }
+}
+
+#[test]
+fn grouping_finds_the_groups_a_flat_build_finds() {
+    let (rows, _) = clustered(&mut SplitMix64::new(12), 1000, 128, 10, 1.0);
+    let settings = BuildParams {
+        vectors_per_list: 100,
+        parents: 3,
+        ..params(Metric::L2)
+    };
+    let flat = cluster(&settings, &rows, &threads(2).unwrap()).unwrap();
+    let mut bare = Clusters {
+        dim: flat.dim,
+        centroids: flat.centroids.clone(),
+        assignment: flat.assignment.clone(),
+        parents: Vec::new(),
+        parent_of: Vec::new(),
+    };
+    crate::Builder::new(settings.clone()).group(&mut bare).unwrap();
+
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&bare.parents), bits(&flat.parents));
+    assert_eq!(bare.parent_of, flat.parent_of);
+    assert_eq!(
+        (bits(&bare.centroids), &bare.assignment),
+        (bits(&flat.centroids), &flat.assignment)
+    );
+
+    // More groups than clusters make one group per cluster.
+    let many = BuildParams {
+        parents: 50,
+        ..settings
+    };
+    crate::Builder::new(many).group(&mut bare).unwrap();
+    assert_eq!(bare.parents.len(), 10 * 128);
+    assert!(bare.parent_of.iter().all(|&g| g < 10));
+}
+
+#[test]
+fn grouping_needs_whole_rows_of_finite_centers_and_a_group() {
+    let (_, clusters) = clustered(&mut SplitMix64::new(13), 100, 128, 4, 0.5);
+    let bare = |dim: usize, centroids: &[f32]| Clusters {
+        dim,
+        centroids: centroids.to_vec(),
+        assignment: clusters.assignment.clone(),
+        parents: Vec::new(),
+        parent_of: Vec::new(),
+    };
+    let mut infinite = clusters.centroids.clone();
+    infinite[200] = f32::INFINITY;
+    let no_groups = BuildParams {
+        parents: 0,
+        ..params(Metric::L2)
+    };
+    let cases = [
+        (bare(128, &[]), params(Metric::L2)),
+        (bare(128, &clusters.centroids[1..]), params(Metric::L2)),
+        (bare(0, &clusters.centroids), params(Metric::L2)),
+        (bare(128, &infinite), params(Metric::L2)),
+        (bare(128, &clusters.centroids), no_groups),
+    ];
+
+    for (i, (mut c, settings)) in cases.into_iter().enumerate() {
+        let err = crate::Builder::new(settings).group(&mut c).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "case {i}");
+        assert!(c.parents.is_empty() && c.parent_of.is_empty(), "case {i}");
+    }
+}
+
 /// A source that counts the rows read from it.
 struct Counted {
     dim: usize,
@@ -289,4 +398,62 @@ fn bad_settings_fail_before_any_clustering() {
             "a bad setting was found only after reading the vectors"
         );
     }
+}
+
+#[test]
+fn a_source_read_in_order_asks_for_each_next_stretch() {
+    struct Logged {
+        rows: Rows,
+        asked: std::cell::RefCell<Vec<(usize, usize)>>,
+    }
+
+    impl VectorSource for Logged {
+        fn count(&self) -> usize {
+            self.rows.count()
+        }
+
+        fn dim(&self) -> usize {
+            self.rows.dim()
+        }
+
+        fn rows(&self, start: usize, rows: usize) -> &[f32] {
+            self.asked.borrow_mut().push((start, rows));
+            self.rows.rows(start, rows)
+        }
+    }
+
+    let (rows, _) = clustered(&mut SplitMix64::new(2), 10, 128, 2, 0.5);
+    let logged = Logged {
+        rows,
+        asked: Default::default(),
+    };
+    let ahead = Ahead {
+        src: &logged,
+        stretch: 3,
+        reads: ReadAhead::new(),
+    };
+
+    // Read a row at a time, it asks for the first stretch as it starts and for each next one as it reaches the one
+    // before, never past the end, and hands out the source's rows.
+    for r in 0..10 {
+        assert_eq!(ahead.rows(r, 1), logged.rows.rows(r, 1));
+    }
+    let hints = [(0, 3), (3, 3), (6, 3), (9, 1)];
+    let rows: Vec<(usize, usize)> = (0..10).map(|r| (r, 1)).collect();
+    let mut want: Vec<(usize, usize)> = Vec::new();
+    for r in 0..10 {
+        if r == 0 {
+            want.push(hints[0]);
+        }
+        if r % 3 == 0 && r + 3 < 10 {
+            want.push(hints[r / 3 + 1]);
+        }
+        want.push(rows[r]);
+    }
+    assert_eq!(*logged.asked.borrow(), want);
+
+    // A run asks for the stretch after each one that starts inside it.
+    logged.asked.borrow_mut().clear();
+    assert_eq!(ahead.rows(2, 5), logged.rows.rows(2, 5));
+    assert_eq!(*logged.asked.borrow(), [(6, 3), (9, 1), (2, 5)]);
 }

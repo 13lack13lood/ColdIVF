@@ -28,7 +28,7 @@ pub(crate) fn before(a: Candidate, b: Candidate) -> bool {
 
 /// A score as it ranks, with NaN as +∞.
 #[inline]
-fn rank(score: f32) -> f32 {
+pub(crate) fn rank(score: f32) -> f32 {
     if score.is_nan() { f32::INFINITY } else { score }
 }
 
@@ -93,6 +93,18 @@ impl Candidates {
         } else {
             self.heap[0] = c;
             self.sift_down(0);
+        }
+    }
+
+    /// Adds `c` while the set has room, whatever its score, and after that like `offer`. So the set ends with the
+    /// `cap` candidates that come first in the order of `before`, even a score of +∞ or NaN, eg. a damaged cluster's
+    /// route score when every cluster is read.
+    pub(crate) fn push(&mut self, c: Candidate) {
+        if self.heap.len() < self.cap {
+            self.heap.push(c);
+            self.sift_up(self.heap.len() - 1);
+        } else {
+            self.offer(c);
         }
     }
 

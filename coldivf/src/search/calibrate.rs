@@ -11,7 +11,7 @@ use std::io::{Error, ErrorKind};
 
 use super::candidates::{Candidate, order};
 use super::route::{route, within_reach};
-use super::scan::scan_list;
+use super::scan::scan_leaf;
 use super::{InPlace, Scratch, View, check_search, invalid, prepare_query};
 use crate::index::Inner;
 use crate::quantization::rabitq::{BLOCK, block_bytes};
@@ -24,15 +24,18 @@ const DELTA: f64 = 0.1;
 /// How many true nearest neighbors each query comes with. A search's recall is the share of them that it finds.
 const TRUTH: usize = 10;
 
-/// The cluster counts that the grid tries, cut at the index's cluster count.
-const NPROBES: [usize; 34] = [
+/// The cluster counts that the grid tries, cut at the index's cluster count. From 2 on, each is at most 1.5 times the
+/// one before. They go up to 4096, since finding 99% of the true 10 nearest neighbors at 10M vectors takes more than
+/// 512.
+const NPROBES: [usize; 38] = [
     1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224,
-    256, 320, 384, 512, 768, 1024,
+    256, 320, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
 ];
 
-/// The rescore depths that the grid tries.
-const RERANKS: [usize; 21] = [
-    10, 12, 14, 16, 18, 20, 24, 29, 32, 35, 39, 44, 48, 56, 64, 80, 96, 128, 160, 192, 256,
+/// The rescore depths that the grid tries. Each is at most 1.5 times the one before, up to 2048.
+const RERANKS: [usize; 28] = [
+    10, 12, 14, 16, 18, 20, 24, 29, 32, 35, 39, 44, 48, 56, 64, 80, 96, 128, 160, 192, 256, 320, 384, 512, 768, 1024,
+    1536, 2048,
 ];
 
 /// The caps on the clusters that a setting with a reach reads, as multiples of the cluster count of the cheapest fixed
@@ -85,9 +88,7 @@ pub(crate) fn calibrate(index: &Inner, queries: &[f32], truth: &[u32], target: T
     // The fixed settings first. The cheapest that meets the target on the first half sets the caps and the rescore
     // depths of the settings with a reach.
     let nlist = view.lists.len();
-    let mut nprobes: Vec<usize> = NPROBES.iter().copied().filter(|&n| n < nlist).collect();
-    nprobes.push(nlist.min(NPROBES[NPROBES.len() - 1]));
-    let fixed: Vec<Calibration> = nprobes
+    let fixed: Vec<Calibration> = fixed_nprobes(nlist)
         .iter()
         .flat_map(|&nprobe| {
             RERANKS.iter().map(move |&rerank| Calibration {
@@ -114,15 +115,26 @@ pub(crate) fn calibrate(index: &Inner, queries: &[f32], truth: &[u32], target: T
         .ok_or_else(|| invalid("no setting meets the target with 90% confidence on these queries"))
 }
 
+/// The cluster counts of the fixed settings for an index of `nlist` clusters. They are the grid's counts below `nlist`,
+/// then `nlist` itself, or the grid's largest count when the index has more clusters.
+fn fixed_nprobes(nlist: usize) -> Vec<usize> {
+    let mut nprobes: Vec<usize> = NPROBES.iter().copied().filter(|&n| n < nlist).collect();
+    nprobes.push(nlist.min(NPROBES[NPROBES.len() - 1]));
+    nprobes.dedup();
+    nprobes
+}
+
 /// The settings with a reach that the grid tries, given `base`, the cheapest fixed setting that met the target on the
-/// first half. Each reads at most `base.nprobe` times one of the caps, cut at `nlist`, and rescores to a depth near
-/// `base.rerank`.
+/// first half. Each reads at most `base.nprobe` times one of the caps, cut at `nlist` and at the fixed settings' most
+/// clusters, and rescores to a depth near `base.rerank`. So no setting reads more clusters or rescores more candidates
+/// than the fixed ones.
 fn reach_grid(base: &Calibration, nlist: usize) -> Vec<Calibration> {
     let at = RERANKS.partition_point(|&r| r < base.rerank);
     let reranks = &RERANKS[at.saturating_sub(NEAR)..(at + NEAR + 1).min(RERANKS.len())];
+    let most = nlist.min(NPROBES[NPROBES.len() - 1]);
     let mut caps: Vec<usize> = CAPS
         .iter()
-        .map(|&c| ((base.nprobe as f64 * c).ceil() as usize).min(nlist))
+        .map(|&c| ((base.nprobe as f64 * c).ceil() as usize).min(most))
         .collect();
     caps.dedup();
 
@@ -304,7 +316,7 @@ impl<'a> Evaluator<'a> {
             view.tier,
             &view.centers,
             &s.q8,
-            s.lut.k.t2,
+            s.lut.mean.t2,
             most,
             &mut s.dots,
             &mut s.routes,
@@ -325,14 +337,15 @@ impl<'a> Evaluator<'a> {
 
         for &point in &points {
             while scanned < point {
-                let list = view.lists[s.routes[scanned].id as usize];
+                let leaf = s.routes[scanned].id;
+                let list = view.lists[leaf as usize];
                 let len = list.count.div_ceil(BLOCK) * size;
-                scan_list(
-                    view.tier,
+                scan_leaf(
+                    view,
+                    leaf,
                     &self.data.blocks[list.offset..list.offset + len],
-                    list.count,
-                    list.first_id,
-                    &s.lut,
+                    &mut s.lut,
+                    &s.q32,
                     &mut s.candidates,
                     &mut s.survivors,
                 );
@@ -380,6 +393,11 @@ impl<'a> Evaluator<'a> {
                         .count();
                     runs.recall[base + depths[next].1] = found as f32 / TRUTH as f32;
                     next += 1;
+                }
+                // Once every depth has its recall, the deeper candidates change nothing, eg. past the few depths that
+                // the settings with a reach try.
+                if next == depths.len() {
+                    break;
                 }
             }
             // A depth past the candidates there are sees them all.

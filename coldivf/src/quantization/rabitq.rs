@@ -26,6 +26,26 @@
 //! and the true distance is within f_err·T of est for ~95% of pairs. Every path computes est with the same three fused
 //! multiply-adds in the same order, so they all give the same bits.
 //!
+//! A code can also be measured from its cluster's center ĉ, the point that the cluster's 4-bit center codes decode to.
+//! Then r = o − ĉ, and every factor keeps its formula with that r except
+//!
+//! ```text
+//! f_add = L² − f_rescale·bc    where x̄ = (2b − 1) / √d and bc = ⟨x̄, P(ĉ − μ)⟩
+//! ```
+//!
+//! Since P(q − ĉ) = P(q − μ) − P(ĉ − μ), and f_add holds the part from P(ĉ − μ), the query keeps its 4-bit values, its
+//! lookup table and k_s, k_p and k_c. The estimate keeps its form too, with t2 = ‖q − ĉ‖² in place of T². So a scan
+//! only sets the query's t and t2 for each cluster it scans, and the error bar is f_err·t with
+//!
+//! ```text
+//! t² = ‖q − ĉ‖² + e²    e² = T²·(d − 1)·Σ_i (v_l + Δ·q_u,i − y_i)² / (d·(1 − 2/π))
+//! ```
+//!
+//! The query's 4-bit values still come from P(q − μ), so their error grows with T and not with ‖q − ĉ‖. e² adds that
+//! error to the bar the way a larger t would, with α² ≈ 2/π, its value for a random direction. From the mean, f_err·T
+//! already covers it, since both grow with T. Without e², the bar would hold far fewer than ~95% of a cluster's pairs
+//! for a query close to its center.
+//!
 //! Queries scan the codes in blocks of 32 vectors, over d_pad dimensions, d rounded up to a multiple of 64. The 32
 //! vector slots of a block are its lanes. A block holds the codes as 4-bit groups. Group g covers dimensions 4g to
 //! 4g + 3, and bit t of a group is the bit of dimension 4g + t. Byte i of group g holds vector i's group in its low
@@ -73,7 +93,8 @@ pub(crate) const fn block_bytes(d_pad: usize) -> usize {
     4 * d_pad + 16 * BLOCK
 }
 
-/// Encodes vectors against a mean and a rotation. It owns its scratch space, so encoding allocates nothing.
+/// Encodes vectors against a mean and a rotation, each measured from the mean or from its cluster's center. It owns
+/// its scratch space, so encoding allocates nothing.
 pub(crate) struct Encoder<'a> {
     rotation: &'a Rotation,
     mean: &'a [f32],
@@ -104,16 +125,6 @@ impl<'a> Encoder<'a> {
 
         let l = rotate_offset(self.rotation, o, self.mean, &mut self.rotated, &mut self.tmp);
         bits.fill(0);
-
-        if l == 0.0 {
-            return Factors {
-                f_add: 0.0,
-                f_rescale: 0.0,
-                f_pop: 0.0,
-                f_err: 0.0,
-            };
-        }
-
         let (mut abs_sum, mut pop) = (0f64, 0u32);
 
         for (i, &x) in self.rotated.iter().enumerate() {
@@ -124,18 +135,63 @@ impl<'a> Encoder<'a> {
             }
         }
 
-        let d = dim as f64;
-        // Σ|w_i| is at least 1 for the unit vector w = P·r / L, so α is at least 1/√d. The clamp only matters when P·r
-        // underflows to zero for a tiny r.
-        let alpha = (abs_sum / l / d.sqrt()).max(1e-6);
-        let f_err = 2.0 * l * f64::from(EPS0) * ((1.0 - alpha * alpha).max(0.0) / (alpha * alpha * (d - 1.0))).sqrt();
+        factors(dim, l, l * l, abs_sum, pop, 0.0)
+    }
 
-        Factors {
-            f_add: (l * l) as f32,
-            f_rescale: (-2.0 * l / alpha) as f32,
-            f_pop: pop as f32,
-            f_err: f_err as f32,
+    /// Encodes `o` into `bits` like `encode`, but measured from a cluster's center ĉ, where `center` is P(ĉ − μ). The
+    /// rotated r is P(o − μ) − P(ĉ − μ), so only `o` is rotated. A vector equal to the center gets f_add = 0 and
+    /// f_rescale = 0, so its estimate is exactly ‖q − ĉ‖².
+    pub(crate) fn encode_from(&mut self, o: &[f32], center: &[f32], bits: &mut [u8]) -> Factors {
+        let dim = self.rotation.dim();
+        assert!(center.len() == dim && bits.len() == code_bytes(padded_dim(dim)));
+
+        rotate_offset(self.rotation, o, self.mean, &mut self.rotated, &mut self.tmp);
+        bits.fill(0);
+        let (mut l2, mut abs_sum, mut bc, mut pop) = (0f64, 0f64, 0f64, 0u32);
+
+        for (i, (&x, &c)) in self.rotated.iter().zip(center).enumerate() {
+            let (r, c) = (f64::from(x) - f64::from(c), f64::from(c));
+            l2 += r * r;
+            abs_sum += r.abs();
+            if r > 0.0 {
+                bits[i / 8] |= 1 << (i % 8);
+                pop += 1;
+                bc += c;
+            } else {
+                bc -= c;
+            }
         }
+
+        factors(dim, l2.sqrt(), l2, abs_sum, pop, bc / (dim as f64).sqrt())
+    }
+}
+
+/// The factors of a code of `dim` dimensions whose offset r has length `l` and squared length `l2`, with
+/// Σ|(P·r)_i| = `abs_sum` and `pop` bits set. `bc` is ⟨x̄, P(ĉ − μ)⟩ for a code measured from a cluster's center ĉ, and
+/// 0 for one measured from the mean.
+fn factors(dim: usize, l: f64, l2: f64, abs_sum: f64, pop: u32, bc: f64) -> Factors {
+    if l == 0.0 {
+        return Factors {
+            f_add: 0.0,
+            f_rescale: 0.0,
+            f_pop: 0.0,
+            f_err: 0.0,
+        };
+    }
+
+    let d = dim as f64;
+    // Σ|w_i| is at least 1 for the unit vector w = P·r / L, so α is at least 1/√d. The clamp only matters when P·r
+    // underflows to zero for a tiny r.
+    let alpha = (abs_sum / l / d.sqrt()).max(1e-6);
+    let f_err = 2.0 * l * f64::from(EPS0) * ((1.0 - alpha * alpha).max(0.0) / (alpha * alpha * (d - 1.0))).sqrt();
+    // f_add uses f_rescale as stored, the value that est multiplies the query's part by.
+    let f_rescale = (-2.0 * l / alpha) as f32;
+
+    Factors {
+        f_add: (l2 - f64::from(f_rescale) * bc) as f32,
+        f_rescale,
+        f_pop: pop as f32,
+        f_err: f_err as f32,
     }
 }
 
@@ -145,9 +201,11 @@ pub(crate) struct QueryConsts {
     pub(crate) k_s: f32,
     pub(crate) k_p: f32,
     pub(crate) k_c: f32,
-    /// T = ‖q − μ‖.
+    /// The scale of the error bar f_err·t. It is T = ‖q − μ‖ for codes measured from the mean, and √(‖q − ĉ‖² + e²) for
+    /// codes measured from a cluster's center ĉ.
     pub(crate) t: f32,
-    /// T².
+    /// The query's squared distance from what the codes are measured from, T² for the mean or ‖q − ĉ‖² for a cluster's
+    /// center ĉ.
     pub(crate) t2: f32,
 }
 
@@ -159,7 +217,12 @@ pub(crate) struct QueryLut {
     pub(crate) qu: Vec<u8>,
     /// 16 entries per 4-bit group, d_pad/4 groups.
     pub(crate) lut: Vec<u8>,
+    /// The constants of est for the codes it scans next.
     pub(crate) k: QueryConsts,
+    /// The constants as `prepare` set them, with t and t2 measured from the mean.
+    pub(crate) mean: QueryConsts,
+    /// e², what the error of the query's 4-bit values adds to t² for codes measured from a cluster's center.
+    pub(crate) e2: f64,
 }
 
 impl QueryLut {
@@ -170,6 +233,8 @@ impl QueryLut {
             qu: vec![0; d_pad],
             lut: vec![0; 4 * d_pad],
             k: QueryConsts::default(),
+            mean: QueryConsts::default(),
+            e2: 0.0,
         }
     }
 
@@ -181,6 +246,8 @@ impl QueryLut {
         self.qu.fill(0);
         self.lut.fill(0);
         self.k = QueryConsts::default();
+        self.mean = self.k;
+        self.e2 = 0.0;
 
         if t == 0.0 {
             return;
@@ -195,12 +262,14 @@ impl QueryLut {
         }
 
         let delta = (hi - lo) / 15.0;
-        let mut qu_sum = 0u64;
+        let (mut qu_sum, mut err2) = (0u64, 0f64);
 
         if delta > 0.0 {
             for (q, &v) in self.qu.iter_mut().zip(y_rot) {
-                *q = ((f64::from(v) / t - lo) / delta).round().clamp(0.0, 15.0) as u8;
+                let y = f64::from(v) / t;
+                *q = ((y - lo) / delta).round().clamp(0.0, 15.0) as u8;
                 qu_sum += u64::from(*q);
+                err2 += (lo + delta * f64::from(*q) - y).powi(2);
             }
         }
 
@@ -226,6 +295,24 @@ impl QueryLut {
             t: t as f32,
             t2: (t * t) as f32,
         };
+        self.mean = self.k;
+        self.e2 = t * t * (d - 1.0) * err2 / (d * (1.0 - 2.0 / std::f64::consts::PI));
+    }
+
+    /// The constants of est for codes measured from a point at squared distance `t2` from the query, eg. a cluster's
+    /// center. Only t and t2 differ from the mean's, and t² is t2 + e², so the error bar counts the query's 4-bit
+    /// error.
+    pub(crate) fn anchored(&self, t2: f64) -> QueryConsts {
+        QueryConsts {
+            t: (t2 + self.e2).sqrt() as f32,
+            t2: t2 as f32,
+            ..self.mean
+        }
+    }
+
+    /// Sets the constants of est to `anchored(t2)`, for codes scanned next.
+    pub(crate) fn set_anchor(&mut self, t2: f64) {
+        self.k = self.anchored(t2);
     }
 }
 
@@ -238,7 +325,7 @@ pub(crate) fn est(s: u32, f: &Factors, k: &QueryConsts) -> f32 {
     fmaf(f.f_rescale, ip, f.f_add + k.t2)
 }
 
-/// The low end of the error bar, est − f_err·T.
+/// The low end of the error bar, est − f_err·t.
 #[inline]
 pub(crate) fn lower(est: f32, f: &Factors, k: &QueryConsts) -> f32 {
     fmaf(-f.f_err, k.t, est)

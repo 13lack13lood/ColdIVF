@@ -8,7 +8,8 @@ use std::io::Error;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
-use super::{InOrder, Range, Warmth, Wave};
+use super::{InOrder, Memory, Range, Warmth, Wave};
+use crate::trace::ReadPath;
 
 /// The page size of Apple silicon, which the reads round out to.
 const PAGE: usize = 16384;
@@ -46,7 +47,7 @@ impl Wave for RdAdviseWave {
         PAGE
     }
 
-    fn submit(&mut self, lane: usize, file: &File, ranges: &[Range], _arena: &mut [u8]) -> Result<(), Error> {
+    fn submit(&mut self, lane: usize, file: &File, ranges: &[Range], _arena: Memory) -> Result<(), Error> {
         self.0.start(lane, 0);
         ranges
             .iter()
@@ -56,8 +57,15 @@ impl Wave for RdAdviseWave {
         Ok(())
     }
 
-    fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<Option<usize>, Error> {
+    fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: Memory) -> Result<Option<usize>, Error> {
         self.0.read(lane, file, ranges, arena)
+    }
+
+    fn read_path(&self) -> ReadPath {
+        ReadPath {
+            backend: "rdadvise",
+            ..ReadPath::default()
+        }
     }
 }
 
@@ -79,6 +87,21 @@ pub(crate) fn advise(file: &File, offset: usize, len: usize) -> Result<(), Error
     }
 
     Ok(())
+}
+
+/// Asks the drive to write `file`'s data and its cache to the medium, which survives a power loss, unlike a plain
+/// sync. Returns false when the file system refuses it, eg. some network drives, so the caller syncs as usual.
+pub(crate) fn full_sync(file: &File) -> Result<bool, Error> {
+    // SAFETY: F_FULLFSYNC takes no argument and touches no memory.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+        let e = Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::ENOTSUP | libc::EINVAL | libc::ENOTTY) => Ok(false),
+            _ => Err(e),
+        };
+    }
+
+    Ok(true)
 }
 
 /// Runs the calling thread at utility quality of service (QoS), which macOS schedules after interactive work.

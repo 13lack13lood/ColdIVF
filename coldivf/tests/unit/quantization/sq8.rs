@@ -129,3 +129,25 @@ fn rows_follow_the_file_layout() {
         assert_eq!(center, want, "center row at dim {dim}");
     }
 }
+
+#[test]
+fn a_row_decodes_to_the_mean_plus_its_scaled_codes() {
+    let mut rng = SplitMix64::new(4);
+    for dim in [128, 200, 768] {
+        let rows = gaussian(&mut rng, 20, dim, |k| 1.0 + (k % 3) as f64);
+        let mu = mean(&rows, dim);
+        let (mut row, mut out) = (vec![0u8; row_bytes(dim)], vec![0f32; dim]);
+        for o in rows.chunks_exact(dim) {
+            write_row(o, &mu, 7, &mut row);
+            decode(&row, &mu, &mut out);
+            let s = scale(&row, dim);
+            for i in 0..dim {
+                assert_eq!(out[i], mu[i] + s * f32::from(code(&row, i)), "value {i} at dim {dim}");
+                assert!(
+                    (out[i] - o[i]).abs() <= 0.5001 * s,
+                    "value {i} at dim {dim} is past half a step"
+                );
+            }
+        }
+    }
+}

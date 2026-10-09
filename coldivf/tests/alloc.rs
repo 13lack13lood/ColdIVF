@@ -1,22 +1,32 @@
-//! Checks that searches allocate nothing once a search context is warm. A counting allocator counts every allocation
-//! in the process while a check runs, so this runs as its own program.
+//! Checks that searches allocate nothing once a search context is warm, also across commits that swap the index's
+//! generation under it. A counting allocator counts every allocation and every free in the process while a check runs,
+//! so this runs as its own program. A thread start allocates and a join frees, so the counts cover those too.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::ErrorKind;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use coldivf::{
-    BuildParams, Builder, Collections, Index, LeafOrder, Limits, Metric, SearchCtx, SearchParams, VectorSource, Writer,
+    Anchor, BuildParams, Builder, Collections, Index, LeafOrder, Limits, MaintainParams, Metric, RunKind, SearchCtx,
+    SearchParams, VectorSource, Writer,
 };
 
 struct Counting;
 
 static ON: AtomicBool = AtomicBool::new(false);
 static COUNT: AtomicUsize = AtomicUsize::new(0);
+static FREES: AtomicUsize = AtomicUsize::new(0);
 
 fn note() {
     if ON.load(Ordering::Relaxed) {
         COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn note_free() {
+    if ON.load(Ordering::Relaxed) {
+        FREES.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -41,6 +51,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        note_free();
         // SAFETY: as for `realloc`.
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -51,11 +62,17 @@ static ALLOCATOR: Counting = Counting;
 
 /// How many allocations `f` makes.
 fn count(f: impl FnOnce()) -> usize {
+    counts(f).0
+}
+
+/// How many allocations and frees `f` makes.
+fn counts(f: impl FnOnce()) -> (usize, usize) {
     COUNT.store(0, Ordering::SeqCst);
+    FREES.store(0, Ordering::SeqCst);
     ON.store(true, Ordering::SeqCst);
     f();
     ON.store(false, Ordering::SeqCst);
-    COUNT.load(Ordering::SeqCst)
+    (COUNT.load(Ordering::SeqCst), FREES.load(Ordering::SeqCst))
 }
 
 /// Rows held in memory.
@@ -91,12 +108,16 @@ fn random(state: &mut u64, n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// The index file, deleted when dropped, even when a check panics.
+/// The index file, deleted when dropped with its log, its lock file and its folder, even when a check panics.
 struct TempFile(std::path::PathBuf);
 
 impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        let side = |end: &str| std::path::PathBuf::from(format!("{}{end}", self.0.display()));
+        let _ = std::fs::remove_file(side(".delta"));
+        let _ = std::fs::remove_file(side(".lock"));
+        let _ = std::fs::remove_dir_all(side(".d"));
     }
 }
 
@@ -137,6 +158,7 @@ fn main() -> ExitCode {
         vectors_per_list: 100,
         parents: 4,
         order: LeafOrder::Chained,
+        anchor: Anchor::Cluster,
         page_size: 4096,
         threads: 2,
         seed: 7,
@@ -176,6 +198,23 @@ fn main() -> ExitCode {
                 }
             }
         }
+    }
+
+    // Once the cluster tables are loaded, `prepare` makes a new context's buffers for the index, so even its first
+    // search allocates nothing.
+    let mut ctx = SearchCtx::new(limits);
+    index.prepare(&mut ctx).unwrap();
+    let sp = SearchParams {
+        k: 10,
+        nprobe: 40,
+        rerank: 60,
+        reach: None,
+    };
+    let allocations = count(|| _ = index.search(&queries[..dim], &sp, &mut ctx).unwrap());
+
+    if allocations > 0 {
+        eprintln!("alloc: the first search after prepare made {allocations} allocations");
+        failed = true;
     }
 
     // A search over several collections keeps its parts in the context too, even for a context first used at the
@@ -223,15 +262,11 @@ fn main() -> ExitCode {
         }
     }
 
-    // Inserts are scanned and deletes filtered in place, so they allocate nothing either.
+    // Inserts are scanned and deletes filtered in place, so they allocate nothing either. An insert can reach a cluster
+    // that no earlier search saw holding one, so a context warmed before any is checked after each of them.
     let _log = TempFile(std::path::PathBuf::from(format!("{}.delta", file.0.display())));
+    let _lock = TempFile(std::path::PathBuf::from(format!("{}.lock", file.0.display())));
     let mut writer = Writer::open(&file.0).unwrap();
-
-    for (i, v) in random(&mut state, 50 * dim).chunks_exact(dim).enumerate() {
-        writer.insert(100_000 + i as u64, v).unwrap();
-    }
-
-    (0..20).for_each(|id| writer.delete(id).unwrap());
     let sp = SearchParams {
         k: 10,
         nprobe: 40,
@@ -241,7 +276,26 @@ fn main() -> ExitCode {
     let mut ctx = SearchCtx::new(limits);
     _ = index.search(&queries[..dim], &sp, &mut ctx).unwrap();
 
-    for q in queries.chunks_exact(dim).skip(1) {
+    for (i, row) in rows.data.chunks_exact(dim).step_by(n / 40).enumerate() {
+        writer.insert(100_000 + i as u64, row).unwrap();
+        let q = &queries[i % 8 * dim..(i % 8 + 1) * dim];
+        let allocations = count(|| _ = index.search(q, &sp, &mut ctx).unwrap());
+        if allocations > 0 {
+            eprintln!("alloc: the search after insert {i} made {allocations} allocations");
+            failed = true;
+        }
+    }
+
+    for (i, v) in random(&mut state, 50 * dim).chunks_exact(dim).enumerate() {
+        writer.insert(200_000 + i as u64, v).unwrap();
+    }
+
+    (0..20).for_each(|id| writer.delete(id).unwrap());
+    // With the inserts there already, a new context that `prepare` made ready allocates nothing from its first search.
+    let mut ctx = SearchCtx::new(limits);
+    index.prepare(&mut ctx).unwrap();
+
+    for q in queries.chunks_exact(dim) {
         let allocations = count(|| _ = index.search(q, &sp, &mut ctx).unwrap());
         if allocations > 0 {
             eprintln!("alloc: a search with inserts and deletes made {allocations} allocations");
@@ -260,8 +314,8 @@ fn main() -> ExitCode {
             reach,
         };
         let mut ctx = SearchCtx::new(limits);
-        _ = index.search(&queries[..dim], &sp, &mut ctx).unwrap();
-        for q in queries.chunks_exact(dim).skip(1) {
+        index.prepare(&mut ctx).unwrap();
+        for q in queries.chunks_exact(dim) {
             let allocations = count(|| _ = index.search(q, &sp, &mut ctx).unwrap());
             if allocations > 0 {
                 eprintln!("alloc: a warm search made {allocations} allocations with reach {reach:?}");
@@ -270,10 +324,153 @@ fn main() -> ExitCode {
         }
     }
 
+    failed |= !across_commits(&mut state);
+
     if failed {
         return ExitCode::FAILURE;
     }
 
     println!("alloc: no search allocated after warming up");
     ExitCode::SUCCESS
+}
+
+/// Searches across commits of this process's writer, which swap the index's generation under warm contexts. Every
+/// search call allocates and frees nothing, unless a new generation's largest clusters outgrow a context's room for
+/// them, which makes one buffer anew. Returns whether every check held.
+fn across_commits(state: &mut u64) -> bool {
+    let (dim, n) = (128, 4000);
+    let rows = Rows {
+        dim,
+        data: random(state, n * dim),
+    };
+    let file = TempFile(std::env::temp_dir().join(format!("coldivf-alloc-{}-commit.coldivf", std::process::id())));
+    let params = BuildParams {
+        metric: Metric::L2,
+        vectors_per_list: 100,
+        parents: 4,
+        order: LeafOrder::Chained,
+        anchor: Anchor::Cluster,
+        page_size: 4096,
+        threads: 2,
+        seed: 7,
+    };
+    Builder::new(params).build(&rows, &file.0).unwrap();
+    let (index, set) = (Index::open(&file.0).unwrap(), Collections::open(&[&file.0]).unwrap());
+    let mut writer = Writer::open(&file.0).unwrap();
+    let limits = Limits {
+        max_k: 10,
+        max_nprobe: 40,
+        max_rerank: 60,
+    };
+    let sp = SearchParams {
+        k: 10,
+        nprobe: 40,
+        rerank: 60,
+        reach: None,
+    };
+    let queries = random(state, 8 * dim);
+    let (mut ctx, mut leaves, mut out) = (SearchCtx::new(limits), Vec::with_capacity(40), Vec::with_capacity(10));
+    let mut failed = false;
+    // On Linux a new generation's file needs an io_uring ring of its own, which `prepare` sets up off the query path.
+    let linux = cfg!(target_os = "linux");
+    let mut every_call = |what: &str, ctx: &mut SearchCtx, leaves: &mut Vec<u32>, out: &mut Vec<_>| {
+        for q in queries.chunks_exact(dim) {
+            if linux {
+                index.prepare(ctx).unwrap();
+            }
+            let calls = [
+                ("search", counts(|| _ = index.search(q, &sp, ctx).unwrap())),
+                ("route", counts(|| index.route(q, 40, None, ctx, leaves).unwrap())),
+                (
+                    "fetch and search",
+                    counts(|| {
+                        let mut fetched = index.fetch(leaves, ctx).unwrap();
+                        fetched.prefetch_rows(q, 60).unwrap();
+                        _ = fetched.search(q, 10, 60).unwrap();
+                    }),
+                ),
+                (
+                    "a search of collections",
+                    counts(|| set.search(q, &sp, ctx, out).unwrap()),
+                ),
+            ];
+            for (call, (allocations, frees)) in calls {
+                if (allocations, frees) != (0, 0) {
+                    eprintln!("alloc: {call} {what} made {allocations} allocations and {frees} frees");
+                    failed = true;
+                }
+            }
+        }
+    };
+    // A first pass makes the context's buffers.
+    let q = &queries[..dim];
+    _ = index.search(q, &sp, &mut ctx).unwrap();
+    index.route(q, 40, None, &mut ctx, &mut leaves).unwrap();
+    _ = index.fetch(&leaves, &mut ctx).unwrap().search(q, 10, 60).unwrap();
+    set.search(q, &sp, &mut ctx, &mut out).unwrap();
+    every_call("before any commit", &mut ctx, &mut leaves, &mut out);
+
+    // A fold after some inserts and deletes swaps in the next generation, whose clusters fit the context's room.
+    for (i, row) in rows.data.chunks_exact(dim).step_by(n / 40).enumerate() {
+        writer.insert(100_000 + i as u64, row).unwrap();
+    }
+    (0..20).for_each(|id| writer.delete(id).unwrap());
+    writer.compact().unwrap();
+    every_call("after a commit", &mut ctx, &mut leaves, &mut out);
+
+    // A fetch made before a commit searches the generation it fetched, and dropping it frees nothing either, since the
+    // writer frees the old generation.
+    index.route(q, 40, None, &mut ctx, &mut leaves).unwrap();
+    let fetched = index.fetch(&leaves, &mut ctx).unwrap();
+    writer.insert(200_000, &rows.data[..dim]).unwrap();
+    writer.compact().unwrap();
+    let (allocations, frees) = counts(|| _ = fetched.search(q, 10, 60).unwrap());
+
+    if (allocations, frees) != (0, 0) {
+        eprintln!("alloc: a fetch from before a commit made {allocations} allocations and {frees} frees");
+        failed = true;
+    }
+
+    // Routes of the old generation name other clusters in the new one, so their fetch fails.
+    index.route(q, 40, None, &mut ctx, &mut leaves).unwrap();
+    writer.insert(200_001, &rows.data[dim..2 * dim]).unwrap();
+    writer.compact().unwrap();
+
+    if index.fetch(&leaves, &mut ctx).err().map(|e| e.kind()) != Some(ErrorKind::InvalidInput) {
+        eprintln!("alloc: a fetch of an older generation's route didn't fail with InvalidInput");
+        failed = true;
+    }
+
+    // A major run into far larger clusters outgrows a context's room for the four largest, so its first search makes
+    // that buffer anew, once, and frees the old one.
+    let few = Limits {
+        max_k: 10,
+        max_nprobe: 4,
+        max_rerank: 60,
+    };
+    let sp4 = SearchParams { nprobe: 4, ..sp };
+    let mut small = SearchCtx::new(few);
+    _ = index.search(q, &sp4, &mut small).unwrap();
+    let larger = MaintainParams {
+        vectors_per_list: 1000,
+        threads: 2,
+        ..MaintainParams::default()
+    };
+    writer.maintain(&larger, RunKind::Major).unwrap();
+
+    if linux {
+        index.prepare(&mut small).unwrap();
+    }
+
+    let first = counts(|| _ = index.search(q, &sp4, &mut small).unwrap());
+    let next = counts(|| _ = index.search(q, &sp4, &mut small).unwrap());
+
+    if first != (1, 1) && !(linux && first == (0, 0)) || next != (0, 0) {
+        eprintln!(
+            "alloc: after the clusters outgrew the room, searches made {first:?} and then {next:?} (allocations, frees)"
+        );
+        failed = true;
+    }
+
+    !failed
 }

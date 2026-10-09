@@ -2,7 +2,8 @@
 //! rows. A query runs in three steps:
 //! 1. Route: score every cluster center with its 4-bit code and keep the `nprobe` nearest, or those of them within the
 //!    reach.
-//! 2. Scan: estimate the distance to every vector in those clusters, 32 at a time, and keep the best candidates.
+//! 2. Scan: estimate the distance to every vector in those clusters, 32 at a time, and keep the best candidates. Codes
+//!    measured from the clusters' centers first take the query's distance to each center.
 //! 3. Rerank: rescore the candidates with their 8-bit rows and return the top `k`.
 //!
 //! Candidates and results are ordered by score and then internal id, so they never depend on the order of the scan.
@@ -21,12 +22,12 @@ use crate::kernels::Tier;
 use crate::quantization::padded_dim;
 use crate::quantization::rabitq::{BLOCK, QueryLut, block_bytes};
 use crate::quantization::rotation::Rotation;
-use crate::quantization::sq4::QueryS8;
-use crate::{Hit, LeafId, Limits, Metric, SearchCtx, SearchParams};
+use crate::quantization::sq4::{QueryS8, QueryS32};
+use crate::{Anchor, Hit, LeafId, Limits, Metric, SearchCtx, SearchParams};
 use candidates::{Candidate, Candidates};
 use rerank::rerank;
-use route::{Centers, route, within_reach};
-use scan::scan_list;
+use route::{CHUNK, Centers, route_chunked, within_reach};
+use scan::scan_leaf;
 
 /// The largest squared length a query's or a vector's offset from the mean may have, a quarter of the largest f32, so
 /// adding two of them can't overflow.
@@ -64,6 +65,8 @@ impl<'a> RowPages<'a> {
 pub(crate) struct View<'a> {
     pub(crate) dim: usize,
     pub(crate) metric: Metric,
+    /// What the 1-bit codes are measured from.
+    pub(crate) anchor: Anchor,
     pub(crate) mean: &'a [f32],
     pub(crate) rotation: &'a Rotation,
     pub(crate) centers: Centers<'a>,
@@ -111,13 +114,14 @@ pub(crate) fn run<'a>(
 /// `params.reach`, reading their blocks in place from `blocks`. It leaves the best `max(params.rerank, params.k)`
 /// candidates in `s`.
 pub(crate) fn scan_in_place(view: &View, blocks: &[u8], params: &SearchParams, s: &mut Scratch) {
-    route(
+    route_chunked(
         view.tier,
         &view.centers,
         &s.q8,
-        s.lut.k.t2,
+        s.lut.mean.t2,
         params.nprobe,
-        &mut s.dots,
+        &mut s.chunk,
+        &mut s.best,
         &mut s.routes,
     );
     s.routes.truncate(within_reach(&s.routes, params.reach));
@@ -125,11 +129,13 @@ pub(crate) fn scan_in_place(view: &View, blocks: &[u8], params: &SearchParams, s
     let Scratch {
         routes,
         lut,
+        q32,
         candidates,
         survivors,
         ..
     } = s;
-    scan_lists(view, blocks, routes.iter().map(|r| r.id), lut, candidates, survivors);
+    let leaves = routes.iter().map(|r| r.id);
+    scan_lists(view, blocks, leaves, lut, q32, candidates, survivors);
 }
 
 /// Scans the clusters `leaves`, reading their blocks in place from `blocks`, and offers their vectors to `candidates`.
@@ -137,7 +143,8 @@ pub(crate) fn scan_lists(
     view: &View,
     blocks: &[u8],
     leaves: impl Iterator<Item = LeafId>,
-    lut: &QueryLut,
+    lut: &mut QueryLut,
+    q32: &QueryS32,
     candidates: &mut Candidates,
     survivors: &mut [Candidate; BLOCK],
 ) {
@@ -146,7 +153,7 @@ pub(crate) fn scan_lists(
     for leaf in leaves {
         let list = view.lists[leaf as usize];
         let blocks = &blocks[list.offset..list.offset + list.count.div_ceil(BLOCK) * size];
-        scan_list(view.tier, blocks, list.count, list.first_id, lut, candidates, survivors);
+        scan_leaf(view, leaf, blocks, lut, q32, candidates, survivors);
     }
 }
 
@@ -169,14 +176,15 @@ pub(crate) fn run_route(
 
     let SearchCtx { limits, scratch, .. } = ctx;
     let s = scratch_for(scratch, view.dim, view.lists.len(), limits);
-    prepare_query(view, query, s)?;
-    route(
+    prepare_route(view, query, s)?;
+    route_chunked(
         view.tier,
         &view.centers,
         &s.q8,
-        s.lut.k.t2,
+        s.lut.mean.t2,
         nprobe,
-        &mut s.dots,
+        &mut s.chunk,
+        &mut s.best,
         &mut s.routes,
     );
     out.clear();
@@ -185,9 +193,21 @@ pub(crate) fn run_route(
     Ok(())
 }
 
-/// Normalizes the query for cosine, then writes its offset q − μ, that offset rotated and its two quantized forms into
-/// `s`.
+/// Prepares the query for a search of `view`. It normalizes the query for cosine, then writes its offset q − μ, that
+/// offset rotated and its two quantized forms into `s`. For codes measured from the clusters' centers it also writes
+/// the query's fixed-point form.
 pub(crate) fn prepare_query(view: &View, query: &[f32], s: &mut Scratch) -> Result<(), Error> {
+    let t2 = prepare_route(view, query, s)?;
+
+    if view.anchor == Anchor::Cluster {
+        s.q32.prepare(&s.rotated, t2);
+    }
+
+    Ok(())
+}
+
+/// The part of `prepare_query` that routing needs, all but the fixed-point form. Returns T² = ‖q − μ‖².
+fn prepare_route(view: &View, query: &[f32], s: &mut Scratch) -> Result<f64, Error> {
     s.query.copy_from_slice(query);
 
     if view.metric == Metric::Cosine && !normalize(&mut s.query) {
@@ -201,7 +221,8 @@ pub(crate) fn prepare_query(view: &View, query: &[f32], s: &mut Scratch) -> Resu
         t2 += f64::from(*o).powi(2);
     }
 
-    // An estimate adds T² to a vector's f_add, and a route score adds it to a center's ‖z‖², so T² needs room to spare.
+    // An estimate adds T², or the squared distance to a cluster's center, to a vector's f_add, and a route score adds
+    // T² to a center's ‖z‖², so T² needs room to spare.
     if t2 > LIMIT {
         return Err(invalid("the query is too far from the index's mean"));
     }
@@ -209,14 +230,15 @@ pub(crate) fn prepare_query(view: &View, query: &[f32], s: &mut Scratch) -> Resu
     view.rotation.apply(&s.offset, &mut s.rotated, &mut s.tmp);
     s.lut.prepare(&s.rotated, t2.sqrt());
     s.q8.prepare(&s.rotated);
-    Ok(())
+    Ok(t2)
 }
 
-/// The buffers of one search, sized for one index's dimension and cluster count. A `SearchCtx` keeps one per shape and
-/// reuses it, so a search allocates nothing after the first with each shape.
+/// The buffers of one search, sized for one index's dimension. Routing scores the clusters a chunk at a time, so no
+/// buffer of a search grows with the cluster count, apart from the distances to the clusters that hold inserts, which a
+/// `SearchCtx` fits with room to spare. It keeps one scratch per dimension, so a search allocates nothing once one with
+/// as many such clusters has run.
 pub(crate) struct Scratch {
     dim: usize,
-    nlist: usize,
     /// The query, normalized for cosine.
     pub(crate) query: Vec<f32>,
     /// The query's offset q − μ from the index's mean μ.
@@ -226,56 +248,85 @@ pub(crate) struct Scratch {
     pub(crate) tmp: Vec<f32>,
     pub(crate) lut: QueryLut,
     pub(crate) q8: QueryS8,
-    /// One dot product per cluster.
+    /// The offset rotated in 32-bit fixed point, for the query's distance to the clusters' centers.
+    pub(crate) q32: QueryS32,
+    /// One dot product per cluster, for a router that scores every cluster at once, eg. calibration's.
     pub(crate) dots: Vec<i32>,
+    /// The dot products of one chunk of clusters, and the nearest clusters so far, for a search's routing.
+    pub(crate) chunk: Vec<i32>,
+    pub(crate) best: Candidates,
     /// The clusters to read, nearest first.
     pub(crate) routes: Vec<Candidate>,
     pub(crate) candidates: Candidates,
     pub(crate) survivors: [Candidate; BLOCK],
     pub(crate) rescored: Vec<Candidate>,
+    /// The query's squared distance to the center of each cluster that holds inserted vectors measured from it, as
+    /// `Delta::clusters` lists them. It has room for every cluster of the largest index it was fitted to, and a quarter
+    /// more.
+    pub(crate) inserted: Vec<f32>,
 }
 
 impl Scratch {
-    /// Whether this scratch fits an index with this dimension and cluster count.
-    pub(crate) fn fits(&self, dim: usize, nlist: usize) -> bool {
-        (self.dim, self.nlist) == (dim, nlist)
+    /// Whether this scratch fits an index with this dimension.
+    pub(crate) fn fits(&self, dim: usize) -> bool {
+        self.dim == dim
     }
 
+    pub(crate) fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Fits the distances to the clusters that hold inserts to an index with `nlist` clusters. Their room only grows,
+    /// to a quarter more than asked, so a cluster count no larger than the room allocates nothing.
+    pub(crate) fn fit(&mut self, nlist: usize) {
+        if nlist > self.inserted.capacity() {
+            self.inserted.clear();
+            self.inserted.reserve(nlist + nlist / 4);
+        }
+    }
+
+    /// Buffers for a search of `dim` dimensions within `limits`. Calibration's router scores all `nlist` clusters at
+    /// once, so it keeps that many dot products and routes, where a search's scratch has 0.
     pub(crate) fn new(dim: usize, nlist: usize, limits: &Limits) -> Scratch {
         let keep = limits.max_rerank.max(limits.max_k);
         Scratch {
             dim,
-            nlist,
             query: vec![0.0; dim],
             offset: vec![0.0; dim],
             rotated: vec![0.0; dim],
             tmp: vec![0.0; dim],
             lut: QueryLut::new(dim),
             q8: QueryS8::new(dim),
+            q32: QueryS32::new(dim),
             dots: vec![0; nlist],
-            routes: Vec::with_capacity(nlist),
+            chunk: vec![0; CHUNK],
+            best: Candidates::new(limits.max_nprobe),
+            routes: Vec::with_capacity(nlist.max(limits.max_nprobe)),
             candidates: Candidates::new(keep),
             survivors: [Candidate::NONE; BLOCK],
             rescored: Vec::with_capacity(keep),
+            inserted: Vec::with_capacity(nlist),
         }
     }
 }
 
-/// The scratch in `slots` for an index with this dimension and cluster count, made first if there isn't one yet.
+/// The scratch in `slots` for an index with this dimension, made first if there isn't one yet, fitted to its `nlist`
+/// clusters. Every maintenance run changes an index's cluster count, so a scratch per count would pile up.
 pub(crate) fn scratch_for<'a>(
     slots: &'a mut Vec<Scratch>,
     dim: usize,
     nlist: usize,
     limits: &Limits,
 ) -> &'a mut Scratch {
-    let i = match slots.iter().position(|s| s.dim == dim && s.nlist == nlist) {
+    let i = match slots.iter().position(|s| s.dim == dim) {
         Some(i) => i,
         None => {
-            slots.push(Scratch::new(dim, nlist, limits));
+            slots.push(Scratch::new(dim, 0, limits));
             slots.len() - 1
         }
     };
 
+    slots[i].fit(nlist);
     &mut slots[i]
 }
 

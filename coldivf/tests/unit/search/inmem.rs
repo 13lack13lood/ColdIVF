@@ -6,13 +6,12 @@ use super::*;
 use crate::build::order::leaf_order;
 use crate::quantization::SplitMix64;
 use crate::quantization::padded_dim;
-use crate::quantization::rabitq::{BLOCK, QueryLut, block_bytes, lane_factors};
+use crate::quantization::rabitq::{BLOCK, block_bytes, lane_factors};
 use crate::quantization::testutil::{Rows, clustered, dist2, gaussian, group, mean, params};
-use crate::search::List;
 use crate::search::candidates::{Candidate, order};
-use crate::search::normalize;
-use crate::search::scan::scan_block_scalar;
-use crate::{LeafOrder, Limits, SearchCtx, SearchParams};
+use crate::search::scan::scan_leaf;
+use crate::search::{List, Scratch, normalize, prepare_query};
+use crate::{Anchor, LeafOrder, Limits, SearchCtx, SearchParams};
 
 fn ctx(max: usize) -> SearchCtx {
     SearchCtx::new(Limits {
@@ -141,50 +140,74 @@ fn finds_most_true_neighbors_on_clustered_data() {
 
 #[test]
 fn estimates_cover_the_true_distances() {
-    // One cluster of isotropic data, so internal ids are input rows and the error bar holds for ~95% of pairs.
+    // Clusters of isotropic data and queries near them. For either anchor, t measures the query from what the codes
+    // are measured from, with the query's own 4-bit error added for a cluster's center, and the error bar f_err·t
+    // holds for ~95% of pairs.
     let mut rng = SplitMix64::new(8);
-    let (dim, n) = (256, 600);
-    let rows = Rows {
-        dim,
-        data: gaussian(&mut rng, n, dim, |_| 1.0),
-    };
-    let center = mean(&rows.data, dim);
-    let clusters = Clusters {
-        dim,
-        centroids: center.clone(),
-        assignment: vec![0; n],
-        parents: center,
-        parent_of: vec![0],
-    };
-    let index = InMemory::build(&params(Metric::L2), &rows, &clusters).unwrap();
-    let d_pad = padded_dim(dim);
+    let (dim, n, nlist) = (256, 1200, 8);
+    let (rows, clusters) = clustered(&mut rng, n, dim, nlist, 1.0);
+    let mut queries = Vec::with_capacity(10 * dim);
 
-    let (mut covered, mut pairs) = (0, 0);
-    for q in gaussian(&mut rng, 10, dim, |_| 1.0).chunks_exact(dim) {
-        let offset: Vec<f32> = q.iter().zip(&index.mean).map(|(&x, &m)| x - m).collect();
-        let t = offset.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt();
-        let (mut rotated, mut tmp) = (vec![0f32; dim], vec![0f32; dim]);
-        index.rotation.apply(&offset, &mut rotated, &mut tmp);
-        let mut lut = QueryLut::new(dim);
-        lut.prepare(&rotated, t);
-        for (b, block) in index.blocks.chunks_exact(block_bytes(d_pad)).enumerate() {
-            let lanes = (n - BLOCK * b).min(BLOCK);
-            let mut out = [Candidate::NONE; BLOCK];
-            let kept = scan_block_scalar(block, &lut, (BLOCK * b) as u32, lanes, Candidate::NONE, &mut out);
-            for (lane, c) in out[..kept].iter().enumerate() {
-                let f = lane_factors(block, d_pad, lane);
-                let truth = dist2(q, &rows.data[c.id as usize * dim..(c.id as usize + 1) * dim]);
-                covered += usize::from((f64::from(c.score) - truth).abs() <= f64::from(f.f_err) * t);
-                pairs += 1;
-            }
-        }
+    for _ in 0..10 {
+        let r = (rng.next_u64() % n as u64) as usize;
+        let near = rows.data[r * dim..(r + 1) * dim]
+            .iter()
+            .map(|&x| x + (rng.normal() * 0.5) as f32);
+        queries.extend(near);
     }
 
-    let coverage = covered as f64 / pairs as f64;
-    assert!(
-        (0.92..=0.96).contains(&coverage),
-        "the error bar covers {coverage} of pairs"
-    );
+    let (d_pad, size) = (padded_dim(dim), block_bytes(padded_dim(dim)));
+    let limits = Limits {
+        max_k: 10,
+        max_nprobe: nlist,
+        max_rerank: n,
+    };
+
+    for anchor in [Anchor::Mean, Anchor::Cluster] {
+        let p = BuildParams {
+            anchor,
+            ..params(Metric::L2)
+        };
+        let index = InMemory::build(&p, &rows, &clusters).unwrap();
+        let (view, mut s) = (index.view(), Scratch::new(dim, nlist, &limits));
+        let (mut sum, mut sum_sq, mut covered, mut pairs) = (0f64, 0f64, 0usize, 0usize);
+        for q in queries.chunks_exact(dim) {
+            prepare_query(&view, q, &mut s).unwrap();
+            for (leaf, list) in index.lists.iter().enumerate() {
+                let blocks = &index.blocks[list.offset..list.offset + list.count.div_ceil(BLOCK) * size];
+                s.candidates.reset(n);
+                scan_leaf(
+                    &view,
+                    leaf as LeafId,
+                    blocks,
+                    &mut s.lut,
+                    &s.q32,
+                    &mut s.candidates,
+                    &mut s.survivors,
+                );
+                for c in s.candidates.as_slice() {
+                    let (j, r) = ((c.id - list.first_id) as usize, index.ids[c.id as usize] as usize);
+                    let f = lane_factors(&blocks[j / BLOCK * size..(j / BLOCK + 1) * size], d_pad, j % BLOCK);
+                    let err = f64::from(c.score) - dist2(q, &rows.data[r * dim..(r + 1) * dim]);
+                    sum += err;
+                    sum_sq += err * err;
+                    covered += usize::from(err.abs() <= f64::from(f.f_err) * f64::from(s.lut.k.t));
+                    pairs += 1;
+                }
+            }
+        }
+        assert_eq!(pairs, 10 * n, "{anchor:?}");
+        let (bias, rms) = (sum / pairs as f64, (sum_sq / pairs as f64).sqrt());
+        let coverage = covered as f64 / pairs as f64;
+        assert!(
+            bias.abs() <= 0.1 * rms,
+            "{anchor:?}: the mean error is {bias}, against an rms error of {rms}"
+        );
+        assert!(
+            (0.92..=0.96).contains(&coverage),
+            "{anchor:?}: the error bar covers {coverage} of pairs"
+        );
+    }
 }
 
 #[test]
@@ -474,14 +497,22 @@ fn the_anchor_is_the_mean_of_the_vectors() {
     let (mut rows, clusters) = clustered(&mut rng, 100, 128, 3, 0.5);
     rows.data.iter_mut().for_each(|x| *x += 5.0);
 
-    let index = InMemory::build(&params(Metric::L2), &rows, &clusters).unwrap();
+    let index = InMemory::build(&mean_anchor(Metric::L2), &rows, &clusters).unwrap();
     assert_eq!(index.mean, mean(&rows.data, 128));
 
     let mut normalized = rows.data.clone();
     let dim = 128;
     normalized.chunks_exact_mut(dim).for_each(|v| assert!(normalize(v)));
-    let index = InMemory::build(&params(Metric::Cosine), &rows, &clusters).unwrap();
+    let index = InMemory::build(&mean_anchor(Metric::Cosine), &rows, &clusters).unwrap();
     assert_eq!(index.mean, mean(&normalized, 128));
+}
+
+/// The tests' build settings, with the mean anchor.
+fn mean_anchor(metric: Metric) -> BuildParams {
+    BuildParams {
+        anchor: Anchor::Mean,
+        ..params(metric)
+    }
 }
 
 #[test]
@@ -586,7 +617,7 @@ fn one_ctx_serves_indexes_of_different_shapes() {
             assert_eq!(bits(index.search(&q, &sp, &mut shared).unwrap()), want, "round {round}");
         }
     }
-    assert_eq!(shared.scratch.len(), 3, "one set of buffers per shape");
+    assert_eq!(shared.scratch.len(), 2, "one set of buffers per dimension");
 }
 
 #[test]
@@ -705,4 +736,57 @@ fn a_reach_reads_only_the_clusters_within_it() {
             .kind(),
         ErrorKind::InvalidInput
     );
+}
+
+#[test]
+fn the_cluster_anchor_finds_at_least_as_many_true_neighbors_as_the_mean_anchor() {
+    // Every cluster is read, so only the 1-bit estimates decide which candidates get rescored.
+    let mut rng = SplitMix64::new(17);
+    let (dim, n, nlist, spread) = (128, 3000, 30, 0.5);
+    let (rows, clusters) = clustered(&mut rng, n, dim, nlist, spread);
+    let by_cluster = InMemory::build(&params(Metric::L2), &rows, &clusters).unwrap();
+    let by_mean = InMemory::build(&mean_anchor(Metric::L2), &rows, &clusters).unwrap();
+    assert_eq!((by_cluster.anchor, by_mean.anchor), (Anchor::Cluster, Anchor::Mean));
+    let queries: Vec<(Vec<f32>, Vec<u64>)> = (0..50)
+        .map(|_| {
+            let r = (rng.next_u64() % n as u64) as usize;
+            let q: Vec<f32> = rows.data[r * dim..(r + 1) * dim]
+                .iter()
+                .map(|&x| x + (rng.normal() * spread) as f32)
+                .collect();
+            let mut exact: Vec<(f64, u64)> = rows
+                .data
+                .chunks_exact(dim)
+                .enumerate()
+                .map(|(i, o)| (dist2(&q, o), i as u64))
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+            (q, exact.iter().take(10).map(|e| e.1).collect())
+        })
+        .collect();
+
+    for rerank in [10, 20, 40] {
+        let sp = SearchParams {
+            k: 10,
+            nprobe: nlist,
+            rerank,
+            reach: None,
+        };
+        let recall = |index: &InMemory| {
+            let mut c = ctx(64);
+            let found: usize = queries
+                .iter()
+                .map(|(q, truth)| {
+                    let hits = index.search(q, &sp, &mut c).unwrap();
+                    hits.iter().filter(|h| truth.contains(&h.id)).count()
+                })
+                .sum();
+            found as f64 / (10 * queries.len()) as f64
+        };
+        let (cluster, mean) = (recall(&by_cluster), recall(&by_mean));
+        assert!(
+            cluster >= mean,
+            "rescoring {rerank}, the cluster anchor finds {cluster} and the mean anchor {mean}"
+        );
+    }
 }

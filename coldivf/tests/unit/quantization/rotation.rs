@@ -141,3 +141,36 @@ fn mixes_every_basis_vector() {
         );
     }
 }
+
+#[test]
+fn inverting_gives_back_what_was_rotated() {
+    let mut rng = crate::quantization::SplitMix64::new(9);
+    for dim in [128, 200, 768, 1000, 3000] {
+        let rotation = Rotation::new(dim, dim as u64);
+        let tmp = &mut vec![0f32; dim];
+        for x in gaussian(&mut rng, 4, dim, |k| 1.0 + (k % 5) as f64).chunks_exact(dim) {
+            let norm = dot(x, x).sqrt();
+            let mut back = rotate(&rotation, x);
+            rotation.invert_in_place(&mut back, tmp);
+            let err = x
+                .iter()
+                .zip(&back)
+                .map(|(&a, &b)| f64::from(a - b).abs())
+                .fold(0f64, f64::max);
+            assert!(
+                err <= 1e-5 * norm,
+                "dim {dim}: off by {err} for a vector of length {norm}"
+            );
+            // And the other way around, rotating what was inverted.
+            let mut v = x.to_vec();
+            rotation.invert_in_place(&mut v, tmp);
+            let again = rotate(&rotation, &v);
+            let err = x
+                .iter()
+                .zip(&again)
+                .map(|(&a, &b)| f64::from(a - b).abs())
+                .fold(0f64, f64::max);
+            assert!(err <= 1e-5 * norm, "dim {dim}: rotating the inverse is off by {err}");
+        }
+    }
+}

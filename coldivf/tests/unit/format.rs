@@ -3,9 +3,10 @@
 use std::io::ErrorKind;
 
 use super::*;
+use crate::BuildParams;
 use crate::build::write;
 use crate::quantization::SplitMix64;
-use crate::quantization::testutil::{clustered, group, params, temp_file};
+use crate::quantization::testutil::{clustered, gaussian, group, params, temp_file};
 
 /// The bytes of a small index file, and the index they came from.
 fn built(name: &str, dim: usize) -> (Vec<u8>, InMemory) {
@@ -34,8 +35,8 @@ fn the_header_reads_back_what_was_written() {
         (200, 150, 6, 2)
     );
     assert_eq!(
-        (layout.metric, layout.page_size, layout.seed),
-        (Metric::Cosine, 4096, 7)
+        (layout.metric, layout.anchor, layout.page_size, layout.seed),
+        (Metric::Cosine, Anchor::Cluster, 4096, 7)
     );
     assert_eq!(layout.span(Part::Codes).len, index.blocks.len());
     assert_eq!(layout.span(Part::Rows).len, index.rows.len());
@@ -55,6 +56,7 @@ fn the_header_reads_back_what_was_written() {
         (tables.factors, tables.parent_of, tables.lists),
         (index.center_factors, index.parent_of, index.lists)
     );
+    assert!(tables.norms.len() == 6 && tables.norms == index.center_norms);
     verify(&bytes, &layout).unwrap();
 
     let ids: Vec<u8> = index
@@ -66,6 +68,81 @@ fn the_header_reads_back_what_was_written() {
     assert_eq!(&bytes[layout.span(Part::Ids).range()], &ids[..]);
     let centers = &bytes[layout.span(Part::Centers).range()];
     assert_eq!(&centers[..index.parents.len()], &index.parents[..]);
+}
+
+#[test]
+fn both_anchors_read_back_and_any_other_anchor_byte_is_rejected() {
+    let mut rng = SplitMix64::new(2);
+    let (rows, mut clusters) = clustered(&mut rng, 150, 128, 6, 0.5);
+    group(&mut clusters, 2);
+
+    // The anchor is byte 41 of the header. Every file written before the cluster anchor holds 0 there, so the mean
+    // must keep 0.
+    for (anchor, byte) in [(Anchor::Mean, 0), (Anchor::Cluster, 1)] {
+        let p = BuildParams {
+            anchor,
+            ..params(Metric::L2)
+        };
+        let path = temp_file(&format!("anchor-{anchor:?}.coldivf"));
+        write(&InMemory::build(&p, &rows, &clusters).unwrap(), &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let (h, _) = Header::read_from_prefix(&bytes).unwrap();
+        assert_eq!((h.anchor, bytes[41]), (byte, byte));
+        assert_eq!(read_header(&bytes, bytes.len()).unwrap().anchor, anchor);
+
+        // Any other byte, with the header's checksum made to match, names no anchor.
+        for other in [2, 3, 0x80, 0xff] {
+            let mut damaged = bytes.clone();
+            let (mut h, _) = Header::read_from_prefix(&damaged).unwrap();
+            h.anchor = other;
+            h.crc = U32::new(crc32fast::hash(&h.as_bytes()[..size_of::<Header>() - 4]));
+            damaged[..size_of::<Header>()].copy_from_slice(h.as_bytes());
+            let err = read_header(&damaged, damaged.len()).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidData, "anchor byte {other}");
+            assert_eq!(err.to_string(), "the header names an unknown anchor");
+        }
+    }
+}
+
+#[test]
+fn a_file_from_before_the_cluster_anchor_searches_as_it_did() {
+    // Such a file holds 0 in the anchor byte, and its codes are measured from the mean.
+    let (mut rng, dim) = (SplitMix64::new(3), 128);
+    let (rows, mut clusters) = clustered(&mut rng, 300, dim, 8, 0.5);
+    group(&mut clusters, 2);
+    let p = BuildParams {
+        anchor: Anchor::Mean,
+        ..params(Metric::L2)
+    };
+    let memory = InMemory::build(&p, &rows, &clusters).unwrap();
+    let path = temp_file("before-anchor.coldivf");
+    write(&memory, &path).unwrap();
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[41] = 0;
+    reseal(&mut bytes);
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(read_header(&bytes, bytes.len()).unwrap().anchor, Anchor::Mean);
+
+    // Few rescored candidates, so the hits follow the estimates.
+    let index = crate::Index::open(&path).unwrap();
+    let limits = crate::Limits {
+        max_k: 10,
+        max_nprobe: 8,
+        max_rerank: 15,
+    };
+    let (mut a, mut b) = (crate::SearchCtx::new(limits), crate::SearchCtx::new(limits));
+    let sp = crate::SearchParams {
+        k: 10,
+        nprobe: 3,
+        rerank: 15,
+        reach: None,
+    };
+    let bits = |hits: &[crate::Hit]| hits.iter().map(|h| (h.id, h.score.to_bits())).collect::<Vec<_>>();
+
+    for q in gaussian(&mut rng, 8, dim, |_| 1.0).chunks_exact(dim) {
+        let want = bits(memory.search(q, &sp, &mut a).unwrap());
+        assert_eq!(bits(index.search(q, &sp, &mut b).unwrap()), want);
+    }
 }
 
 #[test]
@@ -207,9 +284,7 @@ fn check(name: &str, bytes: &[u8], path: &std::path::Path, expect: Expect) {
     std::fs::write(path, bytes).unwrap();
     let run = std::panic::catch_unwind(|| {
         let index = match crate::index::Inner::open(path) {
-            Ok(inner) => crate::Index {
-                inner: std::sync::Arc::new(inner),
-            },
+            Ok(inner) => crate::Index::of(inner),
             Err(e) => return (outcome::<()>(Err(e)), Vec::new(), None),
         };
         let mut ctx = crate::SearchCtx::new(crate::Limits {
@@ -227,7 +302,7 @@ fn check(name: &str, bytes: &[u8], path: &std::path::Path, expect: Expect) {
         let mut routes = Vec::new();
         let mut searches = vec![
             outcome(index.search(&q, &sp, &mut ctx)),
-            outcome(index.inner.search_mapped(&q, &sp, &mut ctx)),
+            outcome(index.inner().search_mapped(&q, &sp, &mut ctx)),
             outcome(index.route(&q, 64, None, &mut ctx, &mut routes)),
         ];
         match index.fetch(&[0, 1, 2, 3], &mut ctx) {
@@ -378,6 +453,11 @@ fn every_kind_of_damage_is_caught_by_its_own_check_without_a_panic() {
             "metric",
             header(&|h| h.metric = 7),
             open("the header names an unknown metric"),
+        ),
+        (
+            "anchor",
+            header(&|h| h.anchor = 2),
+            open("the header names an unknown anchor"),
         ),
         (
             "vector count",
@@ -548,4 +628,146 @@ fn damage(base: &[u8], rng: &mut SplitMix64) -> Vec<u8> {
     }
 
     b
+}
+
+/// A trailer for `nlist` clusters in 3 regions, with `inserts` since the last major run.
+fn trailer(nlist: usize, inserts: u64) -> Trailer {
+    Trailer {
+        region_of: (0..nlist as u32).map(|l| l % 3).collect(),
+        list_last: (0..nlist as u32).map(|l| 25 + l).collect(),
+        region_last: vec![50, 51, 49],
+        region_changes: vec![0, 7, 3],
+        per_region: 2.0,
+        major_count: 150,
+        major_inserts: inserts,
+        major_deletes: 4,
+        pass_changes: 12,
+    }
+}
+
+#[test]
+fn the_trailer_reads_back_what_was_written_and_rejects_damage() {
+    let (bytes, _) = built("trailer-bytes.coldivf", 128);
+    let layout = read_header(&bytes, bytes.len()).unwrap();
+
+    for inserts in [0, 1 << 40] {
+        let t = trailer(6, inserts);
+        assert_eq!(read_trailer(&encode_trailer(&t), &layout).unwrap(), t);
+    }
+
+    let good = encode_trailer(&trailer(6, 9));
+    let mut flipped = good.clone();
+    flipped[60] ^= 1;
+    assert_eq!(
+        kind(read_trailer(&flipped, &layout)),
+        ErrorKind::InvalidData,
+        "a flipped byte"
+    );
+    assert_eq!(
+        kind(read_trailer(&good[..good.len() - 1], &layout)),
+        ErrorKind::InvalidData,
+        "cut short"
+    );
+    assert_eq!(
+        kind(read_trailer(&good[..20], &layout)),
+        ErrorKind::InvalidData,
+        "cut inside its start"
+    );
+    let other = encode_trailer(&trailer(5, 9));
+    assert_eq!(
+        kind(read_trailer(&other, &layout)),
+        ErrorKind::InvalidData,
+        "for another number of clusters"
+    );
+
+    // Values out of range, with the checksum made to match, are rejected too.
+    let resealed = |t: Trailer| {
+        let mut b = encode_trailer(&t);
+        let end = b.len() - 4;
+        let crc = crc32fast::hash(&b[..end]);
+        b[end..].copy_from_slice(&crc.to_le_bytes());
+        b
+    };
+    let mut far = trailer(6, 9);
+    far.region_of[2] = 3;
+    assert_eq!(
+        kind(read_trailer(&resealed(far), &layout)),
+        ErrorKind::InvalidData,
+        "a region past the last"
+    );
+    let mut size = trailer(6, 9);
+    size.per_region = f32::NAN;
+    assert_eq!(
+        kind(read_trailer(&resealed(size), &layout)),
+        ErrorKind::InvalidData,
+        "no regions' size"
+    );
+    let mut magic = encode_trailer(&trailer(6, 9));
+    magic[0] = b'X';
+    let end = magic.len() - 4;
+    let crc = crc32fast::hash(&magic[..end]);
+    magic[end..].copy_from_slice(&crc.to_le_bytes());
+    assert_eq!(
+        kind(read_trailer(&magic, &layout)),
+        ErrorKind::InvalidData,
+        "an unknown magic"
+    );
+}
+
+#[test]
+fn a_file_with_a_trailer_opens_verifies_and_searches_as_without_it() {
+    let (bytes, _) = built("with-trailer.coldivf", 128);
+    let layout = read_header(&bytes, bytes.len()).unwrap();
+    let mut longer = bytes.clone();
+    longer.resize(trailer_at(layout.span(Part::Ids)), 0);
+    longer.extend(encode_trailer(&trailer(6, 9)));
+    let (plain, with) = (temp_file("no-trailer.coldivf"), temp_file("trailer-on.coldivf"));
+    std::fs::write(&plain, &bytes).unwrap();
+    std::fs::write(&with, &longer).unwrap();
+    let search = |path: &std::path::Path| {
+        let index = crate::Index::open(path).unwrap();
+        index.verify().unwrap();
+        let mut ctx = crate::SearchCtx::new(crate::Limits {
+            max_k: 10,
+            max_nprobe: 6,
+            max_rerank: 50,
+        });
+        let sp = crate::SearchParams {
+            k: 10,
+            nprobe: 3,
+            rerank: 50,
+            reach: None,
+        };
+        let queries = gaussian(&mut SplitMix64::new(9), 20, 128, |_| 1.0);
+        let hits = queries.as_chunks::<128>().0.iter().flat_map(|q| {
+            let hits = index.search(q, &sp, &mut ctx).unwrap();
+            hits.iter().map(|h| (h.id, h.score.to_bits())).collect::<Vec<_>>()
+        });
+        (hits.collect::<Vec<_>>(), index.inner().trailer().unwrap())
+    };
+    let (without, none) = search(&plain);
+    let (hits, some) = search(&with);
+    assert_eq!(hits, without);
+    assert_eq!((none, some), (None, Some(trailer(6, 9))));
+
+    // A damaged trailer still opens and searches, and only `verify` sees it.
+    let mut damaged = longer.clone();
+    let last = damaged.len() - 9;
+    damaged[last] ^= 1;
+    std::fs::write(&with, &damaged).unwrap();
+    let index = crate::Index::open(&with).unwrap();
+    assert_eq!(kind(index.verify()), ErrorKind::InvalidData);
+}
+
+#[test]
+fn the_header_must_hold_the_error_bar_width_the_codes_use() {
+    let (bytes, _) = built("eps0.coldivf", 128);
+    let mut other = bytes.clone();
+    let (mut h, _) = Header::read_from_prefix(&other).unwrap();
+    h.eps0 = F32::new(2.0);
+    other[..size_of::<Header>()].copy_from_slice(h.as_bytes());
+    reseal(&mut other);
+    let err = read_header(&other, other.len()).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
+    assert_eq!(err.to_string(), "the header's settings are out of range");
 }

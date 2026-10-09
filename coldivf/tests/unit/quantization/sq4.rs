@@ -1,7 +1,7 @@
 //! Unit tests for the 4-bit cluster center codes and the center scan.
 
 use super::*;
-use crate::kernels::{Tier, sq4_dots};
+use crate::kernels::{Tier, center_distance2, sq4_dots};
 use crate::quantization::SplitMix64;
 use crate::quantization::testutil::{dot, gaussian};
 
@@ -20,26 +20,55 @@ fn random_centers(rng: &mut SplitMix64, n: usize, dim: usize) -> (Vec<u8>, Vec<C
 
 #[test]
 fn simd_matches_scalar_exactly() {
-    let best = Tier::best();
     #[cfg(target_arch = "aarch64")]
     assert!(
-        !best.is_scalar(),
+        !Tier::best().is_scalar(),
         "every 64-bit Arm CPU this runs on should have dotprod"
     );
     let mut rng = SplitMix64::new(1);
-    for dim in [128, 200, 768, 1536] {
-        let n = 103;
-        let (mut codes, _) = random_centers(&mut rng, n, dim);
-        // The last center has every code at 15, the largest products.
-        let cb = code_bytes(padded_dim(dim));
-        codes[(n - 1) * cb..].fill(0xff);
-        let mut query = QueryS8::new(dim);
-        query.prepare(&gaussian(&mut rng, 1, dim, |_| 1.0));
-        query.q8[..dim].iter_mut().step_by(7).for_each(|q| *q = -127);
-        let (mut scalar, mut simd) = (vec![0i32; n], vec![0i32; n]);
-        sq4_dots(Tier::SCALAR, &codes, &query.q8, &mut scalar);
-        sq4_dots(best, &codes, &query.q8, &mut simd);
-        assert_eq!(scalar, simd, "dim {dim}");
+    // 64, 150 and 300 dimensions pad to 1, 3 and 5 chunks of 64, so a kernel that takes two chunks a step ends on one.
+    // 1 to 5 centers leave every remainder of the kernels that score four centers a pass.
+    for dim in [64, 128, 150, 200, 300, 768, 1536] {
+        for n in [1, 2, 3, 4, 5, 103] {
+            let (mut codes, _) = random_centers(&mut rng, n, dim);
+            // The last center has every code at 15, the largest products.
+            let cb = code_bytes(padded_dim(dim));
+            codes[(n - 1) * cb..].fill(0xff);
+            let mut query = QueryS8::new(dim);
+            query.prepare(&gaussian(&mut rng, 1, dim, |_| 1.0));
+            // The largest values a byte holds, −128 included, which the fixed-point digits can take.
+            query.q8[..dim].iter_mut().step_by(7).for_each(|q| *q = -128);
+            query.q8[3..dim].iter_mut().step_by(11).for_each(|q| *q = 127);
+            let mut scalar = vec![0i32; n];
+            sq4_dots(Tier::SCALAR, &codes, &query.q8, &mut scalar);
+            for tier in Tier::simd() {
+                let mut simd = vec![0i32; n];
+                sq4_dots(tier, &codes, &query.q8, &mut simd);
+                assert_eq!(scalar, simd, "{} at dim {dim} with {n} centers", tier.name());
+            }
+        }
+    }
+}
+
+#[test]
+fn the_largest_products_add_up_exactly_on_every_tier() {
+    // Every code at 15 against every query value at −128 or 127, so each product is as large as it gets, and the
+    // whole dot product is 15·d_pad·q.
+    for d_pad in [768, 1536] {
+        let codes = vec![0xffu8; 2 * code_bytes(d_pad)];
+        for q in [-128i8, 127] {
+            let q8 = vec![q; d_pad];
+            for tier in Tier::supported() {
+                let mut dots = [0i32; 2];
+                sq4_dots(tier, &codes, &q8, &mut dots);
+                assert_eq!(
+                    dots,
+                    [15 * d_pad as i32 * i32::from(q); 2],
+                    "{} at d_pad {d_pad}",
+                    tier.name()
+                );
+            }
+        }
     }
 }
 
@@ -127,5 +156,108 @@ fn a_center_with_zero_step_works() {
         sq4_dots(Tier::best(), &codes, &query.q8, &mut d);
         let score = route_score(t2, &f, &query, d[0]);
         assert_eq!(score, t2 + f.norm2 - 2.0 * (f.lo * query.s_q));
+    }
+}
+
+#[test]
+fn each_fixed_point_value_rebuilds_from_its_digits_within_the_bound() {
+    let mut rng = SplitMix64::new(5);
+    for dim in [200, 768] {
+        let d_pad = padded_dim(dim);
+        // With 1.995, 2^(s + 1)·1.995 falls between the largest value the digits hold and 2^31, and 1.9999999 meets
+        // the bound nearly exactly. 2^−40 and 3e38 need s far above 31 and far below 0.
+        for top in [1.0f32, 1.995, 1.999_999_9, 2f32.powi(-40), 3e38] {
+            let mut y: Vec<f32> = gaussian(&mut rng, 1, dim, |_| 0.3)
+                .iter()
+                .map(|&v| v.clamp(-0.9, 0.9) * top)
+                .collect();
+            (y[7], y[9]) = (top, -top);
+            let mut q = QueryS32::new(dim);
+            q.prepare(&y, 0.0);
+            let planes: Vec<&[i8]> = q.planes().chunks_exact(d_pad).collect();
+            let mut sum = 0i64;
+            for i in 0..d_pad {
+                let fixed = planes.iter().rev().fold(0i64, |y, p| 256 * y + i64::from(p[i]));
+                sum += fixed;
+                let want = y.get(i).map_or(0.0, |&v| f64::from(v));
+                assert!(
+                    (fixed as f64 * q.unit - want).abs() <= f64::from(top) / FIXED_MAX,
+                    "value {i} of {top} at dim {dim}: {} against {want}",
+                    fixed as f64 * q.unit
+                );
+            }
+            assert_eq!(q.sum, sum as f64 * q.unit, "{top} at dim {dim}");
+        }
+    }
+}
+
+#[test]
+fn the_distance_to_a_decoded_center_is_exact_on_every_tier() {
+    let mut rng = SplitMix64::new(6);
+    // 150 dimensions pad to 3 chunks of 64, so a kernel that takes two chunks a step ends on one.
+    for dim in [150, 200, 768] {
+        let cb = code_bytes(padded_dim(dim));
+        let (mut codes, factors) = random_centers(&mut rng, 20, dim);
+        // The last center has every code at 15, the largest products, and its padding at 0 as `encode` leaves it.
+        codes[19 * cb..].fill(0xff);
+        for i in dim..padded_dim(dim) {
+            let (byte, shift) = position(i);
+            codes[19 * cb + byte] &= !(0x0f << shift);
+        }
+        let norms = decoded_norms(&codes, &factors, dim);
+        let y = gaussian(&mut rng, 1, dim, |_| 1.0);
+        let mut q = QueryS32::new(dim);
+        q.prepare(&y, dot(&y, &y));
+        for ((center, f), &norm2) in codes.chunks_exact(cb).zip(&factors).zip(&norms) {
+            let z = |i: usize| f64::from(f.lo) + f64::from(f.step) * f64::from(code_at(center, i));
+            let exact: f64 = (0..dim).map(|i| (f64::from(y[i]) - z(i)).powi(2)).sum();
+            assert!((norm2 - (0..dim).map(|i| z(i).powi(2)).sum::<f64>()).abs() <= 1e-12 * norm2);
+            let scalar = center_distance2(Tier::SCALAR, center, f, norm2, &q);
+            assert!(
+                (scalar - exact).abs() <= 1e-9 * exact,
+                "dim {dim}: {scalar} against {exact}"
+            );
+            for tier in Tier::simd() {
+                let simd = center_distance2(tier, center, f, norm2, &q);
+                assert_eq!(simd.to_bits(), scalar.to_bits(), "{} at dim {dim}", tier.name());
+            }
+        }
+    }
+}
+
+#[test]
+fn every_digit_gives_the_same_dot_products_on_every_tier() {
+    // With lo 0, step 1, a unit of 1 and nothing else in the query, the distance is 10^14 − 2·Σ_t 256^t·dots[t]. Every
+    // term is an integer below 2^53, so the distance is exact and shows any difference in the dot products. The digits
+    // run through −128 and 127, the largest products, and random bytes, in every padded dimension.
+    let mut rng = SplitMix64::new(7);
+    let f = CenterFactors {
+        lo: 0.0,
+        step: 1.0,
+        norm2: 0.0,
+    };
+
+    for dim in [150, 768] {
+        let (d_pad, cb) = (padded_dim(dim), code_bytes(padded_dim(dim)));
+        let mut codes = vec![0xffu8; 2 * cb];
+        codes[cb..].iter_mut().for_each(|c| *c = rng.next_u64() as u8);
+        let mut q = QueryS32::new(dim);
+        (q.unit, q.sum, q.t2) = (1.0, 0.0, 0.0);
+        for (t, plane) in q.planes.chunks_exact_mut(d_pad).enumerate() {
+            for (i, digit) in plane.iter_mut().enumerate() {
+                *digit = match (i + t) % 4 {
+                    0 => 127,
+                    1 => rng.next_u64() as i8,
+                    _ => -128,
+                };
+            }
+        }
+        for center in codes.chunks_exact(cb) {
+            let scalar = center_distance2(Tier::SCALAR, center, &f, 1e14, &q);
+            for tier in Tier::simd() {
+                let simd = center_distance2(tier, center, &f, 1e14, &q);
+                assert_eq!(simd.to_bits(), scalar.to_bits(), "{} at dim {dim}", tier.name());
+            }
+        }
     }
 }

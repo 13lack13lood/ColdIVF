@@ -5,8 +5,8 @@ use std::io::Error;
 
 use super::SplitMix64;
 use crate::io::portable::PortableWave;
-use crate::io::{LANES, Range, Wave, read_at};
-use crate::{BuildParams, Clusters, LeafOrder, Metric, VectorSource};
+use crate::io::{LANES, Memory, Range, Wave, read_at};
+use crate::{Anchor, BuildParams, Clusters, LeafOrder, Metric, VectorSource};
 
 impl SplitMix64 {
     /// A uniform value in [0, 1).
@@ -109,13 +109,14 @@ pub(crate) fn nearest(rows: &[f32], dim: usize, v: &[f32]) -> u32 {
     best.1
 }
 
-/// Build settings for the tests, with the given metric.
+/// Build settings for the tests, with the given metric and the default anchor.
 pub(crate) fn params(metric: Metric) -> BuildParams {
     BuildParams {
         metric,
         vectors_per_list: 160,
         parents: 1,
         order: LeafOrder::Id,
+        anchor: Anchor::Cluster,
         page_size: 4096,
         threads: 1,
         seed: 7,
@@ -141,9 +142,9 @@ pub(crate) fn group(clusters: &mut Clusters, nparents: usize) {
         .collect();
 }
 
-/// A test's file in the system's temporary folder. The name holds the process id, so test runs don't clash. Dropping it
-/// deletes the file, any temporary files a build left next to it, and its change log and lock file, even when the test
-/// fails.
+/// A test's file in `scratch_dir`. The name holds the process id, so test runs don't clash. Dropping it deletes the
+/// file, any temporary files a build left next to it, its change log and lock file, and the folder of its generations,
+/// even when the test fails.
 pub(crate) struct TempFile(std::path::PathBuf);
 
 impl std::ops::Deref for TempFile {
@@ -168,33 +169,81 @@ impl Drop for TempFile {
         });
         let _ = std::fs::remove_file(crate::update::log_path(&self.0));
         let _ = std::fs::remove_file(crate::update::lock_path(&self.0));
+        let _ = std::fs::remove_dir_all(crate::root::folder(&self.0));
     }
 }
 
 pub(crate) fn temp_file(name: &str) -> TempFile {
-    TempFile(std::env::temp_dir().join(format!("coldivf-{}-{name}", std::process::id())))
+    TempFile(scratch_dir().join(format!("coldivf-{}-{name}", std::process::id())))
 }
 
-/// The temporary files that builds of `out` left next to it.
+/// The folder for tests' files. On Linux it sits in the build's target folder next to the test program, since the
+/// system's temporary folder may be a tmpfs, which takes no direct reads before Linux 6.6. Elsewhere it is the
+/// system's temporary folder.
+pub(crate) fn scratch_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        let exe = std::env::current_exe().ok();
+        let dir = exe.as_deref().and_then(|e| Some(e.parent()?.parent()?.join("tmp")));
+
+        if let Some(dir) = dir.filter(|d| std::fs::create_dir_all(d).is_ok()) {
+            return dir;
+        }
+    }
+
+    std::env::temp_dir()
+}
+
+/// The temporary, spill and groups files that builds of `out` left next to it, and the files of generations in its
+/// folder that its root doesn't name, which a failed run leaves if it doesn't clean up.
 pub(crate) fn temps_of(out: &std::path::Path) -> Vec<std::path::PathBuf> {
     let (Some(dir), Some(name)) = (out.parent(), out.file_name()) else {
         return Vec::new();
     };
     let prefix = format!("{}.", name.to_string_lossy());
-
-    std::fs::read_dir(dir)
+    let names = |dir: &std::path::Path| -> Vec<(std::path::PathBuf, String)> {
+        let entries = std::fs::read_dir(dir).into_iter().flatten().flatten();
+        entries
+            .map(|e| (e.path(), e.file_name().to_string_lossy().into_owned()))
+            .collect()
+    };
+    let mut out_files: Vec<std::path::PathBuf> = names(dir)
         .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            let n = p
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            n.starts_with(&prefix) && n.ends_with(".tmp")
-        })
-        .collect()
+        .filter(|(_, n)| n.starts_with(&prefix) && [".tmp", ".spill", ".groups"].iter().any(|kind| n.ends_with(kind)))
+        .map(|(p, _)| p)
+        .collect();
+    let current = crate::root::locate(out).ok().and_then(|at| at.root);
+    let named = |n: &str| current.as_ref().is_some_and(|r| n == r.data || n == r.log);
+    let generations = names(&crate::root::folder(out))
+        .into_iter()
+        .filter(|(_, n)| n.starts_with('g') && (n.ends_with(".data") || n.ends_with(".log")) && !named(n));
+    out_files.extend(generations.map(|(p, _)| p));
+    out_files
+}
+
+/// The data file that holds the index at `path` now, which is `path` itself until the index's first commit.
+pub(crate) fn data_of(path: &std::path::Path) -> std::path::PathBuf {
+    crate::root::locate(path).unwrap().data
+}
+
+/// Copies the index at `from`, whatever generation it holds, to `to`, with its log and its folder.
+pub(crate) fn copy_index(from: &std::path::Path, to: &std::path::Path) {
+    use crate::update::log_path;
+
+    for (a, b) in [(from.to_path_buf(), to.to_path_buf()), (log_path(from), log_path(to))] {
+        if a.exists() {
+            std::fs::copy(&a, &b).unwrap();
+        }
+    }
+
+    let (a, b) = (crate::root::folder(from), crate::root::folder(to));
+
+    if a.is_dir() {
+        std::fs::create_dir_all(&b).unwrap();
+        for e in std::fs::read_dir(&a).unwrap().flatten() {
+            std::fs::copy(e.path(), b.join(e.file_name())).unwrap();
+        }
+    }
 }
 
 /// An in-memory index of `n` vectors around `nlist` centers in 3 groups, written to the test file `name` and opened
@@ -239,8 +288,11 @@ impl Wave for Shuffled {
         8192
     }
 
-    fn submit(&mut self, lane: usize, _file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<(), Error> {
-        ranges.iter().for_each(|r| arena[r.at..r.at + r.len].fill(0xA5));
+    fn submit(&mut self, lane: usize, _file: &File, ranges: &[Range], arena: Memory) -> Result<(), Error> {
+        // SAFETY: this backend reads only in `next`, so no read lands in the ranges yet.
+        ranges
+            .iter()
+            .for_each(|r| unsafe { arena.slice_mut(r.at, r.len) }.fill(0xA5));
         let order = &mut self.orders[lane];
         order.clear();
         order.extend(0..ranges.len());
@@ -248,12 +300,13 @@ impl Wave for Shuffled {
         Ok(())
     }
 
-    fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<Option<usize>, Error> {
+    fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: Memory) -> Result<Option<usize>, Error> {
         let Some(i) = self.orders[lane].pop() else {
             return Ok(None);
         };
         let r = ranges[i];
-        read_at(file, &mut arena[r.at..r.at + r.len], r.offset)?;
+        // SAFETY: this backend reads one range at a time, here, and the caller leaves the range alone until it arrives.
+        read_at(file, unsafe { arena.slice_mut(r.at, r.len) }, r.offset)?;
         Ok(Some(i))
     }
 }
@@ -274,7 +327,7 @@ impl<const SUBMIT: usize, const WAVE: usize> Wave for Faulty<SUBMIT, WAVE> {
         4096
     }
 
-    fn submit(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<(), Error> {
+    fn submit(&mut self, lane: usize, file: &File, ranges: &[Range], arena: Memory) -> Result<(), Error> {
         self.submits += 1;
 
         if self.failing == Some(lane) {
@@ -293,7 +346,7 @@ impl<const SUBMIT: usize, const WAVE: usize> Wave for Faulty<SUBMIT, WAVE> {
         self.inner.submit(lane, file, ranges, arena)
     }
 
-    fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<Option<usize>, Error> {
+    fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: Memory) -> Result<Option<usize>, Error> {
         if self.failing == Some(lane) {
             self.failing = None;
             return Err(Error::other("a test read failed"));
@@ -318,7 +371,7 @@ impl<const WAVE: usize> Wave for EndsEarly<WAVE> {
         4096
     }
 
-    fn submit(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<(), Error> {
+    fn submit(&mut self, lane: usize, file: &File, ranges: &[Range], arena: Memory) -> Result<(), Error> {
         self.submits += 1;
 
         if self.short.is_some_and(|(short, _)| short == lane) {
@@ -332,7 +385,7 @@ impl<const WAVE: usize> Wave for EndsEarly<WAVE> {
         self.inner.submit(lane, file, ranges, arena)
     }
 
-    fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<Option<usize>, Error> {
+    fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: Memory) -> Result<Option<usize>, Error> {
         match &mut self.short {
             Some((short, 0)) if *short == lane => return Ok(None),
             Some((short, left)) if *short == lane => *left -= 1,
@@ -361,7 +414,7 @@ impl<const WAVE: usize> Wave for Hooked<WAVE> {
         4096
     }
 
-    fn submit(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<(), Error> {
+    fn submit(&mut self, lane: usize, file: &File, ranges: &[Range], arena: Memory) -> Result<(), Error> {
         self.submits += 1;
 
         if self.submits == WAVE
@@ -373,7 +426,7 @@ impl<const WAVE: usize> Wave for Hooked<WAVE> {
         self.inner.submit(lane, file, ranges, arena)
     }
 
-    fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<Option<usize>, Error> {
+    fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: Memory) -> Result<Option<usize>, Error> {
         self.inner.next(lane, file, ranges, arena)
     }
 }

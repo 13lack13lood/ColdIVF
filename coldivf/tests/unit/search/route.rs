@@ -42,8 +42,9 @@ fn route_matches_a_full_sort_on_every_tier() {
         let centers = Centers {
             codes: &codes,
             factors: &factors,
+            norms: &[],
         };
-        for tier in [Tier::SCALAR, Tier::best()] {
+        for tier in Tier::supported() {
             for nprobe in [0, 1, 10, nlist, nlist + 5] {
                 let mut routes = Vec::new();
                 route(tier, &centers, &q8, t2, nprobe, &mut dots, &mut routes);
@@ -78,13 +79,14 @@ fn a_tie_between_two_centers_goes_to_the_lower_position() {
         let centers = Centers {
             codes: &codes,
             factors: &factors,
+            norms: &[],
         };
         let mut dots = vec![0i32; nlist];
         let mut full = Vec::new();
         route(Tier::SCALAR, &centers, &q8, t2, nlist, &mut dots, &mut full);
         let pa = full.iter().position(|c| c.id == a as u32).unwrap();
         assert_eq!(full[pa + 1].id, b as u32, "the copy must come right after the original");
-        for tier in [Tier::SCALAR, Tier::best()] {
+        for tier in Tier::supported() {
             let mut routes = Vec::new();
             route(tier, &centers, &q8, t2, pa + 1, &mut dots, &mut routes);
             assert_eq!(routes, full[..pa + 1], "positions {a} and {b}");
@@ -111,4 +113,50 @@ fn reach_keeps_the_clusters_near_enough_to_the_nearest() {
     assert_eq!(within_reach(&[], Some(0.5)), 0);
     // A nearest score below 0 counts as 0, so only scores at most 0 stay, and the nearest always does.
     assert_eq!(within_reach(&routes(&[-1.0, 0.0, 0.5]), Some(0.5)), 2);
+}
+
+#[test]
+fn routing_a_chunk_at_a_time_picks_what_scoring_every_center_picks() {
+    let mut rng = SplitMix64::new(4);
+    let (dim, nlist) = (128, 2500);
+    let cb = code_bytes(padded_dim(dim));
+    let mut zs = gaussian(&mut rng, nlist, dim, |_| 1.0);
+    // Centers in other chunks repeat centers 3 and 1500, so their ties cross chunk boundaries.
+    for (from, to) in [(3, 1030), (3, 2049), (1500, 7)] {
+        let copy = zs[from * dim..(from + 1) * dim].to_vec();
+        zs[to * dim..(to + 1) * dim].copy_from_slice(&copy);
+    }
+    let mut codes = vec![0u8; nlist * cb];
+    let mut factors: Vec<_> = zs
+        .chunks_exact(dim)
+        .zip(codes.chunks_exact_mut(cb))
+        .map(|(z, c)| sq4::encode(z, c))
+        .collect();
+    // A damaged center's NaN score ranks last on both paths.
+    factors[1200].norm2 = f32::NAN;
+    let centers = Centers {
+        codes: &codes,
+        factors: &factors,
+        norms: &[],
+    };
+
+    let queries = gaussian(&mut rng, 3, dim, |_| 1.0);
+
+    for (y, tier) in queries
+        .chunks_exact(dim)
+        .flat_map(|y| Tier::supported().map(move |t| (y, t)))
+    {
+        let t2 = dot(y, y) as f32;
+        let mut q8 = QueryS8::new(dim);
+        q8.prepare(y);
+        for nprobe in [0, 1, 40, 1024, 1025, nlist, nlist + 3] {
+            let (mut full, mut dots) = (Vec::new(), vec![0i32; nlist]);
+            route(tier, &centers, &q8, t2, nprobe, &mut dots, &mut full);
+            let (mut chunked, mut chunk) = (Vec::new(), vec![0i32; CHUNK]);
+            let mut best = Candidates::new(nlist + 3);
+            route_chunked(tier, &centers, &q8, t2, nprobe, &mut chunk, &mut best, &mut chunked);
+            let bits = |r: &[Candidate]| r.iter().map(|c| (c.score.to_bits(), c.id)).collect::<Vec<_>>();
+            assert_eq!(bits(&chunked), bits(&full), "nprobe {nprobe}");
+        }
+    }
 }

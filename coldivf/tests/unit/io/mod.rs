@@ -11,7 +11,7 @@ use crate::quantization::testutil::{Shuffled, temp_file};
 
 /// `n` random spans inside a file of `file_len` bytes, sorted by offset. Some are empty, a quarter start where another
 /// ends, and many overlap.
-fn random_spans(rng: &mut SplitMix64, file_len: usize, n: usize) -> Vec<Span> {
+pub(super) fn random_spans(rng: &mut SplitMix64, file_len: usize, n: usize) -> Vec<Span> {
     let mut spans: Vec<Span> = Vec::with_capacity(n);
 
     for _ in 0..n {
@@ -83,6 +83,26 @@ fn coalescing_covers_every_span_with_sorted_aligned_disjoint_ranges() {
 }
 
 #[test]
+fn an_arena_starts_on_its_boundary_and_stays_there() {
+    for len in [0, 1, 4095, 4096, 100_000, 1 << 20] {
+        for align in [1, 512, 4096, 16_384] {
+            let mut arena = Arena::aligned(len, align);
+            let start = arena.as_ptr();
+            assert_eq!(arena.len(), len);
+            assert!(start.addr().is_multiple_of(align), "{len} bytes on {align}");
+            assert!(arena.iter().all(|&b| b == 0));
+            arena.fill(7);
+            // Moving the arena leaves its bytes where they were.
+            let moved = [arena];
+            assert_eq!(moved[0].as_ptr(), start);
+            assert!(moved[0].iter().all(|&b| b == 7));
+        }
+    }
+
+    assert!(Arena::new(100).as_ptr().addr().is_multiple_of(ARENA_ALIGN));
+}
+
+#[test]
 fn coalescing_nothing_plans_nothing() {
     let (mut ranges, mut at) = (
         vec![Range {
@@ -104,7 +124,7 @@ fn random_file(name: &str, len: usize) -> (Vec<u8>, Cold, crate::quantization::t
     let bytes: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
     let path = temp_file(name);
     std::fs::write(&path, &bytes).unwrap();
-    let cold = open_cold(&path, &bytes[..len.min(16384)]).unwrap();
+    let cold = open_cold(&path).unwrap();
     (bytes, cold, path)
 }
 
@@ -117,11 +137,18 @@ fn backends(cold: &Cold) -> Vec<Box<dyn Wave>> {
         Box::<Shuffled>::default(),
         #[cfg(target_os = "macos")]
         Box::<macos::RdAdviseWave>::default(),
+        #[cfg(target_os = "linux")]
+        Box::new(linux::UringWave::with(linux::Setup {
+            direct: false,
+            ..linux::Setup::default()
+        })),
+        #[cfg(target_os = "linux")]
+        Box::<linux::FadviseWave>::default(),
     ]
 }
 
 /// Waits for each range of the lane's last submit, checking that each arrives once.
-fn drain_all(wave: &mut dyn Wave, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) {
+fn drain_all(wave: &mut dyn Wave, lane: usize, file: &File, ranges: &[Range], arena: Memory) {
     let mut seen = vec![false; ranges.len()];
 
     while let Some(i) = wave.next(lane, file, ranges, arena).unwrap() {
@@ -134,6 +161,7 @@ fn drain_all(wave: &mut dyn Wave, lane: usize, file: &File, ranges: &[Range], ar
 
 /// Submits `ranges` on the lane and waits for each.
 fn read_all(wave: &mut dyn Wave, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) {
+    let arena = Memory::of(arena);
     wave.submit(lane, file, ranges, arena).unwrap();
     drain_all(wave, lane, file, ranges, arena);
 }
@@ -175,8 +203,9 @@ fn a_submit_drops_the_ranges_still_pending_on_its_lane() {
     for mut wave in backends(&cold) {
         let mut arena = vec![0u8; 1 << 17];
         coalesce(&first, wave.page(), len, &mut ranges, &mut at);
-        wave.submit(0, &cold.file, &ranges, &mut arena).unwrap();
-        wave.next(0, &cold.file, &ranges, &mut arena).unwrap();
+        let memory = Memory::of(&mut arena);
+        wave.submit(0, &cold.file, &ranges, memory).unwrap();
+        wave.next(0, &cold.file, &ranges, memory).unwrap();
         coalesce(&second, wave.page(), len, &mut ranges, &mut at);
         read_all(&mut *wave, 0, &cold.file, &ranges, &mut arena);
         for (s, &a) in second.iter().zip(&at) {
@@ -201,13 +230,13 @@ fn the_two_lanes_keep_their_waves_apart() {
             let (mut ranges, mut at) = (Vec::new(), Vec::new());
             coalesce(spans, wave.page(), len, &mut ranges, &mut at);
             let mut arena = vec![0u8; arena_bound(spans.iter().map(|s| s.len), wave.page())];
-            wave.submit(lane, &cold.file, &ranges, &mut arena).unwrap();
+            wave.submit(lane, &cold.file, &ranges, Memory::of(&mut arena)).unwrap();
             plans.push((ranges, at, arena));
         }
         // Lane 1 is drained before lane 0, the reverse of the submits.
         for lane in [1, 0] {
             let (ranges, at, arena) = &mut plans[lane];
-            drain_all(&mut *wave, lane, &cold.file, ranges, arena);
+            drain_all(&mut *wave, lane, &cold.file, ranges, Memory::of(arena));
             for (s, &a) in lanes[lane].iter().zip(at.iter()) {
                 assert_eq!(&arena[a..a + s.len], &bytes[s.range()]);
             }
@@ -257,11 +286,14 @@ fn a_read_that_fails_fails_its_wave_on_every_backend() {
         },
     ];
 
-    for mut wave in backends(&cold) {
+    for wave in backends(&cold) {
+        // The arena comes first, so it outlasts the backend, whose drop waits for any read that may still land in it.
         let mut arena = vec![0u8; 12_288];
-        let mut failed = wave.submit(0, &cold.file, &ranges, &mut arena).is_err();
+        let mut wave = wave;
+        let memory = Memory::of(&mut arena);
+        let mut failed = wave.submit(0, &cold.file, &ranges, memory).is_err();
         while !failed {
-            match wave.next(0, &cold.file, &ranges, &mut arena) {
+            match wave.next(0, &cold.file, &ranges, memory) {
                 Ok(Some(_)) => {}
                 Ok(None) => break,
                 Err(_) => failed = true,
@@ -282,17 +314,6 @@ fn reads_past_the_end_fail_and_hints_never_do() {
     );
     will_need(&cold.file, 0, 1 << 30);
     will_need(&cold.file, 1 << 40, 4096);
-}
-
-#[test]
-fn opening_the_cold_handle_checks_that_it_is_the_same_file() {
-    let (bytes, _, path) = random_file("same.bin", 20_000);
-
-    // A start that differs in one byte, as a rebuild renamed over the path would give, fails the check.
-    let mut other = bytes[..16384].to_vec();
-    other[16383] ^= 1;
-    assert_eq!(open_cold(&path, &other).err().unwrap().kind(), ErrorKind::InvalidData);
-    assert!(open_cold(&path, &bytes[..16384]).is_ok());
 }
 
 #[cfg(target_os = "macos")]
@@ -394,7 +415,7 @@ fn the_pool_starts_only_the_threads_a_wave_needs() {
     let mut wave = PoolWave::default();
     let mut arena = vec![0u8; 3 * 4096];
 
-    wave.submit(0, &cold.file, &[], &mut arena).unwrap();
+    wave.submit(0, &cold.file, &[], Memory::of(&mut arena)).unwrap();
     assert_eq!(wave.started(), 0);
     let ranges: Vec<Range> = (0..3)
         .map(|i| Range {
@@ -404,6 +425,6 @@ fn the_pool_starts_only_the_threads_a_wave_needs() {
             at: i * 4096,
         })
         .collect();
-    wave.submit(0, &cold.file, &ranges, &mut arena).unwrap();
+    wave.submit(0, &cold.file, &ranges, Memory::of(&mut arena)).unwrap();
     assert_eq!(wave.started(), 3);
 }

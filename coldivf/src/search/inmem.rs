@@ -10,12 +10,13 @@ use super::route::Centers;
 use super::{InPlace, LIMIT, List, RowPages, View, invalid, normalize, run, run_route};
 use crate::build::order::leaf_order;
 use crate::build::threads;
+use crate::format::Layout;
 use crate::kernels::Tier;
 use crate::quantization::rabitq::{BLOCK, Encoder, Factors, block_bytes, code_bytes, pack_block};
 use crate::quantization::rotation::Rotation;
 use crate::quantization::sq4::{self, CenterFactors};
 use crate::quantization::{padded_dim, rotate_offset, sq8};
-use crate::{BuildParams, Clusters, Hit, LeafId, Metric, SearchCtx, SearchParams, VectorSource};
+use crate::{Anchor, BuildParams, Clusters, Hit, LeafId, Metric, SearchCtx, SearchParams, VectorSource};
 
 /// The smallest dimension an index takes.
 pub(crate) const MIN_DIM: usize = 128;
@@ -24,10 +25,10 @@ pub(crate) const MIN_DIM: usize = 128;
 pub(crate) const MAX_DIM: usize = 4080;
 
 /// Rows read from the source at a time.
-const CHUNK: usize = 4096;
+pub(crate) const CHUNK: usize = 4096;
 
 /// Chunks encoded at once for each thread.
-const BATCH: usize = 2;
+pub(crate) const BATCH: usize = 2;
 
 /// The largest page size.
 const MAX_PAGE: usize = 1 << 20;
@@ -35,6 +36,8 @@ const MAX_PAGE: usize = 1 << 20;
 pub(crate) struct InMemory {
     pub(crate) dim: usize,
     pub(crate) metric: Metric,
+    /// What the 1-bit codes are measured from.
+    pub(crate) anchor: Anchor,
     pub(crate) seed: u64,
     /// How many compactions the index has had.
     pub(crate) epoch: u64,
@@ -46,6 +49,9 @@ pub(crate) struct InMemory {
     /// The 4-bit codes of the cluster centers, back to back, in file order.
     pub(crate) centers: Vec<u8>,
     pub(crate) center_factors: Vec<CenterFactors>,
+    /// Each center's squared length as its codes decode, for codes measured from the clusters' centers. It is empty
+    /// with the mean anchor.
+    pub(crate) center_norms: Vec<f64>,
     /// Each cluster's group, in file order.
     pub(crate) parent_of: Vec<u16>,
     pub(crate) lists: Vec<List>,
@@ -60,8 +66,8 @@ pub(crate) struct InMemory {
 
 impl InMemory {
     /// Builds the index from `src` and an imported clustering. It uses `params.metric`, `params.order`,
-    /// `params.page_size`, `params.seed` and `params.threads`, and gives the same index for any number of threads. The
-    /// vectors in each cluster keep their input order, and a vector's id is its input row.
+    /// `params.anchor`, `params.page_size`, `params.seed` and `params.threads`, and gives the same index for any number
+    /// of threads. The vectors in each cluster keep their input order, and a vector's id is its input row.
     pub(crate) fn build(params: &BuildParams, src: &dyn VectorSource, clusters: &Clusters) -> Result<InMemory, Error> {
         Self::build_ids(params, src, clusters, None)
     }
@@ -73,6 +79,32 @@ impl InMemory {
         clusters: &Clusters,
         ids: Option<&[u64]>,
     ) -> Result<InMemory, Error> {
+        let pool = threads(params.threads)?;
+        let (mut index, id_of) = InMemory::frame(params, src, clusters, ids, &pool)?;
+        let (n, dim) = (src.count(), src.dim());
+        let d_pad = padded_dim(dim);
+        let Encoded { codes, factors, rows } = Encoding::new(&index, ids, &id_of).run(&chunks(src), &pool)?;
+        index.blocks = pack(&index.lists, &codes, &factors, d_pad, &pool);
+        index.rows = rows;
+        index.ids = vec![0u64; n];
+        let external = |r: usize| ids.map_or(r as u64, |ids| ids[r]);
+        id_of
+            .iter()
+            .enumerate()
+            .for_each(|(r, &id)| index.ids[id as usize] = external(r));
+        Ok(index)
+    }
+
+    /// The index without its blocks, rows and ids, which take memory in proportion to the vectors, and each input
+    /// row's internal id. It reads the vectors once, for their mean. A build then encodes the vectors into the frame,
+    /// in memory or a part at a time.
+    pub(crate) fn frame(
+        params: &BuildParams,
+        src: &dyn VectorSource,
+        clusters: &Clusters,
+        ids: Option<&[u64]>,
+        pool: &ThreadPool,
+    ) -> Result<(InMemory, Vec<u32>), Error> {
         let (n, dim) = (src.count(), src.dim());
 
         if ids.is_some_and(|ids| ids.len() != n) {
@@ -82,12 +114,7 @@ impl InMemory {
         check_settings(n, dim, params.page_size)?;
         let (nlist, nparents) = check_input(n, dim, clusters)?;
         let metric = params.metric;
-        let pool = threads(params.threads)?;
-        let chunks: Vec<&[f32]> = (0..n)
-            .step_by(CHUNK)
-            .map(|start| src.rows(start, CHUNK.min(n - start)))
-            .collect();
-        let mean = mean(&chunks, dim, metric, &pool)?;
+        let mean = mean(&chunks(src), dim, metric, pool)?;
         let rotation = Rotation::new(dim, params.seed);
         let order = leaf_order(params.order, clusters, &mean);
         let mut position = vec![0u32; nlist];
@@ -110,22 +137,6 @@ impl InMemory {
                 next[p] - 1
             })
             .collect();
-        let external = |r: usize| ids.map_or(r as u64, |ids| ids[r]);
-        let mut row_ids = vec![0u64; n];
-        id_of
-            .iter()
-            .enumerate()
-            .for_each(|(r, &id)| row_ids[id as usize] = external(r));
-        let Encoded { codes, factors, rows } = Encoding {
-            dim,
-            metric,
-            mean: &mean,
-            rotation: &rotation,
-            page_size: params.page_size,
-            ids,
-        }
-        .run(&chunks, &id_of, &pool)?;
-        let blocks = pack(&lists, &codes, &factors, d_pad, &pool);
 
         let ccb = sq4::code_bytes(d_pad);
         let mut centers = vec![0u8; nlist * ccb];
@@ -142,6 +153,11 @@ impl InMemory {
             center_factors.push(f);
         }
 
+        let center_norms = match params.anchor {
+            Anchor::Mean => Vec::new(),
+            Anchor::Cluster => sq4::decoded_norms(&centers, &center_factors, dim),
+        };
+
         let crb = sq8::center_row_bytes(dim);
         let mut parents = vec![0u8; nparents * crb];
 
@@ -152,9 +168,10 @@ impl InMemory {
             }
         }
 
-        Ok(InMemory {
+        let index = InMemory {
             dim,
             metric,
+            anchor: params.anchor,
             seed: params.seed,
             epoch: 0,
             page_size: params.page_size,
@@ -163,13 +180,47 @@ impl InMemory {
             parents,
             centers,
             center_factors,
+            center_norms,
             parent_of: order.iter().map(|&c| clusters.parent_of[c as usize] as u16).collect(),
             lists,
-            blocks,
-            rows,
-            ids: row_ids,
+            blocks: Vec::new(),
+            rows: Vec::new(),
+            ids: Vec::new(),
             tier: Tier::best(),
-        })
+        };
+
+        Ok((index, id_of))
+    }
+
+    /// An index without blocks, rows or ids, with the settings and epoch of `layout`, the mean `mean`, the rotation
+    /// `rotation` and tables as a file stores them. A rewrite lays out its new file's small sections and header from
+    /// it.
+    pub(crate) fn with_tables(layout: &Layout, mean: Vec<f32>, rotation: Rotation, tables: Stored) -> InMemory {
+        let center_norms = match layout.anchor {
+            Anchor::Mean => Vec::new(),
+            Anchor::Cluster => sq4::decoded_norms(&tables.centers, &tables.center_factors, layout.dim),
+        };
+
+        InMemory {
+            dim: layout.dim,
+            metric: layout.metric,
+            anchor: layout.anchor,
+            seed: layout.seed,
+            epoch: layout.epoch,
+            page_size: layout.page_size,
+            mean,
+            rotation,
+            parents: tables.parents,
+            centers: tables.centers,
+            center_factors: tables.center_factors,
+            center_norms,
+            parent_of: tables.parent_of,
+            lists: tables.lists,
+            blocks: Vec::new(),
+            rows: Vec::new(),
+            ids: Vec::new(),
+            tier: Tier::best(),
+        }
     }
 
     /// What a search reads from the tables.
@@ -177,11 +228,13 @@ impl InMemory {
         View {
             dim: self.dim,
             metric: self.metric,
+            anchor: self.anchor,
             mean: &self.mean,
             rotation: &self.rotation,
             centers: Centers {
                 codes: &self.centers,
                 factors: &self.center_factors,
+                norms: &self.center_norms,
             },
             lists: &self.lists,
             tier: self.tier,
@@ -231,6 +284,16 @@ impl InMemory {
         self.tier = tier;
         self
     }
+}
+
+/// An index's tables as a file stores them, in file order: the group centers as 8-bit rows without ids, each cluster's
+/// 4-bit center codes, back to back, and their factors, each cluster's group and each cluster's place.
+pub(crate) struct Stored {
+    pub(crate) parents: Vec<u8>,
+    pub(crate) centers: Vec<u8>,
+    pub(crate) center_factors: Vec<CenterFactors>,
+    pub(crate) parent_of: Vec<u16>,
+    pub(crate) lists: Vec<List>,
 }
 
 /// Checks the dimension, the vector count and the page size, the settings that need no clustering.
@@ -336,31 +399,71 @@ fn mean(chunks: &[&[f32]], dim: usize, metric: Metric, pool: &ThreadPool) -> Res
         .collect())
 }
 
+/// The rows of `src` in chunks of `CHUNK`, as borrowed slices, so a source in a mapped file is never copied.
+pub(crate) fn chunks(src: &dyn VectorSource) -> Vec<&[f32]> {
+    let n = src.count();
+    (0..n)
+        .step_by(CHUNK)
+        .map(|start| src.rows(start, CHUNK.min(n - start)))
+        .collect()
+}
+
 /// What encoding a vector needs.
-struct Encoding<'a> {
+pub(crate) struct Encoding<'a> {
     dim: usize,
     metric: Metric,
+    anchor: Anchor,
     mean: &'a [f32],
     rotation: &'a Rotation,
     page_size: usize,
     /// The id of each input row, when it isn't the row's number.
     ids: Option<&'a [u64]>,
+    /// The internal id of each input row, which tells its cluster.
+    id_of: &'a [u32],
+    lists: &'a [List],
+    /// Each cluster's rotated offset P(ĉ − μ) as its codes decode, one after another in file order, for codes measured
+    /// from the clusters' centers. A build computes them once, which takes the cluster count times the dimension in
+    /// f32, eg. 19 MB for 6250 clusters of 768 dimensions at 1M vectors and 192 MB at 10M. With the mean anchor it is
+    /// empty.
+    centers: Vec<f32>,
 }
 
 /// Vectors encoded into their 1-bit codes, their factors and their 8-bit rows. A chunk's are in input order, with its
 /// rows back to back. An index's are by internal id, with its rows in pages.
-struct Encoded {
-    codes: Vec<u8>,
-    factors: Vec<Factors>,
-    rows: Vec<u8>,
+pub(crate) struct Encoded {
+    pub(crate) codes: Vec<u8>,
+    pub(crate) factors: Vec<Factors>,
+    pub(crate) rows: Vec<u8>,
 }
 
-impl Encoding<'_> {
-    /// Encodes every input vector into its 1-bit code, its factors and its 8-bit row, and puts each at its internal id
-    /// `id_of[r]`. The threads encode a batch of chunks at a time, which this thread then puts in place in input order,
-    /// so only a few encoded chunks ever wait.
-    fn run(&self, chunks: &[&[f32]], id_of: &[u32], pool: &ThreadPool) -> Result<Encoded, Error> {
-        let n = id_of.len();
+impl<'a> Encoding<'a> {
+    /// The encoding of the vectors of `index`'s frame, whose input row r has internal id `id_of[r]`, with `ids[r]` as
+    /// its id when given.
+    pub(crate) fn new(index: &'a InMemory, ids: Option<&'a [u64]>, id_of: &'a [u32]) -> Encoding<'a> {
+        let centers = match index.anchor {
+            Anchor::Mean => Vec::new(),
+            Anchor::Cluster => decoded_centers(index),
+        };
+
+        Encoding {
+            dim: index.dim,
+            metric: index.metric,
+            anchor: index.anchor,
+            mean: &index.mean,
+            rotation: &index.rotation,
+            page_size: index.page_size,
+            ids,
+            id_of,
+            lists: &index.lists,
+            centers,
+        }
+    }
+
+    /// Encodes every input vector into its 1-bit code, its factors and its 8-bit row, and puts each at its internal
+    /// id. The threads encode a batch of chunks at a time, which this thread then puts in place in input order, so only
+    /// a few encoded chunks ever wait.
+    fn run(&self, chunks: &[&[f32]], pool: &ThreadPool) -> Result<Encoded, Error> {
+        let (n, id_of) = (self.id_of.len(), self.id_of);
         let (cb, rb) = (code_bytes(padded_dim(self.dim)), sq8::row_bytes(self.dim));
         let per_page = self.page_size / rb;
         let mut codes = vec![0u8; n * cb];
@@ -393,7 +496,7 @@ impl Encoding<'_> {
     }
 
     /// Encodes the vectors of one chunk, whose first input row is `first`.
-    fn chunk(&self, chunk: &[f32], first: usize) -> Result<Encoded, Error> {
+    pub(crate) fn chunk(&self, chunk: &[f32], first: usize) -> Result<Encoded, Error> {
         let (dim, count) = (self.dim, chunk.len() / self.dim);
         let (cb, rb) = (code_bytes(padded_dim(dim)), sq8::row_bytes(dim));
         let mut e = Encoded {
@@ -407,10 +510,13 @@ impl Encoding<'_> {
 
         for (i, (x, (code, row))) in chunk.chunks_exact(dim).zip(outputs).enumerate() {
             load(x, self.metric, &mut o)?;
-            let f = encoder.encode(&o, code);
+            let f = match self.anchor {
+                Anchor::Mean => encoder.encode(&o, code),
+                Anchor::Cluster => encoder.encode_from(&o, self.center_of(first + i), code),
+            };
             let id = self.ids.map_or((first + i) as u64, |ids| ids[first + i]);
             sq8::write_row(&o, self.mean, id, row);
-            if !(fits(f.f_add) && f.f_rescale.is_finite() && f.f_err.is_finite() && fits(sq8::norm2(row, dim))) {
+            if !(fits(f.f_add.abs()) && f.f_rescale.is_finite() && f.f_err.is_finite() && fits(sq8::norm2(row, dim))) {
                 return Err(invalid("a vector is too far from the mean to encode"));
             }
             e.factors.push(f);
@@ -418,6 +524,24 @@ impl Encoding<'_> {
 
         Ok(e)
     }
+
+    /// The decoded center of the cluster that holds input row `r`.
+    fn center_of(&self, r: usize) -> &[f32] {
+        let id = self.id_of[r] as usize;
+        let leaf = self.lists.partition_point(|l| l.first_id as usize + l.count <= id);
+        &self.centers[leaf * self.dim..(leaf + 1) * self.dim]
+    }
+}
+
+/// Every cluster's rotated offset P(ĉ − μ) as its codes decode, one after another in file order.
+fn decoded_centers(index: &InMemory) -> Vec<f32> {
+    let (dim, size) = (index.dim, sq4::code_bytes(padded_dim(index.dim)));
+    let mut centers = vec![0f32; index.center_factors.len() * dim];
+    let codes = index.centers.chunks_exact(size).zip(&index.center_factors);
+    codes
+        .zip(centers.chunks_exact_mut(dim))
+        .for_each(|((codes, f), out)| sq4::decode(codes, f, out));
+    centers
 }
 
 /// Packs each cluster's codes into its blocks, a cluster at a time on the pool's threads. The clusters' blocks follow
@@ -461,12 +585,15 @@ fn lists(assignment: &[u32], order: &[u32], size: usize) -> Vec<List> {
         counts[c as usize] += 1;
     }
 
+    place(order.iter().map(|&c| counts[c as usize]), size)
+}
+
+/// The places of clusters of these vector counts, in file order, laid out as `lists` lays them out.
+pub(crate) fn place(counts: impl Iterator<Item = usize>, size: usize) -> Vec<List> {
     let (mut offset, mut first_id) = (0, 0u32);
 
-    order
-        .iter()
-        .map(|&c| {
-            let count = counts[c as usize];
+    counts
+        .map(|count| {
             let list = List {
                 offset,
                 count,

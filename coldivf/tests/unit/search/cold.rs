@@ -36,15 +36,15 @@ fn waves() -> [Option<NewWave>; 3] {
     ]
 }
 
-fn open(path: &TempFile, wave: Option<NewWave>) -> Arc<Inner> {
+fn open(path: &TempFile, wave: Option<NewWave>) -> Index {
     let inner = Inner::open(path).unwrap();
-    Arc::new(wave.map_or(inner, |w| Inner::open(path).unwrap().with_wave(w)))
+    Index::of(wave.map_or(inner, |w| Inner::open(path).unwrap().with_wave(w)))
 }
 
 #[test]
 fn queries_reuse_every_read_buffer() {
     let (_, file, _path) = written("buffers.coldivf", &params(Metric::L2), 3000, 128, 64);
-    let index = Index { inner: Arc::new(file) };
+    let index = Index::of(file);
     let dim = 128;
     let queries = gaussian(&mut SplitMix64::new(1), 20, dim, |_| 1.0);
     // The second context keeps more hits than candidates to rescore.
@@ -107,9 +107,7 @@ fn the_arena_holds_the_largest_clusters_one_fetch_may_read() {
     let q = &gaussian(&mut SplitMix64::new(2), 1, 128, |_| 1.0)[..];
 
     for wave in waves() {
-        let index = Index {
-            inner: open(&path, wave),
-        };
+        let index = open(&path, wave);
         let mut ctx = SearchCtx::new(Limits {
             max_k: 10,
             max_nprobe: 4,
@@ -146,17 +144,22 @@ fn the_row_arenas_hold_the_most_rows_one_search_may_rescore() {
         Box::<Shuffled>::default(),
         #[cfg(target_os = "macos")]
         Box::<crate::io::macos::RdAdviseWave>::default(),
+        #[cfg(target_os = "linux")]
+        Box::<crate::io::linux::UringWave>::default(),
+        #[cfg(target_os = "linux")]
+        Box::<crate::io::linux::FadviseWave>::default(),
     ];
 
     for wave in all {
-        let mut reads = Reads::new(&owner, wave, layout, bytes.len(), &memory.lists, &limits);
-        // Once through the late wave alone, then again with every row read early.
-        for early in [false, true] {
+        let mut reads = Reads::new(&owner, wave, layout, bytes.len(), owner.tables().unwrap(), &limits);
+        // Once through the late wave alone, then again with every row read early, then through the cache, as a warm
+        // search reads them.
+        for (early, warm) in [(false, false), (true, false), (false, true)] {
             reads.fetch(&handle, &memory.lists, &[]).unwrap();
             if early {
                 reads.prefetch(&handle, &candidates).unwrap();
             }
-            reads.read_rows(&handle, &candidates).unwrap();
+            reads.read_rows(&handle, &candidates, warm).unwrap();
             for c in &candidates {
                 let page = (c.id as usize / section.per_page) * section.page_size;
                 let at = section.offset + page + (c.id as usize % section.per_page) * section.row_bytes;
@@ -169,7 +172,7 @@ fn the_row_arenas_hold_the_most_rows_one_search_may_rescore() {
 #[test]
 fn the_late_wave_skips_the_rows_the_early_wave_read() {
     let (_, file, _path) = written("skip.coldivf", &params(Metric::L2), 3000, 128, 64);
-    let index = Index { inner: Arc::new(file) };
+    let index = Index::of(file);
     let mut ctx = SearchCtx::new(Limits {
         max_k: 10,
         max_nprobe: 16,
@@ -222,10 +225,10 @@ fn a_row_page_takes_the_fewest_read_pages_its_offsets_allow() {
 fn a_context_drops_the_reads_of_closed_indexes() {
     let open = |name: &str, dim| {
         let (_, file, path) = written(name, &params(Metric::L2), 400, dim, 12);
-        (Index { inner: Arc::new(file) }, path)
+        (Index::of(file), path)
     };
     let search = |index: &Index, ctx: &mut SearchCtx| {
-        let dim = index.inner.parts().1.dim;
+        let dim = index.inner().parts().1.dim;
         let sp = SearchParams {
             k: 5,
             nprobe: 4,
@@ -250,6 +253,47 @@ fn a_context_drops_the_reads_of_closed_indexes() {
     search(&b, &mut ctx);
     assert_eq!(ctx.reads.len(), 2);
     search(&c, &mut ctx);
-    let owners: Vec<*const Inner> = ctx.reads.iter().map(|r| r.owner.as_ptr()).collect();
-    assert_eq!(owners, [Arc::as_ptr(&b.inner), Arc::as_ptr(&c.inner)]);
+    let owners: Vec<u64> = ctx.reads.iter().map(|r| r.cell).collect();
+    assert_eq!(owners, [b.inner().cell(), c.inner().cell()]);
+}
+
+#[test]
+fn a_commit_plans_a_context_s_reads_again_in_place() {
+    use crate::maintain::tests::{build_params, churn, sample, settings};
+
+    let (path, rows) = sample(
+        "replan.coldivf",
+        &build_params(Metric::L2, crate::Anchor::Cluster),
+        3000,
+        30,
+        72,
+    );
+    let index = Index::open(&path).unwrap();
+    let mut writer = crate::Writer::open(&path).unwrap();
+    let mut ctx = SearchCtx::new(Limits {
+        max_k: 10,
+        max_nprobe: 20,
+        max_rerank: 40,
+    });
+    let sp = SearchParams {
+        k: 10,
+        nprobe: 20,
+        rerank: 40,
+        reach: None,
+    };
+    let q = &rows.data[..128];
+    index.search(q, &sp, &mut ctx).unwrap();
+    let (first, generation) = (buffers(&ctx), ctx.reads[0].generation());
+
+    // A fold after a few changes: the reads move to the new generation, in the same slot, with the same buffers.
+    churn(&mut writer, &rows, 73);
+    writer.maintain(&settings(), crate::RunKind::Fold).unwrap();
+    let hits: Vec<u64> = index.search(q, &sp, &mut ctx).unwrap().iter().map(|h| h.id).collect();
+    assert_eq!((ctx.reads.len(), buffers(&ctx)), (1, first));
+    assert_ne!(ctx.reads[0].generation(), generation);
+    assert_eq!(ctx.reads[0].generation(), index.inner().uid());
+    // And they read the new file, as a context made now does.
+    let mut fresh = SearchCtx::new(ctx.limits);
+    let want: Vec<u64> = index.search(q, &sp, &mut fresh).unwrap().iter().map(|h| h.id).collect();
+    assert_eq!(hits, want);
 }

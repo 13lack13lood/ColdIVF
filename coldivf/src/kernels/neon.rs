@@ -4,7 +4,7 @@
 use std::arch::aarch64::*;
 
 use crate::quantization::rabitq::{BLOCK, QueryLut};
-use crate::search::candidates::Candidate;
+use crate::search::candidates::{Candidate, rank};
 
 /// The dot product Σ q8_i k_i for each cluster center, where q8_i is `q8[i]` and k_i is the center's 4-bit code for
 /// dimension i. It scores four centers per pass, so they share each load of the query. Each center keeps two running
@@ -55,6 +55,34 @@ pub(crate) unsafe fn sq4_dots(codes: &[u8], q8: &[i8], out: &mut [i32]) {
     }
 }
 
+/// The dot product of one center's 4-bit codes with each of 4 query planes, the same as `sq4_dots` gives for that
+/// center and each plane. It goes through the codes once, a chunk at a time for all 4 planes, and each plane keeps two
+/// running sums, so its dot-product instructions don't wait on each other.
+///
+/// # Safety
+///
+/// The CPU must support NEON and dotprod. `codes.len()` must be a multiple of 32, and `planes` must hold 4 planes of
+/// `2 * codes.len()` values each, back to back.
+#[target_feature(enable = "neon,dotprod")]
+pub(crate) unsafe fn plane_dots(codes: &[u8], planes: &[i8], out: &mut [i32; 4]) {
+    let d_pad = 2 * codes.len();
+    let mut acc = [[vdupq_n_s32(0); 2]; 4];
+
+    for chunk in 0..codes.len() / 32 {
+        for (t, a) in acc.iter_mut().enumerate() {
+            // SAFETY: 32·chunk + 32 ≤ codes.len() and t·d_pad + 64·chunk + 64 ≤ planes.len(), by the caller's lengths.
+            unsafe {
+                let q = load_query(planes.as_ptr().add(t * d_pad + 64 * chunk));
+                add_chunk(a, codes.as_ptr().add(32 * chunk), q);
+            }
+        }
+    }
+
+    for (dot, a) in out.iter_mut().zip(&acc) {
+        *dot = vaddvq_s32(vaddq_s32(a[0], a[1]));
+    }
+}
+
 /// Loads 64 query values, the 4 runs of 16 that one 32-byte chunk of codes lines up with.
 ///
 /// # Safety
@@ -93,8 +121,10 @@ unsafe fn add_chunk(acc: &mut [int32x4_t; 2], p: *const u8, q: [int8x16_t; 4]) {
     acc[1] = vdotq_s32(acc[1], vreinterpretq_s8_u8(vshrq_n_u8::<4>(b1)), q[3]);
 }
 
-/// Scores one block of 1-bit codes like `scan_block_scalar` does, and writes the same candidates bit for bit. Each
-/// estimate uses the same three fused multiply-adds in the same order.
+/// Scores one block of 1-bit codes like `scan_block_scalar` does, and writes the same candidates bit for bit, except
+/// that a NaN score may carry another NaN's bits. Each estimate uses the same three fused multiply-adds in the same
+/// order, and adds the query's t2, or lane j's `t2[j]` when `t2` is given. It ranks the estimates against `bound` as
+/// `before` does, with NaN as +∞.
 ///
 /// # Safety
 ///
@@ -104,6 +134,7 @@ unsafe fn add_chunk(acc: &mut [int32x4_t; 2], p: *const u8, q: [int8x16_t; 4]) {
 pub(crate) unsafe fn scan_block(
     block: &[u8],
     query: &QueryLut,
+    t2: Option<&[f32; BLOCK]>,
     first_id: u32,
     count: usize,
     bound: Candidate,
@@ -116,13 +147,14 @@ pub(crate) unsafe fn scan_block(
     unsafe { block_sums(block.as_ptr(), query.lut.as_ptr(), d_pad / 4, &mut sums) };
 
     let k = &query.k;
-    let (k_s, k_p, k_c, t2) = (
+    let (k_s, k_p, k_c, t2_all) = (
         vdupq_n_f32(k.k_s),
         vdupq_n_f32(k.k_p),
         vdupq_n_f32(k.k_c),
         vdupq_n_f32(k.t2),
     );
-    let (bound_score, bound_id) = (vdupq_n_f32(bound.score), vdupq_n_u32(bound.id));
+    let (bound_score, bound_id) = (vdupq_n_f32(rank(bound.score)), vdupq_n_u32(bound.id));
+    let infinity = vdupq_n_f32(f32::INFINITY);
     // SAFETY: the array holds 4 values.
     let offsets = unsafe { vld1q_u32([0u32, 1, 2, 3].as_ptr()) };
     let mut n = 0;
@@ -139,12 +171,19 @@ pub(crate) unsafe fn scan_block(
                 vld1q_f32(p.add(8 * BLOCK).cast()),
             )
         };
+        let t2_lanes = match t2 {
+            // SAFETY: lanes `lane..lane + 4` are inside the 32 values.
+            Some(t2) => unsafe { vld1q_f32(t2.as_ptr().add(lane)) },
+            None => t2_all,
+        };
         let a = vfmaq_f32(k_c, k_s, s);
         let ip = vfmaq_f32(a, k_p, f_pop);
-        let est = vfmaq_f32(vaddq_f32(f_add, t2), f_rescale, ip);
+        let est = vfmaq_f32(vaddq_f32(f_add, t2_lanes), f_rescale, ip);
+        // The estimates as they rank, with NaN as +∞.
+        let x = vbslq_f32(vceqq_f32(est, est), est, infinity);
         let ids = vaddq_u32(vdupq_n_u32(first_id.wrapping_add(lane as u32)), offsets);
-        let ties = vandq_u32(vceqq_f32(est, bound_score), vcltq_u32(ids, bound_id));
-        let pass = vorrq_u32(vcltq_f32(est, bound_score), ties);
+        let ties = vandq_u32(vceqq_f32(x, bound_score), vcltq_u32(ids, bound_id));
+        let pass = vorrq_u32(vcltq_f32(x, bound_score), ties);
         if vmaxvq_u32(pass) == 0 {
             continue;
         }

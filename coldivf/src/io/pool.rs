@@ -10,7 +10,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
-use super::{Cursor, LANES, Range, Wave, read_at};
+use super::{Cursor, LANES, Memory, Range, Wave, read_at};
+use crate::trace::ReadPath;
 
 /// The most threads one backend starts.
 pub(crate) const THREADS: usize = 16;
@@ -89,9 +90,12 @@ impl Wave for PoolWave {
     }
 
     /// Reads every range. The ranges must be packed in order in the arena, as `coalesce` lays them out.
-    fn submit(&mut self, lane: usize, file: &File, ranges: &[Range], arena: &mut [u8]) -> Result<(), Error> {
+    fn submit(&mut self, lane: usize, file: &File, ranges: &[Range], arena: Memory) -> Result<(), Error> {
         self.lanes[lane].start(0);
         let threads = self.spawn(ranges.len()).min(ranges.len());
+        // SAFETY: this backend's waves are done when `submit` returns, so no read of either lane is in flight, and the
+        // caller leaves the lane's memory to this wave until it is done.
+        let arena = unsafe { arena.slice_mut(0, arena.len()) };
 
         if threads == 0 {
             ranges
@@ -147,14 +151,15 @@ impl Wave for PoolWave {
         Ok(())
     }
 
-    fn next(
-        &mut self,
-        lane: usize,
-        _file: &File,
-        _ranges: &[Range],
-        _arena: &mut [u8],
-    ) -> Result<Option<usize>, Error> {
+    fn next(&mut self, lane: usize, _file: &File, _ranges: &[Range], _arena: Memory) -> Result<Option<usize>, Error> {
         Ok(self.lanes[lane].take())
+    }
+
+    fn read_path(&self) -> ReadPath {
+        ReadPath {
+            backend: "pool",
+            ..ReadPath::default()
+        }
     }
 }
 
