@@ -16,3 +16,6 @@ results/
 .idea/
 .vscode/
 runs/
+# Python caches
+__pycache__/
+*.pyc
