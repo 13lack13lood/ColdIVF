@@ -1,0 +1,221 @@
+# A check of the graph adapters at 50K on the dev set. usearch, qdrant-edge and AsterVec each get their builds, a short
+# warm grid at 1 thread, a short run of queries per second (QPS) at 4 threads, 3 C0 trials per build, and intent and
+# C1 trials. It checks the code, not the machine, so its gate only warns and builds use 4 threads.
+
+phase = "graphs-check"
+dataset = "cohere-768-cosine"
+n = 50000
+index_root = "data/bench.noindex/graphs-check"
+
+[gate]
+mode = "warn"
+top_samples = 2
+top_interval_s = 2
+invalid_vm = []
+
+[[system]]
+name = "usearch"
+adapter = "usearch_hnsw"
+
+  [[system.build]]
+  config_id = "m16-i8"
+  config = { dtype = "i8", connectivity = 16 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "m16-f16"
+  config = { dtype = "f16", connectivity = 16 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "m16-f32"
+  config = { dtype = "f32", connectivity = 16 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "m16-i8"
+  grid = { expansion_search = [16, 32, 64, 128] }
+
+  [[system.warm]]
+  config_id = "m16-f16"
+  grid = { expansion_search = [16, 32, 64, 128] }
+
+  [[system.warm]]
+  config_id = "m16-f32"
+  grid = { expansion_search = [16, 32, 64, 128] }
+
+  [[system.warm]]
+  config_id = "m16-i8"
+  threads = 4
+  grid = { expansion_search = [64] }
+  qps_seconds = 2
+  qps_repeats = 1
+
+  [[system.cold]]
+  config_id = "m16-i8"
+  params = { expansion_search = 64 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "m16-f16"
+  params = { expansion_search = 64 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "m16-f32"
+  params = { expansion_search = 64 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "m16-i8"
+  regime = "intent"
+  params = { expansion_search = 64 }
+  trials = 2
+  delay_ms = 5
+
+  [[system.cold]]
+  config_id = "m16-i8"
+  regime = "c1"
+  params = { expansion_search = 64 }
+  trials = 3
+  group = "live"
+
+[[system]]
+name = "qdrant-edge"
+adapter = "qdrant_shard"
+
+  [[system.build]]
+  config_id = "m16-sq8"
+  config = { codes = "sq8", m = 16, ef_construct = 100 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "m16-bq2"
+  config = { codes = "bq2", m = 16, ef_construct = 100 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "m16-bq2-inline"
+  config = { codes = "bq2", inline = true, m = 16, ef_construct = 100 }
+  threads = 4
+  disk_gb = 2
+
+  [[system.warm]]
+  config_id = "m16-sq8"
+  grid = { hnsw_ef = [32, 64, 128], oversampling = [2] }
+
+  [[system.warm]]
+  config_id = "m16-bq2"
+  grid = { hnsw_ef = [32, 64, 128], oversampling = [2] }
+
+  [[system.warm]]
+  config_id = "m16-bq2-inline"
+  grid = { hnsw_ef = [32, 64, 128], oversampling = [2] }
+
+  [[system.warm]]
+  config_id = "m16-sq8"
+  threads = 4
+  grid = { hnsw_ef = [64], oversampling = [2] }
+  qps_seconds = 2
+  qps_repeats = 1
+
+  [[system.cold]]
+  config_id = "m16-sq8"
+  params = { hnsw_ef = 64, oversampling = 2 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "m16-bq2"
+  params = { hnsw_ef = 64, oversampling = 2 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "m16-bq2-inline"
+  params = { hnsw_ef = 64, oversampling = 2 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "m16-sq8"
+  regime = "intent"
+  params = { hnsw_ef = 64, oversampling = 2 }
+  trials = 2
+  delay_ms = 5
+
+  [[system.cold]]
+  config_id = "m16-sq8"
+  regime = "c1"
+  params = { hnsw_ef = 64, oversampling = 2 }
+  trials = 3
+  group = "live"
+
+  [[system.cold]]
+  config_id = "m16-bq2-inline"
+  regime = "c1"
+  params = { hnsw_ef = 64, oversampling = 2 }
+  trials = 3
+  group = "live"
+
+[[system]]
+name = "astervec"
+adapter = "astervec_lsm"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "default"
+  grid = { ef = [32, 64, 128], caches = ["default", "minimal"] }
+
+  [[system.warm]]
+  config_id = "default"
+  threads = 4
+  grid = { ef = [64] }
+  qps_seconds = 2
+  qps_repeats = 1
+
+  [[system.cold]]
+  config_id = "default"
+  params = { ef = 64 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "default"
+  params = { ef = 64, caches = "minimal" }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "default"
+  regime = "intent"
+  params = { ef = 64 }
+  trials = 2
+  delay_ms = 5
+
+  [[system.cold]]
+  config_id = "default"
+  regime = "c1"
+  params = { ef = 64 }
+  trials = 3
+  group = "live"
+
+  [[system.cold]]
+  config_id = "default"
+  regime = "c1"
+  params = { ef = 64, caches = "minimal" }
+  trials = 3
+  group = "live-minimal"

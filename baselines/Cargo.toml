@@ -1,0 +1,20 @@
+# Baseline systems that the benchmark harness drives, apart from the main workspace, so their dependencies never
+# reach ColdIVF's builds or its checks. Builds go to this folder's own target/.
+[workspace]
+resolver = "3"
+members = ["diskann3"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+# The same release settings as the main workspace, so both sides are compiled alike.
+[profile.release]
+debug = "line-tables-only"
+codegen-units = 1
+lto = "thin"
+
+[profile.release.package."*"]
+codegen-units = 16

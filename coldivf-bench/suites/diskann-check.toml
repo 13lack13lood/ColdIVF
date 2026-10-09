@@ -1,0 +1,94 @@
+# A check of the DiskANN adapter on the first 50K rows of the dev set. One build at degree 64, build list size 100 and
+# 96-byte product quantization (PQ) codes serves all three readers. Each reader gets a short warm grid and three C0
+# trials, and the pool reader three C1 trials too. It checks the code, not the machine, so its gate only warns, and the
+# builds use 4 threads to share the machine.
+
+phase = "diskann-check"
+dataset = "cohere-768-cosine"
+n = 50000
+index_root = "data/bench.noindex/diskann-check"
+
+[gate]
+mode = "warn"
+top_samples = 2
+top_interval_s = 2
+invalid_vm = []
+
+[[system]]
+name = "diskann"
+adapter = "diskann"
+variant = "pool"
+
+  [[system.build]]
+  config_id = "r64-l100-pq96"
+  config = { degree = 64, build_list = 100, pq_bytes = 96 }
+  seeds = [1]
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "r64-l100-pq96"
+  split = "tune"
+  grid = { list = [10, 20, 50, 100, 200, 400], beam = [2, 4, 8, 16] }
+  passes = 2
+  warmup = 200
+
+  [[system.cold]]
+  config_id = "r64-l100-pq96"
+  regime = "c0"
+  params = { list = 100, beam = 4 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "r64-l100-pq96"
+  regime = "c1"
+  params = { list = 100, beam = 4 }
+  trials = 3
+  group = "live"
+
+[[system]]
+name = "diskann"
+adapter = "diskann"
+variant = "advise"
+
+  [[system.build]]
+  config_id = "r64-l100-pq96"
+  index = "data/bench.noindex/diskann-check/diskann-pool/r64-l100-pq96-n50000-s1"
+
+  [[system.warm]]
+  config_id = "r64-l100-pq96"
+  split = "tune"
+  grid = { list = [50, 100, 200], beam = [4] }
+  passes = 2
+  warmup = 200
+
+  [[system.cold]]
+  config_id = "r64-l100-pq96"
+  regime = "c0"
+  params = { list = 100, beam = 4 }
+  trials = 3
+  dummy = "data/bench.noindex/diskann-check/diskann-pool/r64-l100-pq96-n50000-s1-dummy5000"
+
+[[system]]
+name = "diskann"
+adapter = "diskann"
+variant = "stock"
+
+  [[system.build]]
+  config_id = "r64-l100-pq96"
+  index = "data/bench.noindex/diskann-check/diskann-pool/r64-l100-pq96-n50000-s1"
+
+  [[system.warm]]
+  config_id = "r64-l100-pq96"
+  split = "tune"
+  grid = { list = [50, 100, 200], beam = [4] }
+  passes = 2
+  warmup = 200
+
+  [[system.cold]]
+  config_id = "r64-l100-pq96"
+  regime = "c0"
+  params = { list = 100, beam = 4 }
+  trials = 3
+  dummy = "data/bench.noindex/diskann-check/diskann-pool/r64-l100-pq96-n50000-s1-dummy5000"

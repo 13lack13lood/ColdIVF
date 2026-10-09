@@ -1,0 +1,316 @@
+# A check of the faiss adapters on the 50K prefix of the 1M dev set. Every inverted file (IVF) setup and every graph
+# gets one build, a short warm grid scored against the 50K ground truth and 3 true-cold (C0) trials. The shipped setup
+# also builds on a shared partition and runs intent and fresh-clone cells, the setups that keep routing data get
+# disk-resident steady-state (C1) cells, and one config of each adapter gets a queries-per-second job at 4 threads. It
+# checks the code, not the machine, so its gate only warns and swap leaves points valid. Builds and the parallel setup
+# use 4 threads here, as the job gate allows.
+#
+# Every true-cold cell first searches a 5K dummy of its own config, as the full runs do with a 50K one. The cell on the
+# shared partition uses the dummy of the vpl160 build, since a dummy build takes no shared clusters.
+#
+# The shared partition is <stem>.centroids.fbin and <stem>.assign.ibin, eg. 312 k-means clusters of the 50K rows, made
+# before the batch.
+
+phase = "check-faiss"
+dataset = "cohere-768-cosine"
+n = 50000
+index_root = "data/bench.noindex/check-faiss"
+
+[gate]
+mode = "warn"
+top_samples = 2
+top_interval_s = 2
+invalid_vm = []
+
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+variant = "shipped"
+
+  [[system.build]]
+  config_id = "vpl160-rq1"
+  config = { vectors_per_list = 160, bits = 1 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "shared-k312-rq1"
+  config = { bits = 1 }
+  clusters = "data/bench.noindex/check-faiss/clusters/cohere-50k-k312"
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "vpl160-rq1"
+  split = "tune"
+  passes = 1
+  warmup = 200
+  grid = { nprobe = [8, 16, 32, 64], k_factor = [1, 2, 4], qb = [4, 8] }
+
+  [[system.warm]]
+  config_id = "shared-k312-rq1"
+  split = "tune"
+  passes = 1
+  warmup = 200
+  grid = { nprobe = [16, 32, 64], k_factor = [4] }
+
+  [[system.warm]]
+  config_id = "vpl160-rq1"
+  split = "tune"
+  threads = 4
+  qps_seconds = 3
+  qps_repeats = 1
+  warmup = 200
+  grid = { nprobe = [32], k_factor = [4] }
+
+  [[system.cold]]
+  config_id = "vpl160-rq1"
+  params = { nprobe = 32, k_factor = 4 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "shared-k312-rq1"
+  params = { nprobe = 32, k_factor = 4 }
+  trials = 3
+  dummy = "data/bench.noindex/check-faiss/faiss-ivf-shipped/vpl160-rq1-n50000-s1-dummy5000"
+
+  [[system.cold]]
+  config_id = "vpl160-rq1"
+  regime = "intent"
+  params = { nprobe = 32, k_factor = 4 }
+  trials = 2
+  delay_ms = 5
+
+  [[system.cold]]
+  config_id = "vpl160-rq1"
+  params = { nprobe = 32, k_factor = 4 }
+  trials = 2
+  fresh_clone = true
+  group = "clone"
+
+  [[system.cold]]
+  config_id = "vpl160-rq1"
+  regime = "c1"
+  params = { nprobe = 32, k_factor = 4 }
+  trials = 3
+  group = "live"
+
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+variant = "ondisk"
+
+  [[system.build]]
+  config_id = "vpl160-rq1"
+  config = { vectors_per_list = 160, bits = 1 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "vpl160-rq1"
+  split = "tune"
+  passes = 1
+  warmup = 200
+  grid = { nprobe = [16, 32, 64], k_factor = [4], prefetch_threads = [32] }
+
+  [[system.cold]]
+  config_id = "vpl160-rq1"
+  params = { nprobe = 32, k_factor = 4, prefetch_threads = 32 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "vpl160-rq1"
+  regime = "c1"
+  params = { nprobe = 32, k_factor = 4, prefetch_threads = 32 }
+  trials = 3
+  group = "live"
+
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+variant = "parallel"
+
+  [[system.build]]
+  config_id = "vpl160-rq1"
+  config = { vectors_per_list = 160, bits = 1 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "vpl160-rq1"
+  split = "tune"
+  passes = 1
+  warmup = 200
+  grid = { nprobe = [16, 32, 64], k_factor = [4] }
+
+  [[system.cold]]
+  config_id = "vpl160-rq1"
+  params = { nprobe = 32, k_factor = 4 }
+  trials = 3
+  threads = 4
+  dummy_n = 5000
+
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+variant = "graph"
+
+  [[system.build]]
+  config_id = "vpl160-rq1-hnsw32"
+  config = { vectors_per_list = 160, bits = 1 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "vpl160-rq1-hnsw32"
+  split = "tune"
+  passes = 1
+  warmup = 200
+  grid = { nprobe = [16, 32, 64], k_factor = [4], quantizer_ef = [64, 128] }
+
+  [[system.cold]]
+  config_id = "vpl160-rq1-hnsw32"
+  params = { nprobe = 32, k_factor = 4, quantizer_ef = 64 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "vpl160-rq1-hnsw32"
+  regime = "c1"
+  params = { nprobe = 32, k_factor = 4, quantizer_ef = 64 }
+  trials = 3
+  group = "live"
+
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+variant = "batched"
+
+  [[system.build]]
+  config_id = "vpl160-rq1"
+  config = { vectors_per_list = 160, bits = 1 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "vpl160-rq1"
+  split = "tune"
+  passes = 1
+  warmup = 200
+  grid = { nprobe = [16, 32, 64], k_factor = [4] }
+
+  [[system.cold]]
+  config_id = "vpl160-rq1"
+  params = { nprobe = 32, k_factor = 4 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "vpl160-rq1"
+  regime = "c1"
+  params = { nprobe = 32, k_factor = 4 }
+  trials = 3
+  group = "live"
+
+[[system]]
+name = "faiss-fastscan"
+adapter = "faiss_ivf"
+variant = "fastscan"
+
+  [[system.build]]
+  config_id = "vpl160-rq1"
+  config = { vectors_per_list = 160, bits = 1 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "vpl160-rq1"
+  split = "tune"
+  passes = 1
+  warmup = 200
+  grid = { nprobe = [16, 32, 64], k_factor = [4], qb = [8] }
+
+  [[system.cold]]
+  config_id = "vpl160-rq1"
+  params = { nprobe = 32, k_factor = 4, qb = 8 }
+  trials = 3
+  dummy_n = 5000
+
+[[system]]
+name = "faiss-hnsw"
+adapter = "faiss_hnsw"
+
+  [[system.build]]
+  config_id = "hnsw32-sq8"
+  config = { m = 32, storage = "sq8", ef_construction = 200 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "hnsw32-rq4-sq8"
+  config = { m = 32, storage = "rabitq", bits = 4, refine = "sq8", ef_construction = 200 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "hnsw32-flat"
+  config = { m = 32, storage = "flat", ef_construction = 200 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "hnsw32-sq8"
+  split = "tune"
+  passes = 1
+  warmup = 200
+  grid = { ef_search = [16, 32, 64, 128] }
+
+  [[system.warm]]
+  config_id = "hnsw32-rq4-sq8"
+  split = "tune"
+  passes = 1
+  warmup = 200
+  grid = { ef_search = [16, 32, 64, 128], k_factor = [1, 2, 4] }
+
+  [[system.warm]]
+  config_id = "hnsw32-flat"
+  split = "tune"
+  passes = 1
+  warmup = 200
+  grid = { ef_search = [16, 32, 64, 128] }
+
+  [[system.warm]]
+  config_id = "hnsw32-sq8"
+  split = "tune"
+  threads = 4
+  qps_seconds = 3
+  qps_repeats = 1
+  warmup = 200
+  grid = { ef_search = [64] }
+
+  [[system.cold]]
+  config_id = "hnsw32-sq8"
+  params = { ef_search = 64 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "hnsw32-rq4-sq8"
+  params = { ef_search = 64, k_factor = 2 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "hnsw32-flat"
+  params = { ef_search = 64 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "hnsw32-sq8"
+  regime = "c1"
+  params = { ef_search = 64 }
+  trials = 3
+  group = "live"

@@ -1,0 +1,99 @@
+# Every key a suite takes, with its default where it has one. Paths are relative to the repo unless absolute, and
+# $VARS and ~ expand. Unknown keys are errors.
+
+phase = "example"                     # results go to <results_root>/<phase>/<system>.jsonl
+dataset = "cohere-768-cosine"         # <data root>/<dataset>.base.fbin, .query.fbin and .gt.ibin
+n = 50000                             # the prefix every build and search uses, rows 0 to n of the base
+index_root = "data/bench.noindex/example"   # where builds go, default data/bench.noindex/<phase>
+results_root = "results/bench"
+seed = 1                              # seeds the random order of warm jobs and of cold cells in each round
+k = 10
+# truth = "data/cohere-768-cosine-50000.gt.ibin"  # default <dataset>.gt.ibin, or data/<dataset>-<n>.gt.ibin at a prefix
+max_attempts = 3                      # tries of a measurement that ends rejected, invalid or failed
+wait_s = 1.0                          # the pause between the two drops of a cold trial's files
+
+[gate]
+mode = "warn"                         # "enforce" waits for the gate and gives up after max_wait_s, "warn" or "off"
+cpu_idle_pct = 85
+top_samples = 3
+top_interval_s = 10
+disk_floor_gb = 40                    # GiB that stay free, checked before the batch and before each build
+max_wait_s = 3600
+recheck_s = 300
+require_ac = true
+require_caffeinate = true
+busy_names = ["cargo", "rustc"]
+locks = ""                            # the job gate's lock folder, which "enforce" needs. Empty means $COLDIVF_BENCH_LOCKS
+invalid_vm = ["swapins", "compressions"]   # machine counters whose change during a timed part makes it invalid
+
+[gate.agents]                         # endpoint agents whose CPU time each line records, as name = [patterns]
+falcon = ["crowdstrike", "Falcon.app"]
+fortidlp = ["FortiDLP"]
+ava = ["uk.ava.reveal", "/Ava/"]
+jamf = ["JAMF", "Jamf"]
+
+[refs]
+mode = "off"                          # "on" runs both references at the start and the end of the batch
+wave_trials = 30
+wave_ranges = 64
+wave_page = 16384
+wave_file = "data/bench.noindex/wave-1g.bin"
+wave_size_mb = 1024
+coldivf_index = "data/cohere-50k.coldivf"
+coldivf_dataset = "cohere-768-cosine"
+coldivf_n = 50000
+coldivf_params = { nprobe = 32, rerank = 39 }
+coldivf_trials = 30
+drift_pct = 10                        # a batch whose references move more than this from their median is flagged
+
+[[system]]
+name = "flat"                         # the results file and every line's system
+adapter = "flat"                      # adapters/flat.py, or a dotted module path such as tests.fake_adapter
+# python = "${COLDIVF_BENCH_VENVS}/venv-other/bin/python3"   # default: the driver's own interpreter
+variant = ""                          # a label that every line carries and every subcommand gets
+env = {}                              # extra environment for this system's processes
+
+  [[system.build]]
+  config_id = "exact"                 # names the build in warm and cold entries and in every line
+  config = {}                         # passed to the adapter's build as JSON
+  seeds = [1]                         # one build per seed
+  threads = 10
+  disk_gb = 1                         # the build's peak disk need, checked against the floor
+  timeout_s = 7200
+  # n = 50000                         # default: the suite's n
+  # index = "data/some-prebuilt-index"  # use an index that is already built instead
+  # clusters = "data/clusters/stem"     # shared clusters for the adapter to import
+
+  [[system.warm]]
+  config_id = "exact"
+  # seed = 1                          # which seed's build, default the first
+  split = "tune"                      # tune, test, all or rest
+  threads = 1                         # 1 times each query. More measures queries per second (QPS)
+  mode = "whole"
+  grid = { unused = [1] }             # the product of these lists, in order
+  # settings = [ { unused = 2 } ]     # and these settings after it
+  passes = 3
+  warmup = 1000
+  k = 10
+  qps_seconds = 10
+  qps_repeats = 3
+  timeout_s = 7200
+
+  [[system.cold]]
+  config_id = "exact"
+  regime = "c0"                       # c0, c1 or intent
+  params = {}
+  trials = 30
+  split = "test"
+  cpu_state = "prewarm"               # prewarm, idle or none
+  next = 9                            # queries after the first in each trial, default 0 for c1
+  delay_ms = 0                        # intent only, the time from the query text to the vector
+  threads = 1
+  group = "main"                      # cells of one group take turns, in a random order each round
+  dummy_n = 0                         # builds the same config at this n and searches it once before READY
+  # dummy = "data/bench.noindex/example/flat/exact-n1000-s1"   # or an index to use as the dummy
+  k = 10
+  self_evict = false                  # c1 only, asks the adapter to drop its own mappings too
+  fresh_clone = false                 # c0 and intent, runs each trial on a new clone of the index
+  timeout_s = 600
+  ready_timeout_s = 600

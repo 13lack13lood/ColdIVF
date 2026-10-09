@@ -1,0 +1,300 @@
+# A check of the LanceDB and Paimon adapters at 50K: their builds, short warm grids, and C0, C1 and intent trials. It
+# checks the code, not the machine, so its gate only warns. Run the driver with the main virtual environment's Python,
+# and set $COLDIVF_BENCH_VENVS to the folder that holds venv-lance13, the environment of lancedb 0.40 with pylance 13.
+# The 0.39 reference row and Paimon run on the driver's own interpreter.
+
+phase = "check-lance-paimon"
+dataset = "cohere-768-cosine"
+n = 50000
+index_root = "data/bench.noindex/check-lance-paimon"
+
+[gate]
+mode = "warn"
+top_samples = 2
+top_interval_s = 2
+invalid_vm = []
+
+# A Lance build's footprint grows with its threads and its ingest batches. The RaBitQ builds run at 1 thread with
+# batches of 16K rows, which keeps each 50K build below 1 GB. The PQ build trains for ~100 s at 4 threads.
+[[system]]
+name = "lancedb"
+adapter = "lancedb"
+python = "${COLDIVF_BENCH_VENVS}/venv-lance13/bin/python3"
+
+  [[system.build]]
+  config_id = "rq1-vpl160"
+  config = { index = "ivf_rq", bits = 1, vpl = 160, batch_rows = 16384 }
+  threads = 1
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "rq5-vpl160"
+  config = { index = "ivf_rq", bits = 5, vpl = 160, batch_rows = 16384 }
+  threads = 1
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "rq9-vpl160"
+  config = { index = "ivf_rq", bits = 9, vpl = 160, batch_rows = 16384 }
+  threads = 1
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "pq96-vpl160"
+  config = { index = "ivf_pq", num_sub_vectors = 96, vpl = 160 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "rq1-vpl160"
+  split = "tune"
+  passes = 2
+  warmup = 200
+  grid = { nprobes = [16, 32], refine_factor = [4] }
+  settings = [
+    { nprobes = 32, refine_factor = 4, approx_mode = "fast" },
+    { nprobes = 32, refine_factor = 4, query_parallelism = 0 },
+  ]
+
+  [[system.warm]]
+  config_id = "rq1-vpl160"
+  split = "tune"
+  threads = 4
+  warmup = 200
+  qps_seconds = 2
+  qps_repeats = 1
+  grid = { nprobes = [32], refine_factor = [4] }
+
+  [[system.warm]]
+  config_id = "rq5-vpl160"
+  split = "tune"
+  passes = 2
+  warmup = 200
+  grid = { nprobes = [16, 32] }
+
+  [[system.warm]]
+  config_id = "rq9-vpl160"
+  split = "tune"
+  passes = 2
+  warmup = 200
+  grid = { nprobes = [32] }
+
+  [[system.warm]]
+  config_id = "pq96-vpl160"
+  split = "tune"
+  passes = 2
+  warmup = 200
+  grid = { nprobes = [32], refine_factor = [4] }
+
+  # Lance's default compute pool is 10 threads on this 12-core Mac.
+  [[system.cold]]
+  config_id = "rq1-vpl160"
+  regime = "c0"
+  params = { nprobes = 32, refine_factor = 4 }
+  trials = 3
+  threads = 10
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "rq1-vpl160"
+  regime = "c0"
+  params = { nprobes = 32, refine_factor = 4, open = "lancedb" }
+  trials = 3
+  threads = 10
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "rq1-vpl160"
+  regime = "c0"
+  params = { nprobes = 32, refine_factor = 4 }
+  trials = 3
+  threads = 1
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "rq1-vpl160"
+  regime = "c0"
+  params = { nprobes = 32, refine_factor = 4, analyze = true }
+  trials = 1
+  next = 0
+  threads = 10
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "rq1-vpl160"
+  regime = "intent"
+  params = { nprobes = 32, refine_factor = 4 }
+  trials = 2
+  threads = 10
+  delay_ms = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "rq5-vpl160"
+  regime = "c0"
+  params = { nprobes = 32 }
+  trials = 3
+  threads = 10
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "rq9-vpl160"
+  regime = "c0"
+  params = { nprobes = 32 }
+  trials = 3
+  threads = 10
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "pq96-vpl160"
+  regime = "c0"
+  params = { nprobes = 32, refine_factor = 4 }
+  trials = 3
+  threads = 10
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "rq1-vpl160"
+  regime = "c1"
+  params = { nprobes = 32, refine_factor = 4 }
+  trials = 3
+  threads = 10
+  group = "live"
+
+[[system]]
+name = "lancedb"
+adapter = "lancedb"
+variant = "0.39"
+
+  [[system.build]]
+  config_id = "rq1-vpl160"
+  config = { index = "ivf_rq", bits = 1, vpl = 160, batch_rows = 16384 }
+  threads = 1
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "rq1-vpl160"
+  split = "tune"
+  passes = 2
+  warmup = 200
+  grid = { nprobes = [16, 32], refine_factor = [4] }
+
+  [[system.cold]]
+  config_id = "rq1-vpl160"
+  regime = "c0"
+  params = { nprobes = 32, refine_factor = 4 }
+  trials = 3
+  threads = 10
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "rq1-vpl160"
+  regime = "c1"
+  params = { nprobes = 32, refine_factor = 4 }
+  trials = 2
+  threads = 10
+  group = "live"
+
+[[system]]
+name = "paimon"
+adapter = "paimon"
+
+  [[system.build]]
+  config_id = "rq4-vpl160"
+  config = { bits = 4, vpl = 160 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "rq8-vpl160"
+  config = { bits = 8, vpl = 160 }
+  threads = 4
+  disk_gb = 1
+
+  # Probing all 312 lists gives the recall ceiling of the codes, since Paimon has no rerank.
+  [[system.warm]]
+  config_id = "rq4-vpl160"
+  split = "tune"
+  passes = 2
+  warmup = 200
+  grid = { nprobe = [16, 32, 64, 312] }
+
+  [[system.warm]]
+  config_id = "rq4-vpl160"
+  split = "tune"
+  threads = 4
+  warmup = 200
+  qps_seconds = 2
+  qps_repeats = 1
+  grid = { nprobe = [32] }
+
+  [[system.warm]]
+  config_id = "rq8-vpl160"
+  split = "tune"
+  passes = 2
+  warmup = 200
+  grid = { nprobe = [32, 64] }
+
+  [[system.cold]]
+  config_id = "rq4-vpl160"
+  regime = "c0"
+  params = { nprobe = 32 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "rq8-vpl160"
+  regime = "c0"
+  params = { nprobe = 32 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "rq4-vpl160"
+  regime = "intent"
+  params = { nprobe = 32 }
+  trials = 2
+  delay_ms = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "rq4-vpl160"
+  regime = "c1"
+  params = { nprobe = 32 }
+  trials = 3
+  group = "live"
+
+# The two other inputs read the default variant's build. Their dummies use the same config.
+[[system]]
+name = "paimon"
+adapter = "paimon"
+variant = "rdadvise"
+
+  [[system.build]]
+  config_id = "rq4-vpl160"
+  config = { bits = 4, vpl = 160 }
+  index = "data/bench.noindex/check-lance-paimon/paimon/rq4-vpl160-n50000-s1"
+
+  [[system.cold]]
+  config_id = "rq4-vpl160"
+  regime = "c0"
+  params = { nprobe = 32 }
+  trials = 3
+  dummy_n = 5000
+
+[[system]]
+name = "paimon"
+adapter = "paimon"
+variant = "serial"
+
+  [[system.build]]
+  config_id = "rq4-vpl160"
+  config = { bits = 4, vpl = 160 }
+  index = "data/bench.noindex/check-lance-paimon/paimon/rq4-vpl160-n50000-s1"
+
+  [[system.cold]]
+  config_id = "rq4-vpl160"
+  regime = "c0"
+  params = { nprobe = 32 }
+  trials = 3
+  dummy_n = 5000

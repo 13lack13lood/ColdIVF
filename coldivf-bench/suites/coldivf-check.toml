@@ -1,0 +1,68 @@
+# A quick check of the harness on ColdIVF at 50K: one build, a short warm grid, C0 and intent trials and both drift
+# references. It checks the code, not the machine, so its gate only warns.
+
+phase = "check"
+dataset = "cohere-768-cosine"
+n = 50000
+index_root = "data/bench.noindex/check"
+
+[gate]
+mode = "warn"
+top_samples = 2
+top_interval_s = 2
+invalid_vm = []
+
+[refs]
+mode = "on"
+wave_trials = 10
+coldivf_index = "data/cohere-50k.coldivf"
+coldivf_dataset = "cohere-768-cosine"
+coldivf_n = 50000
+coldivf_params = { nprobe = 32, rerank = 39 }
+coldivf_trials = 10
+
+[[system]]
+name = "coldivf"
+adapter = "coldivf"
+
+  [[system.build]]
+  config_id = "tl160"
+  config = { clustering = "two-level", vectors_per_list = 160 }
+  seeds = [7]
+  threads = 10
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "prebuilt"
+  index = "data/cohere-50k.coldivf"
+
+  [[system.warm]]
+  config_id = "tl160"
+  split = "tune"
+  grid = { nprobe = [16, 32], rerank = [39] }
+
+  [[system.cold]]
+  config_id = "tl160"
+  regime = "c0"
+  params = { nprobe = 32, rerank = 39 }
+  trials = 3
+
+  [[system.cold]]
+  config_id = "prebuilt"
+  regime = "c0"
+  params = { nprobe = 32, rerank = 39 }
+  trials = 3
+
+  [[system.cold]]
+  config_id = "tl160"
+  regime = "intent"
+  params = { nprobe = 32, rerank = 39 }
+  trials = 2
+  delay_ms = 5
+
+  [[system.cold]]
+  config_id = "tl160"
+  regime = "c1"
+  params = { nprobe = 32, rerank = 39 }
+  trials = 1
+  group = "live"

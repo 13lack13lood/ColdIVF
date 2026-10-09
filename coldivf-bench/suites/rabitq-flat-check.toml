@@ -1,0 +1,455 @@
+# A check of the RaBitQ-Library, turbovec and sqlite-vec adapters on the 50K prefix of the 1M dev set. Every config
+# gets a short warm grid and 3 true-cold (C0) trials, each system gets one queries-per-second job at 4 threads, and one
+# config of each gets intent cells and disk-resident steady-state (C1) cells. It checks the code, not the machine, so
+# its gate only warns and swap leaves points valid. Builds use 4 threads here, as the job gate allows.
+
+phase = "check-rabitq-flat"
+dataset = "cohere-768-cosine"
+n = 50000
+index_root = "data/bench.noindex/check-rabitq-flat"
+
+[gate]
+mode = "warn"
+top_samples = 2
+top_interval_s = 2
+invalid_vm = []
+
+[[system]]
+name = "rabitq-ivf"
+adapter = "rabitq_ivf"
+
+  [[system.build]]
+  config_id = "vpl160-b1"
+  config = { vectors_per_list = 160, bits = 1 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "vpl160-b3"
+  config = { vectors_per_list = 160, bits = 3 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "vpl160-b5"
+  config = { vectors_per_list = 160, bits = 5 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "vpl160-b7"
+  config = { vectors_per_list = 160, bits = 7 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "vpl160-b9"
+  config = { vectors_per_list = 160, bits = 9 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "vpl160-b32"
+  config = { vectors_per_list = 160, bits = 32 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "vpl160-b1"
+  split = "tune"
+  grid = { nprobe = [8, 16, 32, 64] }
+
+  [[system.warm]]
+  config_id = "vpl160-b3"
+  split = "tune"
+  grid = { nprobe = [8, 16, 32, 64] }
+
+  [[system.warm]]
+  config_id = "vpl160-b5"
+  split = "tune"
+  grid = { nprobe = [8, 16, 32, 64] }
+
+  [[system.warm]]
+  config_id = "vpl160-b7"
+  split = "tune"
+  grid = { nprobe = [8, 16, 32, 64] }
+
+  [[system.warm]]
+  config_id = "vpl160-b9"
+  split = "tune"
+  grid = { nprobe = [8, 16, 32, 64] }
+
+  [[system.warm]]
+  config_id = "vpl160-b32"
+  split = "tune"
+  grid = { nprobe = [8, 16, 32, 64] }
+
+  [[system.warm]]
+  config_id = "vpl160-b5"
+  split = "tune"
+  threads = 4
+  settings = [{ nprobe = 32 }]
+  qps_seconds = 2
+  qps_repeats = 1
+
+  [[system.cold]]
+  config_id = "vpl160-b1"
+  regime = "c0"
+  params = { nprobe = 32 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "vpl160-b3"
+  regime = "c0"
+  params = { nprobe = 32 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "vpl160-b5"
+  regime = "c0"
+  params = { nprobe = 32 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "vpl160-b7"
+  regime = "c0"
+  params = { nprobe = 32 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "vpl160-b9"
+  regime = "c0"
+  params = { nprobe = 32 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "vpl160-b32"
+  regime = "c0"
+  params = { nprobe = 32 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "vpl160-b5"
+  regime = "intent"
+  params = { nprobe = 32 }
+  trials = 2
+  next = 0
+  delay_ms = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "vpl160-b5"
+  regime = "c1"
+  params = { nprobe = 32 }
+  trials = 3
+  group = "live"
+
+[[system]]
+name = "rabitq-hnsw"
+adapter = "rabitq_hnsw"
+
+  [[system.build]]
+  config_id = "m16-b4"
+  config = { bits = 4, M = 16, ef_construction = 200 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "m16-b5"
+  config = { bits = 5, M = 16, ef_construction = 200 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "m16-b4"
+  split = "tune"
+  grid = { ef = [16, 32, 64, 128] }
+
+  [[system.warm]]
+  config_id = "m16-b5"
+  split = "tune"
+  grid = { ef = [16, 32, 64, 128] }
+
+  [[system.warm]]
+  config_id = "m16-b4"
+  split = "tune"
+  threads = 4
+  settings = [{ ef = 64 }]
+  qps_seconds = 2
+  qps_repeats = 1
+
+  [[system.cold]]
+  config_id = "m16-b4"
+  regime = "c0"
+  params = { ef = 64 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "m16-b5"
+  regime = "c0"
+  params = { ef = 64 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "m16-b4"
+  regime = "intent"
+  params = { ef = 64 }
+  trials = 2
+  next = 0
+  delay_ms = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "m16-b4"
+  regime = "c1"
+  params = { ef = 64 }
+  trials = 3
+  group = "live"
+
+[[system]]
+name = "symphonyqg"
+adapter = "symphonyqg"
+
+  [[system.build]]
+  config_id = "d32"
+  config = { degree = 32, ef_construction = 200 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "d32"
+  split = "tune"
+  grid = { ef = [16, 32, 64, 128] }
+
+  [[system.warm]]
+  config_id = "d32"
+  split = "tune"
+  threads = 4
+  settings = [{ ef = 64 }]
+  qps_seconds = 2
+  qps_repeats = 1
+
+  [[system.cold]]
+  config_id = "d32"
+  regime = "c0"
+  params = { ef = 64 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "d32"
+  regime = "intent"
+  params = { ef = 64 }
+  trials = 2
+  next = 0
+  delay_ms = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "d32"
+  regime = "c1"
+  params = { ef = 64 }
+  trials = 3
+  group = "live"
+
+[[system]]
+name = "turbovec"
+adapter = "turbovec"
+
+  [[system.build]]
+  config_id = "b2"
+  config = { bits = 2 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "b4"
+  config = { bits = 4 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "b2"
+  split = "tune"
+  settings = [{}]
+
+  [[system.warm]]
+  config_id = "b4"
+  split = "tune"
+  settings = [{}]
+
+  [[system.warm]]
+  config_id = "b4"
+  split = "tune"
+  threads = 4
+  settings = [{}]
+  qps_seconds = 2
+  qps_repeats = 1
+
+  [[system.cold]]
+  config_id = "b2"
+  regime = "c0"
+  params = {}
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "b4"
+  regime = "c0"
+  params = {}
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "b4"
+  regime = "intent"
+  params = {}
+  trials = 2
+  next = 0
+  delay_ms = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "b4"
+  regime = "c1"
+  params = {}
+  trials = 3
+  group = "live"
+
+[[system]]
+name = "sqlite-vec"
+adapter = "sqlite_vec"
+# An exact scan reads all 154 MB of float32 rows per query, so its warm runs are short.
+
+  [[system.build]]
+  config_id = "f32"
+  config = { codes = "f32", page_size = 16384 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "int8"
+  config = { codes = "int8", page_size = 16384 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "bit"
+  config = { codes = "bit", page_size = 16384 }
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "f32"
+  split = "tune"
+  settings = [{ codes = "f32" }]
+  warmup = 50
+  passes = 1
+
+  [[system.warm]]
+  config_id = "int8"
+  split = "tune"
+  grid = { codes = ["int8"], oversample = [1, 2, 4, 8] }
+  warmup = 50
+  passes = 1
+
+  [[system.warm]]
+  config_id = "bit"
+  split = "tune"
+  grid = { codes = ["bit"], oversample = [1, 2, 4, 8] }
+  warmup = 50
+  passes = 1
+
+  [[system.warm]]
+  config_id = "bit"
+  split = "tune"
+  threads = 4
+  settings = [{ codes = "bit", oversample = 8 }]
+  qps_seconds = 2
+  qps_repeats = 1
+
+  [[system.cold]]
+  config_id = "f32"
+  regime = "c0"
+  params = { codes = "f32" }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "int8"
+  regime = "c0"
+  params = { codes = "int8", oversample = 4 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "bit"
+  regime = "c0"
+  params = { codes = "bit", oversample = 8 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "int8"
+  regime = "intent"
+  params = { codes = "int8", oversample = 4 }
+  trials = 2
+  next = 0
+  delay_ms = 5
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "int8"
+  regime = "c1"
+  params = { codes = "int8", oversample = 4 }
+  trials = 3
+  group = "live"
+
+  # The same coarse scans with the float32 rows in an auxiliary column, which a coarse scan reads row by row.
+  [[system.build]]
+  config_id = "int8-aux"
+  config = { codes = "int8", page_size = 16384, rescore = "aux" }
+  threads = 4
+  disk_gb = 1
+
+  [[system.build]]
+  config_id = "bit-aux"
+  config = { codes = "bit", page_size = 16384, rescore = "aux" }
+  threads = 4
+  disk_gb = 1
+
+  [[system.warm]]
+  config_id = "int8-aux"
+  split = "tune"
+  grid = { codes = ["int8"], oversample = [1, 2, 4, 8] }
+  warmup = 50
+  passes = 1
+
+  [[system.warm]]
+  config_id = "bit-aux"
+  split = "tune"
+  grid = { codes = ["bit"], oversample = [1, 2, 4, 8] }
+  warmup = 50
+  passes = 1
+
+  [[system.cold]]
+  config_id = "int8-aux"
+  regime = "c0"
+  params = { codes = "int8", oversample = 4 }
+  trials = 3
+  dummy_n = 5000
+
+  [[system.cold]]
+  config_id = "bit-aux"
+  regime = "c0"
+  params = { codes = "bit", oversample = 8 }
+  trials = 3
+  dummy_n = 5000
