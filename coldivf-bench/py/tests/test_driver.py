@@ -362,6 +362,43 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(d.warmup_queries(cell), [29, 28, 27, 26, 25])
         self.assertIn("--warmup-queries", d.cold_args(cell, [1]))
 
+        # Nor does any trial of another cell on the index in the group search them. With 30 queries in blocks of 3, the
+        # cell of 3 trials takes the queries 0 to 8, and the cell of 9 trials the first of the blocks 4 to 8 and 0 to 3.
+        other = suite.cells[1]
+        cell.trials, cell.next = 3, 2
+        other.split, other.trials, other.next = "all", 9, 0
+        self.assertEqual(sorted({q for t in range(9) for q in d.trial_queries(other, t)}),
+                         [0, 3, 6, 9, 12, 15, 18, 21, 24])
+        self.assertEqual(d.warmup_queries(cell), [29, 28, 27, 26, 25, 23, 22, 20])
+
+    def test_cells_on_one_index_search_queries_of_their_own_in_each_round(self):
+        suite = driver.load_suite(write_suite(self.root))
+        d = driver.Driver(suite)
+        c0, intent, c1 = suite.cells
+        # The test split's queries are the odd ones. C0 and intent share the index in the main group, in blocks of 3
+        # positions. C0 takes the blocks 0, 1 and 2, and intent, with one query a trial, starts 2 blocks later.
+        self.assertEqual([d.trial_queries(c0, t) for t in range(3)], [[1, 3, 5], [7, 9, 11], [13, 15, 17]])
+        self.assertEqual([d.trial_queries(intent, t) for t in range(2)], [[13], [19]])
+        # C1 runs in a group of its own, so it takes the positions one after another.
+        self.assertEqual([d.trial_queries(c1, t) for t in range(3)], [[1], [3], [5]])
+
+        # Cells of as many trials search the same queries over them. In each round they search different ones, and
+        # neither searches one that the other searched in the round before, also once the trials outnumber the 5
+        # blocks that fit in the split.
+        for trials, queries in ((4, 12), (12, 15)):
+            intent.trials, intent.next, c0.trials = trials, 2, trials
+            a, b = ([set(d.trial_queries(c, t)) for t in range(trials)] for c in (c0, intent))
+            self.assertEqual(set().union(*a), set().union(*b))
+            self.assertEqual(len(set().union(*a)), queries)
+
+            for t in range(trials):
+                self.assertFalse(a[t] & b[t], (trials, t))
+                self.assertFalse(t and (a[t] & b[t - 1] or b[t] & a[t - 1]), (trials, t))
+
+        # A cell of another split takes that split's positions from the start, as a cell alone does.
+        intent.split = "tune"
+        self.assertEqual(d.trial_queries(intent, 0), [0, 2, 4])
+
     def test_a_build_of_its_own_n_is_scored_against_its_own_truth(self):
         rows = self.ds.prefix(1000)
         ids, _ = helpers.exact(np.asarray(rows), np.asarray(self.ds.queries), 100)

@@ -168,13 +168,20 @@ never hits.
 Query splits are fixed. Among the first 1,000 queries, even positions are `tune` and odd positions are `test`. `all` is
 every query and `rest` every query after the first 1,000.
 
+Each cold trial searches 1 + `next` queries of its cell's split, a block of positions of its own. The cells of a group
+that search one index with one split run their trials in the same rounds, so they take turns at the split's blocks, as
+`Driver.query_blocks` lays them out. In a round no two of them search the same query, and none searches one that
+another searched in the round before, since a search of pages that a search just read can come out faster, although
+none of them shows as cached. Cells that run as many trials, at least twice as many as there are cells, search the same
+queries over them, in another order.
+
 ## Cold Protocol
 
 **C0 (true cold).** Each trial is a fresh adapter process.
 1. The adapter imports its libraries, loads its queries, sets the user-interactive QoS class, searches the dummy index
    once if there is one, turns off Python's garbage collection, and sends `ready`. Its warm-up searches use the
-   queries of `--warmup-queries`, which no trial of the cell searches. They come from the other split of a tune or test
-   cell, so nothing a warm-up leaves in a cache can answer a timed query.
+   queries of `--warmup-queries`, which no trial on the cell's index in its group searches. They come from the other
+   split of a tune or test cell, so nothing a warm-up leaves in a cache can answer a timed query.
 2. The driver holds a mapping of every file of the index from the start of the group. It fsyncs each file, drops its
    pages with `MS_INVALIDATE` through those mappings, waits `wait_s`, drops them again and checks every page with
    `mincore`. Any cached page rejects the trial, and the driver tries again with a new process. The wait is 1.0 s by
@@ -196,11 +203,11 @@ clone is deleted after the trial. It is the control for files that were cached o
 counts. The counters cover the whole trial, the open and the wait included.
 
 **C1 (disk-resident steady state).** One adapter process per cell opens the index and runs one warm-up query before
-`ready`, then serves every trial of the cell. The warm-up query is one no trial of the cell searches. The cell's run
-keys name the index as it was before its process started, since a process that keeps a store open can change it. Before
-each trial the driver drops the whole pages of the ranges the adapter marked "bulk", and at most 0.5% of them may stay
-cached. Routing ranges stay as the system keeps them. The driver's drop reaches pages that a live process maps, so
-mapped systems need no help.
+`ready`, then serves every trial of the cell. The warm-up query is one no trial on the index in the group searches. The
+cell's run keys name the index as it was before its process started, since a process that keeps a store open can change
+it. Before each trial the driver drops the whole pages of the ranges the adapter marked "bulk", and at most 0.5% of them
+may stay cached. Routing ranges stay as the system keeps them. The driver's drop reaches pages that a live process maps,
+so mapped systems need no help.
 
 The CPU state step is "prewarm" by default, which spins as many cores as the trial's threads for 150 ms. "idle" sleeps
 200 ms instead, and "none" skips the step.
@@ -315,10 +322,10 @@ complete example in ~70 lines.
 
 `BuildContext` has `config`, `data_path`, `rows`, `out`, `clusters`, `threads`, `seed`, `metric`, `variant`, `dataset`,
 `data` and `dim`. `ServeContext` has `index`, `dataset`, `rows`, `k`, `metric`, `threads`, `variant`, `params`,
-`queries` (query vectors by id), `warmup` (the vectors of the warm-up queries), `regime`, `cpu_state`, `delay_ms`,
-`dummy`, `split` and `mode`. A class sets `workers` to name the threads the system runs besides the calling one, and
-`loads_at_open` when an open copies every file into memory. `self.variant` holds
-the variant before `load` runs. A hook raises `adapters.base.Unsupported` for something the system can't do.
+`queries` (query vectors by id), `warmup` (the vectors of the warm-up queries), `warmup_ids` (their ids), `regime`,
+`cpu_state`, `delay_ms`, `dummy`, `split` and `mode`. A class sets `workers` to name the threads the system runs besides
+the calling one, and `loads_at_open` when an open copies every file into memory. `self.variant` holds the variant before
+`load` runs. A hook raises `adapters.base.Unsupported` for something the system can't do.
 
 An adapter that drives an outside program, as `adapters/coldivf.py` does, overrides `run_build`, `cold_setup`,
 `cold_trial`, `cold_teardown` and `warm_run`, and runs the program with `self.run_child`, which stops it when the
@@ -341,34 +348,44 @@ Rules every adapter follows:
 ## ColdIVF Adapter
 
 `adapters/coldivf.py` runs `build_index`, `warm` and `cold` from `COLDIVF_BIN`. An index is a folder that holds one
-`.coldivf` file, or the file itself. The binaries take a dataset by name, so a split becomes a dataset under
-`data/splits/`, with a link to the base, the split's queries and the split's truth. Each cold trial is one
-`cold --one` run, which drops and checks the file's pages through its own mapping right before its timer and reports
-the trial rejected if any page was cached. Its `files` marks the header, rotation, centers and extents as routing, the
-codes, rows and ids as bulk, and watches the `.delta` and `.lock` files beside the index.
+`.coldivf` file, or the file itself. The binaries take a dataset by name. For `warm` a split becomes a dataset under
+`data/splits/`, with a link to the base, the split's queries and the split's truth. `cold` searches the dataset itself
+and takes each trial's queries by their ids. Its `files` marks the header, rotation, centers and extents as routing,
+the codes, rows and ids as bulk, and watches the `.delta` and `.lock` files beside the index.
 
-The binaries print no ids. Each split's truth gets a distances file beside it, `<split>.<name>[-<n>].gt.dist.fbin`, with
+Each C0 or intent trial is one `cold --one` run, a fresh process. With a dummy it first opens the dummy and searches it
+once with the cell's first warm-up query, with a search context of its own, so the timed search finds its code and its
+threads warm as other systems' do. It then drops the pages of the index and of the `.delta` and `.lock` files beside it
+through its own mappings, checks them right before its timer, and reports the trial rejected if any page was cached. It
+searches the trial's queries, then the first one again with its pages cached, which gives `resident_rerun_us`. In intent
+the vector arrives `delay_ms` after the timer starts, while the open and `prepare` run, and the search starts once both
+the vector is there and `prepare` is done. It waits for the vector as the base class does, and its counters cover the
+wait too. `total_us` is then the time from the vector's arrival to the ids, so open time past the delay counts, as for
+every other system. A C1 cell runs one `cold --one --c1` process for all its trials. It opens the index, searches the
+first warm-up query, which loads the cluster tables it then keeps, and runs each trial from a line of its input. Before
+each trial it drops the codes, rows and ids, and the timer covers the search alone. A C1 trial is rejected when more
+than 0.5% of those pages were still cached, as the driver allows. Its `footprint_before` is the process's footprint
+right before the search, which holds the cluster tables the process keeps, and `lifetime_max_footprint` the process's
+peak by the search's end. The adapter refuses a `cold` that predates all of this, since such a binary would search
+other queries than the trial's, or wait for the vector another way.
+
+`cold` prints each query's ids, so the driver scores ColdIVF's cold trials with the same recall code as every other
+system. Its own `recall10` counts ties the same way, from the base rows, and `recall10_ids_only` counts ids alone.
+`warm` prints no ids. Each split's truth gets a distances file beside it, `<split>.<name>[-<n>].gt.dist.fbin`, with
 each truth id's distance from its base row as the binaries measure it, minus the inner product for a cosine dataset and
 the squared Euclidean distance for an `-euclidean` one. With it `warm` counts ties, reports `ties` true, and the adapter
 takes recall@1, @10 and @100 and their percentiles from it, which `extra.recall_source` records. The binary counts a tie
 only at most as far as the true 10th distance, where the driver allows two float32 units, so at a near tie between rows
-that differ its recall can come out lower. `extra.near_ties` counts the split's queries with one. An older `warm`, and
-`cold` always, score recall by ids alone. That equals recall with ties wherever the truth has no tie at that rank, so
-then a recall field is filled only when no query of the split has one, and the binary's own values go under `extra`. A
-`warm` that takes `--mode t1`, passes and threads gets them from the adapter, which then fills p90 and QPS too. A warm
-line's `footprint` is the warm binary's whole process at its peak, read from its record after it exits.
+that differ its recall can come out lower. `extra.near_ties` counts the split's queries with one. An older `warm`
+scores recall by ids alone. That equals recall with ties wherever the truth has no tie at that rank, so then a recall
+field is filled only when no query of the split has one, and the binary's own values go under `extra`. A `warm` that
+takes `--mode t1`, passes and threads gets them from the adapter, which then fills p90 and QPS too. A warm line's
+`footprint` is the warm binary's whole process at its peak, read from its record after it exits.
 
-The binaries have no C1 mode, no dummy search in the timed process, no resident rerun, no CPU time per QoS class and no
-cluster import, so those report unsupported or null, and each trial's `extra` says `dummy_searched` and
-`rerun_measured` are false. They time each search inside their own process, around the library's call, so their
-per-call cost is 0. The binaries ignore flags they don't know, so the adapter refuses a build setting its
-`build_index` lacks, eg. `anchor` on an older build, rather than build the default.
-
-Intent counts the open time past the requested delay, as for every other system. The binary starts its gap only once
-`prepare` is done, though, and settling its counters stretches the gap by ~3 ms. So its search starts later than the
-vector would let it, and the cluster tables that `prepare` starts reading get that extra time in the background. Each
-intent trial reports that lateness as `extra.intent_search_late_us`, and `extra.intent_comparable` is false whenever it
-is above 0, which it is for every delay above 0.
+The binaries have no CPU time per QoS class and no cluster import, so those report unsupported or null. They time
+each search inside their own process, around the library's call, so their per-call cost is 0. The binaries ignore
+flags they don't know, so the adapter refuses a build setting its `build_index` lacks, eg. `anchor` on an older build,
+rather than build the default.
 
 ## LanceDB Adapter
 

@@ -1405,18 +1405,44 @@ class Driver:
                     gt=self.truth_record(job.build.n), overhead_us=self.overhead_of(job.system).get("overhead_us"))
         return line
 
+    def query_blocks(self, cell: Cell) -> tuple[int, int, int, int]:
+        """Where the trials of `cell` take their queries. The m cells of its group that search its index with its split
+        run their trials in the same rounds, so they share the split's positions, in blocks as wide as the widest of
+        their trials. The i-th cell's trial t takes block (t + i·d) mod b, where b is the number of blocks the cells go
+        through before they come back to the first, and d, b / m rounded down, spaces the cells evenly. b is their most
+        trials, or 2m for fewer, but at most the blocks that fit in the split. So in a round no two cells search the
+        same query while the split holds a block for each, and none searches one that another searched in the round
+        before while it holds two for each. Cells of as many trials, at least 2m, search the same queries over them.
+        It returns the block width, b, d and i."""
+        key = (cell.group, str(cell.build.index), cell.split)
+        cells = [c for c in self.suite.cells if (c.group, str(c.build.index), c.split) == key]
+        place = next((i for i, c in enumerate(cells) if c is cell), None)
+        cells, place = (cells, place) if place is not None else ([cell], 0)
+        width = max(1 + c.next for c in cells)
+        fit = max(1, len(data.split_ids(self.dataset.queries.shape[0], cell.split)) // width)
+        blocks = min(max(max(c.trials for c in cells), 2 * len(cells)), fit)
+        return width, blocks, max(1, blocks // len(cells)), place
+
     def trial_queries(self, cell: Cell, trial: int) -> list[int]:
-        """The queries of trial r, which are the split's query at position r and the next `cell.next` positions,
-        wrapping around."""
+        """The queries of trial r, 1 + `cell.next` positions from the start of the block that `query_blocks` gives
+        it."""
+        return self.queries_of(cell, range(trial, trial + 1))
+
+    def queries_of(self, cell: Cell, trials: range) -> list[int]:
+        """The queries of the trials `trials` of `cell`, one trial after another."""
         qids = data.split_ids(self.dataset.queries.shape[0], cell.split)
-        return [int(qids[(trial + j) % len(qids)]) for j in range(1 + cell.next)]
+        width, blocks, step, place = self.query_blocks(cell)
+        starts = [((t + place * step) % blocks) * width for t in trials]
+        return [int(qids[(s + j) % len(qids)]) for s in starts for j in range(1 + cell.next)]
 
     def warmup_queries(self, cell: Cell, count: int = WARMUP_QUERIES) -> list[int]:
-        """Queries for the searches a cell's process runs before READY, none of which any trial of the cell searches.
-        So a cache that a warm-up fills can't answer a timed query. They come from the other split of a tune or test
-        cell, and otherwise from the end of the cell's own split."""
+        """Queries for the searches a cell's process runs before READY, none of which any trial on the cell's index in
+        its group searches. So a cache that a warm-up fills can't answer a timed query. They come from the other split
+        of a tune or test cell, and otherwise from the end of the cell's own split."""
         total = self.dataset.queries.shape[0]
-        used = {q for trial in range(cell.trials) for q in self.trial_queries(cell, trial)}
+        index = (cell.group, str(cell.build.index))
+        near = [c for c in self.suite.cells if (c.group, str(c.build.index)) == index and c is not cell] + [cell]
+        used = {q for c in near for q in self.queries_of(c, range(c.trials))}
         other = {"tune": "test", "test": "tune"}.get(cell.split)
         own = data.split_ids(total, cell.split).tolist()[::-1]
         pool = (data.split_ids(total, other).tolist() if other else []) + own

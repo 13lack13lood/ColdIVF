@@ -1,9 +1,12 @@
+import json
 import os
 import struct
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -14,15 +17,52 @@ import data
 
 # The first query line and a later one of a real `cold --one` run, trimmed to the fields the adapter reads.
 FIRST = {
-    "seq": 0, "query": 5, "recall": 1, "pages_resident_at_start": 0, "ctx_us": 28.6, "open_us": 1879.3, "read_us": 0,
-    "prepare_us": 18.1, "gap_us": 0, "search_us": 2288.6, "total_us": 4186.0, "tables_us": 150.4, "route_us": 22.8,
-    "submit_us": 83.4, "wave_us": 348, "cluster_wave_us": 431.4, "scan_us": 36.5, "rows_us": 1638.2,
-    "rerank_us": 8.3, "post_embedding_us": 2287.6, "cluster_bytes": 983040, "cluster_ranges": 10,
-    "row_bytes": 589824, "row_ranges": 30, "footprint_delta": 1949744.0, "p_share": 0.99, "ghz": 3.6,
-    "open_p_share": 0.99, "open_ghz": 3.45, "energy_nj": 2523977, "pageins": 0, "disk_bytes": 1736704,
-    "syscall_open_us": 771.8, "qos": "user-interactive", "index_crc": 722862947, "index_epoch": 0,
+    "seq": 0, "query": 5, "recall": 0.9, "recall10": 1, "ids": [3, 1, 4, 1, 5, 9, 2, 6, 5, 3],
+    "pages_resident_at_start": 0, "pages_checked": 3, "ctx_us": 28.6, "open_us": 1879.3, "read_us": 0,
+    "prepare_us": 18.1, "gap_us": 0, "late_us": 1897.4, "search_us": 2288.6, "total_us": 4186.0,
+    "from_vector_us": 4190.0, "tables_us": 150.4, "route_us": 22.8, "submit_us": 83.4, "wave_us": 348,
+    "cluster_wave_us": 431.4, "scan_us": 36.5, "rows_us": 1638.2, "rerank_us": 8.3, "post_embedding_us": 2287.6,
+    "cluster_bytes": 983040, "cluster_ranges": 10, "row_bytes": 589824, "row_ranges": 30, "header_bytes": 16384,
+    "table_bytes": 147456, "footprint_delta": 1949744.0, "footprint_before": 9289728, "peak_footprint": 12697600,
+    "p_share": 0.99, "ghz": 3.6, "open_p_share": 0.99,
+    "open_ghz": 3.45, "energy_nj": 2523977, "pageins": 0, "disk_bytes": 1736704, "resident_rerun_us": 730.2,
+    "rerun_disk_bytes": 0, "dummy": None, "dummy_us": None, "warmup_query": 501, "syscall_open_us": 771.8,
+    "qos": "user-interactive", "index_crc": 722862947, "index_epoch": 0,
 }
-NEXT = {"seq": 1, "query": 6, "recall": 0.8, "open_us": 0, "prepare_us": 0, "search_us": 1817.0, "total_us": 1817.0}
+NEXT = {"seq": 1, "query": 6, "recall": 0.8, "recall10": 0.8, "open_us": 0, "prepare_us": 0, "search_us": 1817.0,
+        "total_us": 1817.0}
+
+# A stand-in for the cold binary. It writes its arguments to $FAKE_COLD_LOG, then prints a line for each query of a
+# trial, and with --c1 serves trials from its input until it reads stop. Its comment holds the text that shows the
+# adapter a cold binary of this harness.
+FAKE_COLD = """#!{python}
+# that the manifest or the dataset gives it
+import json, os, sys
+args = sys.argv[1:]
+if not args:
+    sys.exit(2)
+with open(os.environ["FAKE_COLD_LOG"], "a") as log:
+    log.write(json.dumps(args) + "\\n")
+def value(words, name):
+    return words[words.index(name) + 1]
+def trial(words):
+    for seq, q in enumerate(value(words, "--queries").split(",")):
+        print(json.dumps({{"seq": seq, "query": int(q), "trial": int(value(words, "--trial")), "open_us": 1.0,
+                          "prepare_us": 2.0, "search_us": 100.0 + seq, "total_us": 100.0 + seq,
+                          "from_vector_us": 100.0 + seq, "pages_resident_at_start": 0, "pages_checked": 30,
+                          "ids": [int(q)] * 10, "dummy": None}}), flush=True)
+if "--c1" in args:
+    print("warming", flush=True)
+    print(json.dumps({{"event": "ready", "warmup_us": 5.0}}), flush=True)
+    for line in sys.stdin:
+        if line.strip() == "stop":
+            break
+        with open(os.environ["FAKE_COLD_LOG"], "a") as log:
+            log.write(json.dumps(line.split()) + "\\n")
+        trial(line.split())
+else:
+    trial(args)
+"""
 
 
 def write_index(path: Path, sizes: list[int]) -> None:
@@ -98,55 +138,147 @@ class TrialTest(unittest.TestCase):
                             regime=regime)
 
     def test_c0_fields(self):
-        adapter = coldivf.ColdIVF()
-        adapter.tie_free = {5: True}
-        out = adapter.trial_fields(self.ctx(), [5, 6], [FIRST, NEXT])
+        out = coldivf.ColdIVF().trial_fields(self.ctx(), [5, 6], [FIRST, NEXT])
         self.assertAlmostEqual(out["open_us"], 1879.3 + 18.1)
         self.assertEqual(out["total_us"], 4186.0)
         self.assertEqual(out["next_us"], [1817.0])
-        self.assertEqual(out["recall10"], 1)
+        self.assertEqual(out["ids"], FIRST["ids"])
         self.assertEqual(out["stages"]["cluster_bytes"], 983040)
+        self.assertEqual(out["stages"]["table_bytes"], 147456)
         self.assertIsInstance(out["footprint_delta"], int)
+        self.assertEqual((out["footprint_before"], out["lifetime_max_footprint"]), (9289728, 12697600))
         self.assertNotIn("status", out)
 
-    def test_recall_needs_a_tie_free_truth(self):
-        adapter = coldivf.ColdIVF()
-        adapter.tie_free = {5: False}
-        out = adapter.trial_fields(self.ctx(), [5, 6], [FIRST, NEXT])
-        self.assertIsNone(out["recall10"])
-        self.assertEqual(out["recall10_ids_only"], 1)
-
-    def test_intent_counts_open_time_past_the_delay(self):
-        adapter = coldivf.ColdIVF()
-        ctx = self.ctx("intent")
-        ctx.delay_ms = 1.0
-        # The binary's gap overshoots the 1 ms asked for, and the open time past 1 ms counts all the same.
-        out = adapter.trial_fields(ctx, [5], [FIRST | {"gap_us": 3600.0}])
-        self.assertAlmostEqual(out["total_us"], (1879.3 + 18.1 - 1000.0) + 2288.6)
-        # The vector came while the open still ran, and the search started the whole gap after it.
-        self.assertAlmostEqual(out["extra"]["intent_search_late_us"], 3600.0)
-        self.assertFalse(out["extra"]["intent_comparable"])
-        ctx.delay_ms = 5.0
-        out = adapter.trial_fields(ctx, [5], [FIRST | {"gap_us": 7600.0}])
-        self.assertAlmostEqual(out["total_us"], 2288.6)
-        self.assertAlmostEqual(out["extra"]["intent_search_late_us"], 1879.3 + 18.1 + 7600.0 - 5000.0)
-        ctx.delay_ms = 0.0
-        out = adapter.trial_fields(ctx, [5], [FIRST])
-        self.assertAlmostEqual(out["total_us"], 1879.3 + 18.1 + 2288.6)
-        self.assertTrue(out["extra"]["intent_comparable"])
-
-    def test_what_the_binary_leaves_out_is_marked(self):
+    def test_recall_counts_ties_as_the_binary_does(self):
         out = coldivf.ColdIVF().trial_fields(self.ctx(), [5, 6], [FIRST, NEXT])
-        self.assertIsNone(out["resident_rerun_us"])
-        self.assertEqual((out["extra"]["dummy_searched"], out["extra"]["rerun_measured"]), (False, False))
+        self.assertEqual((out["recall10"], out["recall10_ids_only"]), (1, 0.9))
+        self.assertEqual(out["extra"]["next_recall10"], [0.8])
+        self.assertEqual(out["extra"]["recall_source"], "binary, with ties")
+
+    def test_intent_times_from_the_vector(self):
+        ctx = self.ctx("intent")
+        ctx.delay_ms = 5.0
+        line = FIRST | {"gap_us": 3000.0, "late_us": 4.0, "from_vector_us": 2292.6}
+        out = coldivf.ColdIVF().trial_fields(ctx, [5], [line])
+        # The binary's search starts when the vector arrives, so the time from then is its whole latency.
+        self.assertEqual(out["total_us"], 2292.6)
+        self.assertAlmostEqual(out["open_us"], 1879.3 + 18.1)
+        self.assertEqual(out["stages"]["late_us"], 4.0)
         self.assertNotIn("intent_comparable", out["extra"])
+
+    def test_c1_times_the_search_alone(self):
+        line = FIRST | {"open_us": None, "prepare_us": None, "read_us": None, "total_us": 2288.6}
+        out = coldivf.ColdIVF().trial_fields(self.ctx("c1"), [5], [line])
+        self.assertIn("c1", coldivf.ColdIVF().supported_regimes())
+        self.assertIsNone(out["open_us"])
+        self.assertEqual((out["total_us"], out["search_us"]), (2288.6, 2288.6))
+        # The process's footprint before the search holds the cluster tables it keeps.
+        self.assertEqual(out["footprint_before"], 9289728)
+        self.assertNotIn("status", out)
+
+    def test_the_dummy_and_the_rerun_are_reported(self):
+        out = coldivf.ColdIVF().trial_fields(self.ctx(), [5, 6], [FIRST | {"dummy": "d.coldivf", "dummy_us": 9.0}])
+        self.assertEqual(out["resident_rerun_us"], 730.2)
+        self.assertEqual((out["extra"]["dummy_searched"], out["extra"]["dummy_us"]), (True, 9.0))
+        self.assertEqual(out["extra"]["rerun_disk_bytes"], 0)
+        self.assertFalse(coldivf.ColdIVF().trial_fields(self.ctx(), [5], [FIRST])["extra"]["dummy_searched"])
 
     def test_the_binaries_carry_no_per_call_cost(self):
         self.assertEqual(coldivf.ColdIVF().run_overhead(None)["overhead_us"], 0.0)
 
     def test_cached_pages_reject_the_trial(self):
-        out = coldivf.ColdIVF().trial_fields(self.ctx(), [5], [FIRST | {"pages_resident_at_start": 3}])
+        out = coldivf.ColdIVF().trial_fields(self.ctx(), [5], [FIRST | {"pages_resident_at_start": 1}])
         self.assertEqual(out["status"], "rejected")
+        # C1 allows 0.5% of the bulk pages to stay cached, as the driver does.
+        line = FIRST | {"pages_checked": 1000}
+        c1 = coldivf.ColdIVF().trial_fields(self.ctx("c1"), [5], [line | {"pages_resident_at_start": 5}])
+        self.assertNotIn("status", c1)
+        c1 = coldivf.ColdIVF().trial_fields(self.ctx("c1"), [5], [line | {"pages_resident_at_start": 6}])
+        self.assertEqual(c1["status"], "rejected")
+
+
+class ColdCommandTest(unittest.TestCase):
+    """The adapter's cold processes, run against a stand-in for the binary."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.ds = helpers.make_dataset(self.root / "data", n=200, nq=20)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        cold = self.bin / "cold"
+        cold.write_text(FAKE_COLD.format(python=sys.executable))
+        cold.chmod(0o755)
+        self.log = self.root / "log.jsonl"
+        self.env = mock.patch.dict(os.environ, {"FAKE_COLD_LOG": str(self.log)})
+        self.env.start()
+        self.bins = mock.patch.object(coldivf, "BIN", self.bin)
+        self.bins.start()
+        for folder in ("index", "dummy"):
+            (self.root / folder).mkdir()
+            write_index(self.root / folder / "i.coldivf", [4096, 12288, 16384])
+
+    def tearDown(self):
+        self.bins.stop()
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def ctx(self, regime: str, **more) -> ServeContext:
+        ctx = ServeContext(index=self.root / "index", dataset=self.ds, rows=200, k=10, metric="cosine", threads=1,
+                           variant="", regime=regime, params={"nprobe": 32, "rerank": 39}, warmup_ids=[17, 19],
+                           cpu_state="idle")
+        for key, value in more.items():
+            setattr(ctx, key, value)
+        return ctx
+
+    def logged(self) -> list[list[str]]:
+        return [json.loads(x) for x in self.log.read_text().splitlines()]
+
+    @staticmethod
+    def value(args: list[str], name: str) -> str:
+        return args[args.index(name) + 1]
+
+    def test_a_c0_trial_searches_its_own_queries_after_the_dummy(self):
+        adapter, ctx = coldivf.ColdIVF(), self.ctx("c0", dummy=self.root / "dummy")
+        adapter.cold_setup(ctx)
+        out = adapter.cold_trial(ctx, {"trial": 3, "queries": [5, 6, 7]})
+        args = self.logged()[-1]
+        self.assertEqual((self.value(args, "--trial"), self.value(args, "--queries")), ("3", "5,6,7"))
+        self.assertEqual((self.value(args, "--warmup-query"), self.value(args, "--gap-ms")), ("17", "0.0"))
+        self.assertEqual(self.value(args, "--dummy"), str(self.root / "dummy" / "i.coldivf"))
+        self.assertEqual((self.value(args, "--dataset"), self.value(args, "--variant")), (self.ds.name, "idle"))
+        self.assertEqual((self.value(args, "--nprobe"), self.value(args, "--rerank")), ("32", "39"))
+        self.assertNotIn("--c1", args)
+        self.assertEqual((out["total_us"], out["next_us"], out["ids"]), (100.0, [101.0, 102.0], [5] * 10))
+
+    def test_an_intent_trial_gets_its_delay(self):
+        adapter, ctx = coldivf.ColdIVF(), self.ctx("intent", delay_ms=2.5)
+        adapter.cold_setup(ctx)
+        adapter.cold_trial(ctx, {"trial": 0, "queries": [4]})
+        args = self.logged()[-1]
+        self.assertEqual(self.value(args, "--gap-ms"), "2.5")
+        self.assertNotIn("--dummy", args)
+
+    def test_a_c1_cell_serves_every_trial_from_one_process(self):
+        adapter, ctx = coldivf.ColdIVF(), self.ctx("c1")
+        adapter.cold_setup(ctx)
+        server = adapter.server
+        first = adapter.cold_trial(ctx, {"trial": 0, "queries": [1, 2], "self_evict": False})
+        second = adapter.cold_trial(ctx, {"trial": 1, "queries": [3]})
+        self.assertEqual((first["ids"], first["next_us"], second["ids"]), ([1] * 10, [101.0], [3] * 10))
+        self.assertIsNone(first["open_us"])
+        adapter.cold_teardown(ctx)
+        self.assertEqual(server.returncode, 0)
+        self.assertNotIn(server, adapter.children)
+        start, *trials = self.logged()
+        self.assertIn("--c1", start)
+        self.assertEqual(self.value(start, "--warmup-query"), "17")
+        self.assertEqual(trials, [["--trial", "0", "--queries", "1,2"], ["--trial", "1", "--queries", "3"]])
+
+    def test_a_cold_binary_without_lists_of_queries_is_refused(self):
+        (self.bin / "cold").write_text("#!/bin/sh\nexit 2\n")
+        with self.assertRaises(RuntimeError):
+            coldivf.ColdIVF().cold_setup(self.ctx("c0"))
 
 
 class WarmFieldsTest(unittest.TestCase):

@@ -1,16 +1,20 @@
 """ColdIVF through its release binaries build_index, warm and cold, from $COLDIVF_BIN or target/mine/release.
 
-The binaries take a dataset by name and find its files through $COLDIVF_DATA. A tune or test split becomes a dataset
-of its own under data/splits/, with a link to the base, the split's queries, and the split's ground truth with its
-distances, so the binaries see the split's queries in order. The binaries print no ids. warm counts ties when the
-distances are there, which gives the same recall the driver computes for every other system. cold reports recall by
-ids alone, so a trial's recall10 is filled only for a query whose truth has no tie at rank 10, where the two are equal.
+The binaries take a dataset by name and find its files through $COLDIVF_DATA. For warm, a tune or test split becomes a
+dataset of its own under data/splits/, with a link to the base, the split's queries, and the split's ground truth with
+its distances, so warm sees the split's queries in order. warm counts ties when the distances are there, which gives
+the same recall the driver computes for every other system.
 
-Each cold trial runs `cold --one`, a fresh process that maps the index once, drops its pages through that mapping,
-waits for anything that reads them back, and checks them right before its timer. It times Index::open, prepare and the
-search of the first query, then searches the next queries without dropping anything. A trial whose own check finds a
-cached page comes back rejected. C1, a dummy search in the timed process and a rerun of the first query need modes the
-binaries don't have yet. The binaries time each search inside their own process, so their per-call cost is 0.
+cold searches the dataset itself, and takes each trial's queries by their ids. A C0 or intent trial is one
+`cold --one` run, a fresh process that first searches the cell's dummy index once, if it has one. It maps the index
+once, drops its pages through that mapping, waits for anything that reads them back, and checks them right before its
+timer. It times Index::open, prepare and the search of the first query, searches the next queries without dropping
+anything, then the first query again with its pages cached. In intent the vector arrives delay_ms after the timer
+starts, and the binary times the search from then. A C1 cell runs one `cold --one --c1` process. It opens the index,
+searches the cell's warm-up query, which loads the cluster tables it then keeps, and runs each trial from a line of its
+input. The binary prints each query's ids, so the driver scores ColdIVF with the same recall code as every other
+system. A trial whose own check finds cached pages comes back rejected. The binaries time each search inside their own
+process, so their per-call cost is 0.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import os
 import platform
 import struct
 import subprocess
+import sys
 import tempfile
 import tomllib
 from pathlib import Path
@@ -43,6 +48,14 @@ SEARCH_FLAGS = {"nprobe": "--nprobe", "rerank": "--rerank", "reach": "--reach"}
 # Build settings that only some builds of build_index take, with the text that shows a binary takes it. The binaries
 # ignore flags they don't know, so a setting a binary lacks would build the default without a word.
 NEWER_BUILD_FLAGS = {"anchor": b"--anchor must"}
+
+# The text of an error message that only a cold binary of this harness holds, one that checks each index file's vector
+# count, waits for the vector as the other systems do and reports its footprints. An older binary would search other
+# queries than the trial's, or wait for the vector another way, without a word.
+COLD_MARKER = b"that the manifest or the dataset gives it"
+
+# The share of a C1 trial's bulk pages that may still be cached when its timer starts, as the driver allows.
+C1_CACHED = 0.005
 
 # The index file's header holds a table of 7 sections at byte 80, each an offset, a length, a kind and a checksum.
 SECTIONS = ("header", "rotation", "centers", "extents", "codes", "rows", "ids")
@@ -198,16 +211,15 @@ def _crate_version() -> str:
 class ColdIVF(Adapter):
     system = "coldivf"
     binding = "cli"
-    regimes = ("c0", "intent")
+    regimes = ("c0", "c1", "intent")
     # A cold search reads in F_RDADVISE waves from the calling thread, so it runs no read threads.
     workers = ""
 
     def __init__(self) -> None:
         super().__init__()
-        self.positions: dict[int, int] = {}
-        self.split: tuple[Path, str] | None = None
         self.file: Path | None = None
-        self.tie_free: dict[int, bool] = {}
+        # The C1 process of a C1 cell.
+        self.server: subprocess.Popen | None = None
 
     def binary(self, name: str) -> Path:
         path = BIN / name
@@ -286,11 +298,6 @@ class ColdIVF(Adapter):
             out.append({"path": str(side), "bytes": n, "ranges": ranges})
 
         return out
-
-    def _tie_free(self, ds: data.Dataset, n: int, qids: list[int]) -> dict[int, bool]:
-        recall = data.Recall(ds, ds.truth(n))
-        free = recall.tie_free(np.asarray(qids), 10)
-        return {int(q): bool(f) for q, f in zip(qids, free)}
 
     def warm_run(self, ctx: ServeContext, grid: list[dict], qids: np.ndarray, ids_dir: Path, passes: int,
                  warmup: int, qps_seconds: float, qps_repeats: int) -> Iterator[dict]:
@@ -371,93 +378,154 @@ class ColdIVF(Adapter):
                            "dirty": line.get("dirty")}
         return fields
 
+    def cold_binary(self) -> Path:
+        """The cold binary, which must be one of this harness."""
+        cold = self.binary("cold")
+
+        if not offers(cold, COLD_MARKER):
+            raise RuntimeError(f"{cold} is older than this adapter. Build it again with cargo build --release -p "
+                               f"coldivf-bench --target-dir target/mine")
+
+        return cold
+
+    def cold_command(self, ctx: ServeContext) -> list[str]:
+        """What every cold process of a cell starts with."""
+        cmd = [str(self.cold_binary()), "--one", "--index", str(self.file), "--dataset", ctx.dataset.name, "--n",
+               str(ctx.rows), "--k", str(ctx.k), "--mode", "wave", "--variant",
+               "idle" if ctx.cpu_state == "idle" else "prewarm", *flags(ctx.params, SEARCH_FLAGS, "search setting")]
+
+        # The warm-up query is one that no trial of the cell searches.
+        if ctx.warmup_ids:
+            cmd += ["--warmup-query", str(ctx.warmup_ids[0])]
+
+        return cmd
+
     def cold_setup(self, ctx: ServeContext) -> None:
-        with open(self.binary("cold"), "rb") as f:
+        cold = self.cold_binary()
+
+        with open(cold, "rb") as f:
             f.read()
 
-        self.split = split_dataset(ctx.dataset, ctx.rows, ctx.split)
-        qids = data.split_ids(ctx.dataset.queries.shape[0], ctx.split)
-        self.positions = {int(q): i for i, q in enumerate(qids)}
         self.file = index_file(ctx.index)
-        self.tie_free = self._tie_free(ctx.dataset, ctx.rows, list(ctx.queries)[:1])
-        # A failed start loads the binary and its libraries, the way a dummy search warms an in-process library.
-        subprocess.run([str(self.binary("cold"))], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        if ctx.regime == "c1":
+            self.server = self.start_server(ctx)
+        else:
+            # A failed start loads the binary and its libraries before the timed process starts.
+            subprocess.run([str(cold)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def start_server(self, ctx: ServeContext) -> subprocess.Popen:
+        """Starts the cell's C1 process and waits until it has warmed its index."""
+        proc = subprocess.Popen(self.cold_command(ctx) + ["--c1"], env=self.env(ctx.dataset.root),
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr)
+        self.children.add(proc)
+        ready = self.server_line(proc)
+
+        if ready.get("event") != "ready":
+            raise RuntimeError(f"cold --c1 said {ready} instead of that it is ready")
+
+        return proc
+
+    def server_line(self, proc: subprocess.Popen) -> dict:
+        """The next JSON line of the C1 process `proc`."""
+        while True:
+            raw = proc.stdout.readline()
+
+            if not raw:
+                raise RuntimeError(f"cold --c1 ended with status {proc.wait()}")
+
+            if raw.startswith(b"{"):
+                return json.loads(raw)
 
     def cold_teardown(self, ctx: ServeContext) -> None:
-        pass
+        proc, self.server = self.server, None
+
+        if proc is None:
+            return
+
+        try:
+            proc.stdin.write(b"stop\n")
+            proc.stdin.close()
+        except OSError:
+            pass
+
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+        proc.stdout.close()
+        self.children.discard(proc)
 
     def cold_trial(self, ctx: ServeContext, go: dict) -> dict:
-        root, name = self.split
         queries = [int(q) for q in go["queries"]]
-        positions = [self.positions[q] for q in queries]
-        size = len(self.positions)
+        trial, ids = str(int(go.get("trial") or 0)), ",".join(str(q) for q in queries)
 
-        if any((positions[0] + j) % size != p for j, p in enumerate(positions)):
-            raise ValueError("a trial's queries must follow each other in the split")
+        if ctx.regime == "c1":
+            self.server.stdin.write(f"--trial {trial} --queries {ids}\n".encode())
+            self.server.stdin.flush()
+            lines = [self.server_line(self.server) for _ in queries]
+        else:
+            delay = ctx.delay_ms if ctx.regime == "intent" else 0.0
+            cmd = self.cold_command(ctx) + ["--trial", trial, "--queries", ids, "--gap-ms", str(delay)]
 
-        cmd = [str(self.binary("cold")), "--one", "--index", str(self.file), "--dataset", name, "--n", str(ctx.rows),
-               "--k", str(ctx.k), "--first", str(positions[0]), "--trial", "0", "--per-trial", str(len(queries)),
-               "--mode", "wave", "--variant", "idle" if ctx.cpu_state == "idle" else "prewarm",
-               "--gap-ms", str(int(round(ctx.delay_ms))), *flags(ctx.params, SEARCH_FLAGS, "search setting")]
-        done = self.run_child(cmd, env=self.env(root), timeout=600)
+            if ctx.dummy is not None:
+                cmd += ["--dummy", str(index_file(ctx.dummy))]
 
-        if done.returncode != 0:
-            raise RuntimeError(f"cold exited with {done.returncode}")
+            done = self.run_child(cmd, env=self.env(ctx.dataset.root), timeout=600)
 
-        lines = sorted((json.loads(x) for x in done.stdout.decode().splitlines() if x.startswith("{")),
-                       key=lambda x: x["seq"])
-        return self.trial_fields(ctx, queries, lines)
+            if done.returncode != 0:
+                raise RuntimeError(f"cold exited with {done.returncode}")
+
+            lines = [json.loads(x) for x in done.stdout.decode().splitlines() if x.startswith("{")]
+
+        return self.trial_fields(ctx, queries, sorted(lines, key=lambda x: x["seq"]))
 
     def trial_fields(self, ctx: ServeContext, queries: list[int], lines: list[dict]) -> dict:
         """The cold fields of one trial from the binary's lines, one per query."""
         first = lines[0]
-        before = first["open_us"] + first.get("read_us", 0) + first["prepare_us"]
-        total = first["total_us"]
-        intent: dict[str, Any] = {}
-
-        if ctx.regime == "intent":
-            # The vector is ready delay_ms after the open starts, so open time past that counts, as for every other
-            # system. The binary starts its gap only once prepare is done, and settling its counters stretches the gap
-            # by a few milliseconds. So its search starts later than the vector would let it, and the cluster tables
-            # that prepare starts reading get that much longer in the background.
-            delay_us = ctx.delay_ms * 1e3
-            total = max(0.0, before - delay_us) + first["search_us"]
-            late = before + first.get("gap_us", 0.0) - max(before, delay_us)
-            intent = {"intent_search_late_us": late, "intent_comparable": late <= 0}
-
-        stage_keys = ("ctx_us", "read_us", "prepare_us", "gap_us", "tables_us", "buffers_us", "route_us", "submit_us",
-                      "wave_us", "cluster_wave_us", "scan_us", "rows_us", "rerank_us", "post_embedding_us",
-                      "cluster_bytes", "cluster_ranges", "row_bytes", "row_ranges")
-        cached = int(first.get("pages_resident_at_start") or 0)
-        q0 = queries[0]
+        # C1 times the search alone. Intent times from the vector's arrival, so the open time past the delay counts,
+        # as for every other system.
+        before = None if ctx.regime == "c1" else first["open_us"] + first.get("read_us", 0) + first["prepare_us"]
+        total = first["from_vector_us"] if ctx.regime == "intent" else first["total_us"]
+        stage_keys = ("ctx_us", "read_us", "prepare_us", "gap_us", "late_us", "tables_us", "buffers_us", "route_us",
+                      "submit_us", "wave_us", "cluster_wave_us", "scan_us", "rows_us", "rerank_us",
+                      "post_embedding_us", "cluster_bytes", "cluster_ranges", "row_bytes", "row_ranges",
+                      "header_bytes", "table_bytes")
+        cached, checked = int(first.get("pages_resident_at_start") or 0), int(first.get("pages_checked") or 0)
+        ids = first.get("ids")
         out: dict[str, Any] = {
             "open_us": before,
             "search_us": first["search_us"],
             "total_us": total,
             "next_us": [x["search_us"] for x in lines[1:]],
-            "resident_rerun_us": None,
-            "stages": {k: first[k] for k in stage_keys if k in first},
+            "resident_rerun_us": first.get("resident_rerun_us"),
+            "ids": [int(i) for i in ids] if isinstance(ids, list) else None,
+            "stages": {k: first[k] for k in stage_keys if first.get(k) is not None},
             "disk_bytes": first.get("disk_bytes"),
             "pageins": first.get("pageins"),
+            # A C1 process's footprint before the search holds the state it keeps, eg. its cluster tables.
+            "footprint_before": first.get("footprint_before"),
             "footprint_delta": int(first["footprint_delta"]) if first.get("footprint_delta") is not None else None,
+            "lifetime_max_footprint": first.get("peak_footprint"),
             "p_share": first.get("p_share"),
             "ghz": first.get("ghz"),
             "energy_nj": first.get("energy_nj"),
             "qos": first.get("qos"),
+            # The binary counts ties as the driver does, which recomputes both from the ids.
             "recall10_ids_only": first.get("recall") if ctx.k == 10 else None,
-            "recall10": first.get("recall") if ctx.k == 10 and self.tie_free.get(q0) else None,
-            "extra": {k: first.get(k) for k in ("pages_resident_at_start", "syscall_open_us", "open_p_share",
-                                                "open_ghz", "index_crc", "index_epoch", "load_1")}
-            | {"next_recall_ids_only": [x.get("recall") for x in lines[1:]], "recall_source": "binary, ids only",
-               # The binary searches no dummy index in its timed process and doesn't rerun the first query.
-               "dummy_searched": False, "rerun_measured": False} | intent,
+            "recall10": first.get("recall10"),
+            "extra": {k: first.get(k) for k in ("pages_resident_at_start", "pages_checked", "syscall_open_us",
+                                                "open_p_share", "open_ghz", "index_crc", "index_epoch", "load_1",
+                                                "rerun_disk_bytes", "dummy_us", "warmup_query")}
+            | {"next_recall10": [x.get("recall10") for x in lines[1:]],
+               "next_recall_ids_only": [x.get("recall") for x in lines[1:]], "recall_source": "binary, with ties",
+               "dummy_searched": first.get("dummy") is not None, "rerun_measured": True},
         }
 
-        if isinstance(first.get("ids"), list):
-            out["ids"] = first["ids"]
-
-        if cached:
-            out.update(status="rejected", error=f"the binary found {cached} pages cached at its timer")
+        if cached > (C1_CACHED * checked if ctx.regime == "c1" else 0):
+            out.update(status="rejected", error=f"the binary found {cached} of {checked} pages cached at its timer")
 
         return out
 

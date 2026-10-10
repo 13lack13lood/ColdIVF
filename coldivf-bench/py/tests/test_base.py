@@ -133,6 +133,23 @@ class HelpersTest(unittest.TestCase):
         cell.warmup = []
         self.assertEqual(float(Recorder().warmup_query(cell)[0]), 1.0)
 
+    def test_cold_hands_the_warm_up_ids_to_the_adapter(self):
+        class Seen(base.Adapter):
+            def cold_setup(self, ctx):
+                self.seen = (ctx.warmup_ids, [float(v[0]) for v in ctx.warmup])
+                raise base.Unsupported("seen")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ds = helpers.make_dataset(Path(tmp), n=200, nq=10)
+            args = base._parser().parse_args(["cold", "--data", str(ds.base_path), "--rows", "200", "--index", tmp,
+                                              "--queries", "1", "--warmup-queries", "4,5"])
+            adapter = Seen()
+
+            with self.assertRaises(base.Unsupported):
+                base._cold(adapter, args, None, ds)
+
+            self.assertEqual(adapter.seen, ([4, 5], [float(ds.queries[4][0]), float(ds.queries[5][0])]))
+
     def test_wait_until_never_ends_early(self):
         for spin in (False, True):
             deadline = base.now_ns() + 20_000_000

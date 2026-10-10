@@ -199,7 +199,7 @@ class BuildContext:
 class ServeContext:
     """What a warm run or a cold trial gets. `params` holds the search settings, and `queries` the query vectors by
     query id. `warmup` holds the vectors of the queries a cold process searches before READY, which no trial of its cell
-    times."""
+    times, and `warmup_ids` their ids."""
 
     index: Path
     dataset: data.Dataset
@@ -218,6 +218,7 @@ class ServeContext:
     mode: str = "whole"
     handle: Any = None
     warmup: list[np.ndarray] = field(default_factory=list)
+    warmup_ids: list[int] = field(default_factory=list)
 
 
 def read_except(path: Path | str, skip: list[tuple[int, int]], chunk: int = 1 << 24) -> int:
@@ -932,7 +933,8 @@ def _cold(adapter: Adapter, args: argparse.Namespace, wire: Wire, dataset: data.
     ctx.regime, ctx.cpu_state, ctx.delay_ms, ctx.split = args.regime, args.cpu_state, args.delay_ms, args.split
     ctx.dummy = Path(args.dummy) if args.dummy else None
     ctx.queries = _queries(dataset, [int(q) for q in args.queries.split(",") if q.strip()])
-    ctx.warmup = list(_queries(dataset, [int(q) for q in args.warmup_queries.split(",") if q.strip()]).values())
+    ctx.warmup_ids = [int(q) for q in args.warmup_queries.split(",") if q.strip()]
+    ctx.warmup = list(_queries(dataset, ctx.warmup_ids).values())
     rusage.set_interactive()
     adapter.cold_setup(ctx)
     gc.collect()
