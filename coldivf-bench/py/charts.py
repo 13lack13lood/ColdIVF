@@ -85,6 +85,17 @@ CELLS = {
 
 CPU_STATES = {"prewarm": "prewarmed core", "idle": "idle core"}
 
+# The quiet run's jobs that time ColdIVF through its own cold binary: the job, the chart group, the read mode and the
+# row's label. The read waves are ColdIVF's own path. The rest show how its first query changes with what came before
+# it or how it reads, and the controls read the same file another way.
+OWN_SCENARIOS = (
+    ("a3-m1a", "coldivf", "wave", "ColdIVF, own harness, {state}"),
+    ("a4-m1a-dummy", "coldivf", "wave", "ColdIVF after a search of another index, {state}"),
+    ("a8-controls", "coldivf", "pool", "ColdIVF with thread-pool reads, {state}"),
+    ("a8-controls", "control", "blocking", "ColdIVF's file read whole at open, {state} (control)"),
+    ("a5-mapped", "control", "mapped", "ColdIVF's file, lazily mapped, {state} (control)"),
+)
+
 # A line of the quiet runner's log written right before a job starts, eg. "23:58:38 a3-m1a: CPU idle 85.16 91.21".
 IDLE_LINE = re.compile(r"^\d\d:\d\d:\d\d (\S+): CPU idle ([\d.]+) ([\d.]+)$")
 
@@ -451,8 +462,9 @@ def baseline(row: dict, rows: list[dict]) -> dict | None:
     return {k: same[0][k] for k in ("label", "setting", "cpu_state", "trials", "p50_us", "source")} if same else None
 
 
-def cold_matched(quiet: Path, repo: Path) -> dict:
-    """Chart (a), the cold first query at matched recall from the quiet run, with ColdIVF's warm numbers there."""
+def cold_matched(quiet: Path, repo: Path) -> list[dict]:
+    """The two charts of the cold first query at matched recall from the quiet run: ColdIVF in each of its setups, and
+    ColdIVF through the driver against one row per other system, with ColdIVF's warm numbers there."""
     idle = runner_idle((quiet / "summary.md").read_text() if (quiet / "summary.md").exists() else "")
     b3 = read_lines(quiet / "b3-warm.jsonl")
     own = own_warm(b3)
@@ -505,7 +517,7 @@ def cold_matched(quiet: Path, repo: Path) -> dict:
             "source": rel(source[id(cell[0])], repo), "machine_state": driver_state(cell), "code": code_of(cell, repo),
         })
 
-    for job, group, mode in (("a3-m1a", "coldivf", "wave"), ("a5-mapped", "control", "mapped")):
+    for job, group, mode, name in OWN_SCENARIOS:
         for c in own_cells(read_lines(quiet / f"{job}.jsonl")):
             if c["mode"] != mode:
                 continue
@@ -517,11 +529,9 @@ def cold_matched(quiet: Path, repo: Path) -> dict:
                                  "setting": c["setting"], "best_recall10_warm": (shown or {}).get("recall10")})
                 continue
 
-            state = CPU_STATES.get(c["cpu_state"], c["cpu_state"])
-            label = (f"ColdIVF, own harness, {state}" if group == "coldivf"
-                     else f"ColdIVF's file, lazily mapped, {state} (control)")
+            label = name.format(state=CPU_STATES.get(c["cpu_state"], c["cpu_state"]))
             rows.append({
-                "label": label, "group": group, "harness": "own", "system": "coldivf", "config_id": None,
+                "label": label, "group": group, "harness": "own", "job": job, "system": "coldivf", "config_id": None,
                 "setting": c["setting"], "dataset": c["dataset"], "n": c["n"], "regime": "c0", "mode": c["mode"],
                 "cpu_state": c["cpu_state"], "threads": 1, "trials": c["trials"], "p50_us": c["p50_us"],
                 "p95_us": c["p95_us"], "p99_us": c["p99_us"], "slowest_us": c["slowest_us"],
@@ -547,18 +557,19 @@ def cold_matched(quiet: Path, repo: Path) -> dict:
             "code": code_of([w]),
         })
 
-    # The lazy map is measured against the read waves that the same job interleaved with it, at its setting and CPU
-    # state, and every other row against ColdIVF through the driver.
-    waves = {(c["cpu_state"], setting_key(c["setting"])): c
-             for c in own_cells(read_lines(quiet / "a5-mapped.jsonl")) if c["mode"] == "wave"}
+    # A control is measured against the read waves that its own job interleaved with it, at its setting and CPU state,
+    # and every other row against ColdIVF through the driver.
+    waves = {(job, c["cpu_state"], setting_key(c["setting"])): c
+             for job in ("a5-mapped", "a8-controls") for c in own_cells(read_lines(quiet / f"{job}.jsonl"))
+             if c["mode"] == "wave"}
 
     for r in rows:
         if r["group"] == "control":
-            w = waves.get((r["cpu_state"], setting_key(r["setting"])))
+            w = waves.get((r["job"], r["cpu_state"], setting_key(r["setting"])))
             r["against"] = None if w is None else {
                 "label": f"ColdIVF, own harness, read waves, {CPU_STATES.get(w['cpu_state'], w['cpu_state'])}",
                 "setting": w["setting"], "cpu_state": w["cpu_state"], "trials": w["trials"], "p50_us": w["p50_us"],
-                "source": rel(quiet / "a5-mapped.jsonl", repo),
+                "source": rel(quiet / f"{r['job']}.jsonl", repo),
             }
         else:
             r["against"] = baseline(r, rows)
@@ -570,40 +581,76 @@ def cold_matched(quiet: Path, repo: Path) -> dict:
     datasets = sorted({r["dataset"] for r in measured if r["dataset"]})
     ours = baseline({"cpu_state": "prewarm"}, rows)
     point = (ours or next((r for r in measured if r["group"] == "coldivf"), {})).get("setting")
-    return {
-        "id": "cold-matched",
-        "title": "Cold first query at recall@10 near 0.95",
+
+    # The head-to-head keeps one row per system, its fastest config at the target, all timed the same way through the
+    # driver. The configs it drops stay in other_cells.
+    fastest = {}
+
+    for r in measured:
+        if r["harness"] == "driver":
+            fastest.setdefault(r["system"], r)
+
+    head = list(fastest.values())
+    dropped = [r for r in measured if r["harness"] == "driver" and r not in head]
+    others += [{k: r.get(k) for k in ("system", "config_id", "setting", "cpu_state", "threads", "trials", "p50_us",
+                                       "p99_us", "recall10_warm", "warm_p50_us", "source")} for r in dropped]
+    common = {
         "dataset": datasets[0] if len(datasets) == 1 else datasets,
         "n": measured[0]["n"] if measured else None,
         "unit": "microseconds",
         "target_recall10": TARGET,
+    }
+    pick_note = (f"Each row runs at a setting whose recall@10 reaches {TARGET:.2f} warm. Of those timed cold, it is "
+                 "the one with the most trials, and of those with as many, the cheapest warm, the lowest p50 and then "
+                 "the fewest bytes scanned, as pick.py ranks settings.")
+    head_to_head = {
+        "id": "cold-head-to-head",
+        "title": "Cold first query against the other systems, recall@10 near 0.95",
+        **common,
+        "legend": ["ColdIVF", "Other systems"],
+        "footer": "Every row ran interleaved through the same driver in one quiet window. Each trial is a fresh "
+                  "process with the index evicted from the cache, on a prewarmed core that spins for 150 ms before the "
+                  "query, and each system shows its fastest config. The other systems join this chart as their matched "
+                  "runs finish.",
         "notes": [
-            f"Each system and config runs at a setting whose recall@10 reaches {TARGET:.2f} warm. Of those timed "
-            "cold, it is the one with the most trials, and of those with as many, the cheapest warm, the lowest p50 "
-            "and then the fewest bytes scanned, as pick.py ranks settings.",
-            "ColdIVF through the driver, LanceDB, faiss and usearch ran interleaved through one driver, each trial a "
-            "fresh process with the index evicted, on a prewarmed core.",
-            f"The own-harness rows are ColdIVF's cold binary, "
-            f"{fmt_range([r['trials'] for r in measured if r['harness'] == 'own' and r['group'] == 'coldivf'])} "
-            "trials per CPU state.",
-            "The lazy map searches ColdIVF's file through a memory map that faults pages in as the search reads them. "
-            "It runs at the control's setting rather than its cheapest one.",
-            "Each p50_ratio is the row's p50 over the p50 of the row it is against. The lazy map is against the read "
-            "waves that its job interleaved with it, at the same setting and CPU state, and every other row is against "
-            "ColdIVF through the driver.",
-            "The AiSAQ-style model times only the reads of a graph that keeps its codes on disk, i.e. dependent "
-            "rounds of 4 random 16 KiB reads from a 1 GiB file, with no compute, for an index ~5 to 15 times ColdIVF's "
-            "size.",
+            pick_note,
+            "Each system has one row, its fastest config at the target. Every row ran interleaved through one driver, "
+            "each trial a fresh process with the index evicted, on a prewarmed core.",
+            "Each p50_ratio is the row's p50 over ColdIVF's through the driver.",
+            "models are reads-only models, which the chart doesn't plot. The AiSAQ-style model times only the reads "
+            "of a graph that keeps its codes on disk, i.e. dependent rounds of 4 random 16 KiB reads from a 1 GiB "
+            "file, with no compute, for an index ~5 to 15 times ColdIVF's size.",
             "coldivf_warm is ColdIVF's warm p50 and its queries per second at the setting of its row through the "
             "driver, on the quiet run's index.",
             "other_cells are the cells the driver timed that the chart doesn't plot, and left_out the systems and "
             "cells with no setting that reaches the target.",
         ],
-        "rows": measured + modeled,
+        "rows": head,
+        "models": modeled,
         "other_cells": sorted(others, key=lambda c: (c["system"], c["config_id"] or "", c["p50_us"])),
         "left_out": left_out,
         "coldivf_warm": quiet_warm(b3, point, quiet, repo, idle) if point else None,
     }
+    scenarios = {
+        "id": "cold-coldivf",
+        "title": "ColdIVF's cold first query in each setup, recall@10 near 0.95",
+        **common,
+        "legend": ["ColdIVF", "Controls, ColdIVF's file read another way"],
+        "footer": "A prewarmed core spins for 150 ms before the query, and an idle core sleeps 200 ms first, so its "
+                  "query can start on an efficiency core. The driver runs a fresh process per trial with the index "
+                  "evicted, and the own harness is ColdIVF's cold binary. After a search of another index, the "
+                  "process has first searched a 50K index of its own. The lazy map searches ColdIVF's file through a "
+                  "memory map that faults pages in, at the control's setting rather than its cheapest one.",
+        "notes": [
+            pick_note,
+            "Every row is ColdIVF's index, timed through the driver or ColdIVF's own cold binary, with the read path "
+            "and the state before the query that its label names.",
+            "Each p50_ratio is the row's p50 over ColdIVF's through the driver, and a control's over the read waves "
+            "that its own job interleaved with it, at the same setting and CPU state.",
+        ],
+        "rows": [r for r in measured if r["system"] == "coldivf"],
+    }
+    return [scenarios, head_to_head]
 
 
 def quiet_warm(b3: list[dict], setting: dict, quiet: Path, repo: Path, idle: dict) -> dict | None:
@@ -805,7 +852,7 @@ def busy_note(states: list[dict], ours: list[bool]) -> str:
 def chart_data(suite: Path = SUITE, quiet: Path = QUIET, repo: Path = REPO) -> dict:
     """Every number the charts plot and the README's text cites, with where it came from."""
     warm, cold, mem, missing, machine = smoke_charts(suite, repo)
-    matched = cold_matched(quiet, repo)
+    scenarios, head_to_head = cold_matched(quiet, repo)
     return tidy({
         "about": "Every number the README's charts plot and its text cites, written by coldivf-bench/py/charts.py. "
                  "The results are preliminary, and the full head-to-head runs will replace them.",
@@ -815,7 +862,7 @@ def chart_data(suite: Path = SUITE, quiet: Path = QUIET, repo: Path = REPO) -> d
         "datasets": dict(DATASETS),
         "smoke_suite": rel(suite, repo),
         "missing_systems": missing,
-        "charts": [matched, warm, cold, mem],
+        "charts": [scenarios, head_to_head, warm, cold, mem],
     })
 
 
@@ -879,9 +926,9 @@ def millions(n: int) -> str:
     return f"{n / 1e6:g}M"
 
 
-def headline_table(data: dict) -> str:
-    """The README's table: each row of the matched chart, its setting, recall, times and ratio."""
-    rows = next(c for c in data["charts"] if c["id"] == "cold-matched")["rows"]
+def headline_table(data: dict, chart_id: str = "cold-head-to-head") -> str:
+    """A README table: each row of a matched chart, its setting, recall, times and ratio."""
+    rows = next(c for c in data["charts"] if c["id"] == chart_id)["rows"]
     out = ["| System | Setting | Recall@10 | Trials | Cold p50 | Cold p95 | Cold p99 | p50 Against ColdIVF |",
            "|---|---|---|---|---|---|---|---|"]
 
@@ -1089,19 +1136,14 @@ def draw_cold_matched(data: dict, chart: dict, t: dict, path: Path) -> None:
     row_h, left, plot_w = 31.0, 300.0, 290.0
     dataset = chart["dataset"] if isinstance(chart["dataset"], str) else ", ".join(chart["dataset"])
     recalls = [r["recall10_warm"] for r in measured if r.get("recall10_warm") is not None]
-    reach = (f"Each system runs at a setting picked to reach recall@10 {chart['target_recall10']:.2f} warm, and its "
+    reach = (f"Each row runs at a setting picked to reach recall@10 {chart['target_recall10']:.2f} warm, and its "
              f"warm recall is {min(recalls):.3f} to {max(recalls):.3f} over "
              f"{fmt_count([r.get('recall10_warm_queries') for r in measured])} queries. ") if recalls else ""
     page = Page(t, f"{chart['title']} (preliminary)", [
         f"{millions(chart['n'])} vectors of {dataset} ({DATASETS.get(dataset, dataset)}), on one "
         f"{data['machine'].get('chip', 'machine')} in a quiet window. Each dot is the p50 of "
         f"{fmt_range([r['trials'] for r in measured])} trials, and its line runs to the p99. {reach}Log scale."
-    ], 34 + row_h * len(slots) + 42, [
-        "The rows through the driver ran on a prewarmed core, which spins for 150 ms before the query. An idle core "
-        "sleeps 200 ms first, so its query can start on an efficiency core. The lazy map is ColdIVF's own file "
-        "searched through a memory map that faults pages in, at the control's setting rather than its cheapest one. "
-        "The model has no compute, and its index would be ~5 to 15 times ColdIVF's size.",
-    ])
+    ], 34 + row_h * len(slots) + 42, [chart["footer"]])
     top = page.top + 34
     ax = page.axes(left, top, plot_w, row_h * len(slots))
     lo = 10 ** math.floor(math.log10(min(r["p50_us"] for r in rows) / 1.2))
@@ -1139,13 +1181,16 @@ def draw_cold_matched(data: dict, chart: dict, t: dict, path: Path) -> None:
                 size=8.5, color=t["ink2"])
 
     dot = {"marker": "o", "markersize": 8, "linestyle": "none"}
-    handles = [m.Line2D([], [], markerfacecolor=t["coldivf"], markeredgecolor=t["surface"], label="ColdIVF", **dot),
-               m.Line2D([], [], markerfacecolor=t["rest"], markeredgecolor=t["surface"],
-                        label="Other systems and the lazy map", **dot),
-               m.Line2D([], [], markerfacecolor=t["surface"], markeredgecolor=t["rest"], markeredgewidth=1.6,
-                        label="Modeled", **dot),
-               m.Line2D([], [], color=t["rest"], marker="|", markersize=9, markeredgewidth=1.5, linewidth=1.5,
-                        label="Line to the p99")]
+    ours_label, rest_label = chart["legend"]
+    handles = [m.Line2D([], [], markerfacecolor=t["coldivf"], markeredgecolor=t["surface"], label=ours_label, **dot),
+               m.Line2D([], [], markerfacecolor=t["rest"], markeredgecolor=t["surface"], label=rest_label, **dot)]
+
+    if modeled:
+        handles.append(m.Line2D([], [], markerfacecolor=t["surface"], markeredgecolor=t["rest"], markeredgewidth=1.6,
+                                label="Modeled", **dot))
+
+    handles.append(m.Line2D([], [], color=t["rest"], marker="|", markersize=9, markeredgewidth=1.5, linewidth=1.5,
+                            label="Line to the p99"))
     page.fig.legend(handles=handles, loc="upper left", ncol=4, handlelength=1.6, columnspacing=1.8,
                     borderaxespad=0, borderpad=0, bbox_to_anchor=page.anchor(MARGIN, page.top + 4))
     page.save(path)
@@ -1423,8 +1468,8 @@ def draw_memory(data: dict, chart: dict, t: dict, path: Path) -> None:
     page.save(path)
 
 
-DRAW = {"cold-matched": draw_cold_matched, "warm-recall": draw_warm_recall, "cold-smoke": draw_cold_smoke,
-        "memory": draw_memory}
+DRAW = {"cold-coldivf": draw_cold_matched, "cold-head-to-head": draw_cold_matched, "warm-recall": draw_warm_recall,
+        "cold-smoke": draw_cold_smoke, "memory": draw_memory}
 
 
 def draw(data: dict, out: Path) -> list[Path]:
@@ -1489,7 +1534,7 @@ def main(argv: list[str] | None = None) -> int:
     if data["missing_systems"]:
         print(f"no smoke lines for {', '.join(data['missing_systems'])}", file=sys.stderr)
 
-    for gone in next(c for c in data["charts"] if c["id"] == "cold-matched")["left_out"]:
+    for gone in next(c for c in data["charts"] if c["id"] == "cold-head-to-head")["left_out"]:
         print(f"the matched chart leaves out {gone}, since no cell reaches recall@10 {TARGET} warm", file=sys.stderr)
 
     try:
@@ -1501,7 +1546,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.data_only:
         print("wrote only chart-data.json, so the charts may not match it until they are drawn", file=sys.stderr)
 
-    print(headline_table(data))
+    print(headline_table(data, "cold-head-to-head"))
+    print()
+    print(headline_table(data, "cold-coldivf"))
     return 0
 
 

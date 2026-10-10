@@ -155,7 +155,8 @@ class ChartsTest(unittest.TestCase):
                          (3, 6000.0, 7000.0, 5000.0))
 
     def test_the_matched_cell_reaches_the_target_with_the_most_trials_and_is_the_cheapest_warm(self):
-        matched = self.data()["charts"][0]
+        matched = self.data()["charts"][1]
+        self.assertEqual(matched["id"], "cold-head-to-head")
         lance = [r for r in matched["rows"] if r["system"] == "lancedb"]
         self.assertEqual([r["setting"] for r in lance], [{"nprobes": 18, "refine_factor": 4}])
         self.assertEqual((lance[0]["recall10_warm"], lance[0]["recall10_warm_split"]), (0.951, "all"))
@@ -197,7 +198,11 @@ class ChartsTest(unittest.TestCase):
 
     def test_each_ratio_is_against_the_coldivf_row_measured_the_same_way(self):
         data = self.data()
-        rows = {r["label"]: r for r in data["charts"][0]["rows"]}
+        scenarios, head = data["charts"][:2]
+        self.assertEqual(len({r["system"] for r in head["rows"]}), len(head["rows"]))
+        self.assertTrue(all(r["harness"] == "driver" for r in head["rows"]))
+        self.assertTrue(all(r["system"] == "coldivf" for r in scenarios["rows"]))
+        rows = {r["label"]: r for r in scenarios["rows"] + head["rows"]}
         driver = rows["ColdIVF, through the driver"]
         self.assertEqual((driver["p50_us"], driver["recall10_warm"], driver["p50_ratio"]), (6000.0, 0.9513, 1.0))
         self.assertEqual(rows["LanceDB IVF_RQ"]["against"]["label"], "ColdIVF, through the driver")
@@ -207,17 +212,18 @@ class ChartsTest(unittest.TestCase):
         self.assertEqual((lazy["against"]["label"], lazy["against"]["p50_us"]),
                          ("ColdIVF, own harness, read waves, prewarmed core", 7000.0))
         self.assertAlmostEqual(lazy["p50_ratio"], 25000 / 7000, places=5)
-        table = charts.headline_table(data)
+        table = charts.headline_table(data, "cold-head-to-head")
         self.assertIn("| LanceDB IVF_RQ | nprobes 18, refine_factor 4 | 0.951 | 3 | 22.0 ms | 23.0 ms | 23.0 ms | "
                       "3.67x |", table)
-        self.assertIn("| 25.0 ms | 25.0 ms | 25.0 ms | 3.57x |", table)
-        self.assertIn("| AiSAQ-style graph, 12 rounds (modeled) | 12 rounds of 4 × 16 KiB reads | - | 200 | 1.92 ms | "
-                      "- | 2.40 ms | 0.32x |", table)
+        self.assertNotIn("lazily mapped", table)
+        self.assertIn("| 25.0 ms | 25.0 ms | 25.0 ms | 3.57x |", charts.headline_table(data, "cold-coldivf"))
+        self.assertEqual([m["label"] for m in head["models"]], ["AiSAQ-style graph, 12 rounds (modeled)"])
+        self.assertAlmostEqual(head["models"][0]["p50_ratio"], 1920 / 6000, places=5)
 
     def test_every_number_records_its_source_setting_trials_machine_state_and_code(self):
-        matched, warm_chart, cold_chart, memory = self.data()["charts"]
-        self.assertEqual([r["group"] for r in matched["rows"]][-1], "model")
-        rows = {r["label"]: r for r in matched["rows"]}
+        scenarios, matched, warm_chart, cold_chart, memory = self.data()["charts"]
+        self.assertEqual([r["group"] for r in matched["models"]], ["model"])
+        rows = {r["label"]: r for r in scenarios["rows"] + matched["rows"]}
         driver = rows["ColdIVF, through the driver"]
         self.assertEqual(driver["source"], "results/quiet2/driver/m1a/coldivf.jsonl")
         self.assertEqual(driver["code"], {"system_version": "coldivf 1.0", "wheel_sha256": {"coldivf": "w1"},
@@ -226,12 +232,12 @@ class ChartsTest(unittest.TestCase):
         self.assertEqual(rows["ColdIVF, own harness, prewarmed core"]["code"], {"commit": "abc", "dirty": False})
         self.assertEqual(driver["recall_code"], {"commit": "abc", "dirty": False})
 
-        for row in matched["rows"] + cold_chart["points"] + memory["rows"]:
+        for row in scenarios["rows"] + matched["rows"] + matched["models"] + cold_chart["points"] + memory["rows"]:
             self.assertTrue(row["source"].startswith("results/"), row)
             self.assertIn("machine_state", row)
             self.assertTrue(row["code"], row)
 
-        for row in matched["rows"] + cold_chart["points"]:
+        for row in scenarios["rows"] + matched["rows"] + cold_chart["points"]:
             self.assertGreater(row["trials"], 0)
             self.assertIsInstance(row["setting"], dict)
 
@@ -245,7 +251,7 @@ class ChartsTest(unittest.TestCase):
         self.assertEqual((row["disk"]["bytes_per_vector"], row["warm"]["process_bytes"]), (1.0, 5_000_000))
 
     def test_coldivf_warm_holds_the_quiet_runs_p50_and_qps_at_the_driver_setting(self):
-        found = self.data()["charts"][0]["coldivf_warm"]
+        found = self.data()["charts"][1]["coldivf_warm"]
         self.assertEqual((found["setting"], found["p50_us"], found["recall10"]), ({"nprobe": 96, "rerank": 35}, 231.0,
                                                                                  0.9513))
         self.assertEqual([(q["threads"], q["qps"]) for q in found["qps"]], [(1, 4000.0), (6, 18000.0)])
@@ -253,7 +259,7 @@ class ChartsTest(unittest.TestCase):
                          ("results/quiet2/b3-warm.jsonl", [89.76, 87.62]))
 
     def test_the_warm_chart_compares_each_point_with_coldivf_at_the_same_recall(self):
-        curves = {c["system"]: c for c in self.data()["charts"][1]["curves"]}
+        curves = {c["system"]: c for c in self.data()["charts"][2]["curves"]}
         self.assertNotIn("against_coldivf", curves["coldivf"])
         ((p,),) = [curves["lancedb"]["against_coldivf"]["points"]]
         base = math.sqrt(150 * 250)
@@ -300,8 +306,10 @@ class ChartsTest(unittest.TestCase):
 
         self.assertIn("| LanceDB IVF_RQ | nprobes 18, refine_factor 4 | 0.951 | 3 | 22.0 ms |", printed.getvalue())
         names = sorted(p.name for p in out.iterdir())
-        self.assertEqual(len(names), 9)
+        self.assertEqual(len(names), 11)
         self.assertIn("chart-data.json", names)
+        self.assertIn("cold-head-to-head.svg", names)
+        self.assertIn("cold-coldivf-dark.svg", names)
         drawn_with = json.loads((out / "chart-data.json").read_text())["drawn_with"]
         self.assertEqual(set(drawn_with), {"matplotlib"})
         light, dark = (out / "memory.svg").read_text(), (out / "memory-dark.svg").read_text()
