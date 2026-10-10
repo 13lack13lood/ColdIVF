@@ -273,6 +273,22 @@ class ChartsTest(unittest.TestCase):
         self.assertTrue(found["call_longer_than_a_search"])
         self.assertEqual([q["ratio_less_call"] for q in found["points"]], [None, None])
 
+    def test_the_leaderboard_ranks_each_target_and_leaves_off_grids_that_reach_none(self):
+        boards, left_out = charts.leaderboard(self.data()["charts"][2]["curves"])
+        self.assertEqual([b["recall10"] for b in boards], list(charts.WARM_TARGETS))
+        low, mid, high = boards
+        self.assertEqual([(r["system"], round(r["p50_us"], 6), r["between"]) for r in low["rows"]],
+                         [("coldivf", 150.0, True), ("lancedb", 4000.0, False)])
+        self.assertEqual((low["rows"][1]["recall10"], low["rows"][1]["p50_less_call_us"]), (0.9, 3900.0))
+        self.assertAlmostEqual(mid["rows"][0]["p50_us"], math.sqrt(150 * 250), places=4)
+        self.assertEqual([r["system"] for r in high["rows"]], ["coldivf"])
+        self.assertEqual(high["not_reached"], [{"system": "lancedb", "label": "LanceDB IVF_RQ", "best_recall10": 0.9}])
+        self.assertEqual(left_out, [])
+        capped = {"system": "x", "label": "X i8", "points": [{"setting": {}, "recall10": 0.84, "p50_us": 10.0}]}
+        boards, left_out = charts.leaderboard([capped])
+        self.assertEqual(left_out, [{"system": "x", "label": "X i8", "best_recall10": 0.84}])
+        self.assertTrue(all(not b["rows"] and not b["not_reached"] for b in boards))
+
     def test_a_drawing_that_fails_writes_nothing(self):
         out = self.repo / "docs/charts"
         out.mkdir(parents=True)
@@ -310,6 +326,7 @@ class ChartsTest(unittest.TestCase):
         self.assertIn("chart-data.json", names)
         self.assertIn("cold-head-to-head.svg", names)
         self.assertIn("cold-coldivf-dark.svg", names)
+        self.assertIn("warm-leaderboard-dark.svg", names)
         drawn_with = json.loads((out / "chart-data.json").read_text())["drawn_with"]
         self.assertEqual(set(drawn_with), {"matplotlib"})
         light, dark = (out / "memory.svg").read_text(), (out / "memory-dark.svg").read_text()

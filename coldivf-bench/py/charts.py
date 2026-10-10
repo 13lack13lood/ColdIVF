@@ -40,6 +40,9 @@ OUT = REPO / "docs" / "charts"
 # The recall@10 the matched chart compares the systems at, the target that pick.py picks settings for.
 TARGET = 0.95
 
+# The recall@10 targets that the warm leaderboard ranks the systems at.
+WARM_TARGETS = (0.85, 0.90, 0.95)
+
 # The splits whose warm recall picks a matched cell, the tune split that pick.py picks on, else all the queries.
 PICK_SPLITS = ("tune", "all")
 
@@ -717,6 +720,56 @@ def against_coldivf(curve: dict, ours: dict) -> dict:
     return {"call_us": span(calls), "call_longer_than_a_search": bool(calls) and not usable, "points": out}
 
 
+def at_recall(points: list[dict], target: float) -> dict | None:
+    """A warm grid's p50 at recall@10 `target`. Inside the grid it is interpolated, linear in the log of the latency
+    between the two settings around it. Where every setting is above `target`, it is the fastest of them, with that
+    setting and its recall. It is None when no setting reaches `target`."""
+    between = interpolate(points, target)
+
+    if between is not None:
+        return {"p50_us": between, "between": True}
+
+    reach = [p for p in points if (p.get("recall10") or 0.0) >= target]
+
+    if not reach:
+        return None
+
+    fastest = min(reach, key=lambda p: p["p50_us"])
+    return {"p50_us": fastest["p50_us"], "between": False, "setting": fastest["setting"],
+            "recall10": fastest["recall10"]}
+
+
+def leaderboard(curves: list[dict]) -> tuple[list[dict], list[dict]]:
+    """The warm leaderboard: at each of WARM_TARGETS, the systems whose grid reaches it, fastest first, and the ones
+    whose grid doesn't. A system whose grid reaches none of the targets is left off it, and comes apart with its best
+    recall."""
+    best = {c["system"]: max((p["recall10"] for p in c["points"] if p.get("recall10") is not None), default=None)
+            for c in curves}
+    on = [c for c in curves if best[c["system"]] is not None and best[c["system"]] >= min(WARM_TARGETS)]
+    left_out = [{"system": c["system"], "label": c["label"], "best_recall10": best[c["system"]]}
+                for c in curves if c not in on]
+    boards = []
+
+    for target in WARM_TARGETS:
+        rows, short = [], []
+
+        for c in on:
+            found = at_recall(c["points"], target)
+
+            if found is None:
+                short.append({"system": c["system"], "label": c["label"], "best_recall10": best[c["system"]]})
+                continue
+
+            calls = [p["overhead_us"] for p in c["points"] if p.get("overhead_us") is not None]
+            usable = bool(calls) and max(calls) < min(p["p50_us"] for p in c["points"])
+            rows.append({"system": c["system"], "label": c["label"], **found,
+                         "p50_less_call_us": found["p50_us"] - max(calls) if usable else None})
+
+        boards.append({"recall10": target, "rows": sorted(rows, key=lambda r: r["p50_us"]), "not_reached": short})
+
+    return boards, left_out
+
+
 def smoke_charts(suite_path: Path, repo: Path) -> tuple[dict, dict, dict, list[str], dict]:
     """Charts (b), (c) and (d) from the suite's smoke runs, the systems with no lines, and the machine."""
     suite = tomllib.loads(suite_path.read_text())
@@ -799,8 +852,10 @@ def smoke_charts(suite_path: Path, repo: Path) -> tuple[dict, dict, dict, list[s
     queries = fmt_range([p["queries"] for c in curves for p in c["points"]])
     busy = busy_note([c["machine_state"] for c in curves], [c["system"] == "coldivf" for c in curves])
     build_threads = fmt_range([(r["build"] or {}).get("threads") for r in memory])
+    boards, left_out = leaderboard(curves)
+    targets = ", ".join(f"{v:.2f}" for v in WARM_TARGETS)
     warm = {
-        "id": "warm-recall", "title": "Warm recall@10 against p50 latency", "dataset": dataset, "n": n,
+        "id": "warm-leaderboard", "title": "Fastest warm query at three recall targets", "dataset": dataset, "n": n,
         "unit": "microseconds",
         "notes": [f"The smoke grids run at 1 thread over {queries} queries of {dataset}'s tune split, each index "
                   "read into memory first.", busy,
@@ -810,8 +865,15 @@ def smoke_charts(suite_path: Path, repo: Path) -> tuple[dict, dict, dict, list[s
                   "against_coldivf compares each point with ColdIVF's p50 at the same recall, linear in the log of the "
                   "latency between the two settings of ColdIVF's grid around it. ratio_less_call takes that call's "
                   "time out of the point's p50 first, and is left out where the call takes longer than one of the "
-                  "system's own searches."],
+                  "system's own searches.",
+                  f"boards ranks the systems at recall@10 {targets} by warm p50, read off each grid as against_coldivf "
+                  "does. Where every setting of a grid is above a target, it takes the fastest, with between false. "
+                  "not_reached are the systems whose grid doesn't reach that target, and left_out those whose grid "
+                  "reaches none. p50_less_call_us takes the call's time out first, where it is shorter than every "
+                  "search of the grid."],
         "curves": curves,
+        "boards": boards,
+        "left_out": left_out,
     }
     cold = {
         "id": "cold-smoke", "title": "Cold first query against recall at each system's smoke setting",
@@ -1196,26 +1258,19 @@ def draw_cold_matched(data: dict, chart: dict, t: dict, path: Path) -> None:
     page.save(path)
 
 
-# The warm chart's other systems by family: inverted files draw solid, graphs dashed, and systems with one setting as
-# a lone marker. Each curve takes the next color of the palette, so no two curves share one. "ink" is the page's text
-# color, black on a light page and white on a dark one.
-FAMILIES = {
-    "ivf": ("faiss-ivf", "faiss-fastscan", "lancedb", "paimon", "rabitq-ivf"),
-    "graph": ("faiss-hnsw", "usearch", "qdrant-edge", "astervec", "diskann", "rabitq-hnsw", "symphonyqg"),
-}
-PALETTE = ("#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
-           "#b15928", "ink")
-LONE_MARKERS = ("s", "D", "^", "v", "P")
-
-
-def draw_warm_recall(data: dict, chart: dict, t: dict, path: Path) -> None:
+def draw_warm_leaderboard(data: dict, chart: dict, t: dict, path: Path) -> None:
     m = _mpl()
-    curves = chart["curves"]
+    boards, curves = chart["boards"], chart["curves"]
     points = [p for c in curves for p in c["points"]]
     calls = [p["overhead_us"] for c in curves if c["system"] != "coldivf" for p in c["points"]
              if p.get("overhead_us")]
     busy = busy_note([c["machine_state"] for c in curves], [c["system"] == "coldivf" for c in curves])
     foot = []
+
+    if chart["left_out"]:
+        foot.append(f"Left off, since no setting of its grid reaches recall@10 {boards[0]['recall10']:.2f}: "
+                    + ", ".join(f"{g['label']}, whose best is {g['best_recall10']:.3f}" for g in chart["left_out"])
+                    + ".")
 
     if calls:
         foot.append(f"The times of the Python adapters are raw, so they include each binding's per-call cost, which "
@@ -1225,52 +1280,56 @@ def draw_warm_recall(data: dict, chart: dict, t: dict, path: Path) -> None:
     if busy:
         foot.append(busy)
 
-    plot_w, plot_h, left = 470.0, 360.0, 58.0
+    longest = max(len(b["rows"]) for b in boards)
+    every = [r["p50_us"] for b in boards for r in b["rows"]]
+    lo, hi = min(every) / 1.5, max(every) * 1.5
+    row_h, label_w, plot_w, value_w, gap = 16.0, 100.0, 88.0, 42.0, 6.0
+    panel_w = label_w + plot_w + value_w
+    short = [wrap(f"Not reached in its grid: {', '.join(r['label'] for r in b['not_reached'])}.", 7.5, panel_w - 4)
+             if b["not_reached"] else [] for b in boards]
+    grid = [len(c["points"]) for c in curves if len(c["points"]) > 1]
     page = Page(t, f"{chart['title']} at {millions(chart['n'])} vectors (preliminary)", [
-        f"First {millions(chart['n'])} rows of {chart['dataset']} ({DATASETS.get(chart['dataset'], '')}). Smoke grids "
-        f"at 1 thread over {fmt_range([p['queries'] for p in points])} queries, "
-        f"{fmt_range([p['passes'] for p in points])} timed passes each, with every index read into memory first. "
-        "Each dot is one setting of a system, at its p50 latency and its recall. Up and to the left is better. "
-        "Solid lines are inverted-file indexes, dashed lines graphs, and lone markers systems with one setting. "
-        "Log scale."
-    ], 20 + plot_h + 34, [" ".join(foot)])
-    lo, hi = _log_limits([p["p50_us"] for p in points])
-    ax = page.axes(left, page.top + 20, plot_w, plot_h)
-    ax.set_xscale("log")
-    ax.set_xlim(lo, hi)
-    ax.set_ylim(0.55, 1.02)
-    _log_ticks(ax, lo, hi, fmt=lambda v: f"{v / 1000:,g}")
-    ax.yaxis.set_major_locator(m.FixedLocator([0.6, 0.7, 0.8, 0.9, 1.0]))
-    _grid(ax, t, "both")
-    ax.set_ylabel("Recall@10", labelpad=4)
-    ax.set_xlabel("p50 latency per query (ms), log scale", labelpad=6)
-    handles, used, lone = [], 0, 0
+        f"First {millions(chart['n'])} rows of {chart['dataset']} ({DATASETS.get(chart['dataset'], '')}). Each panel "
+        "ranks the systems by warm p50 at one recall@10, read off each system's grid of "
+        f"{fmt_range(grid)} settings between the two around it, linear in the log of the latency. A system whose "
+        "every setting is above a target shows its fastest, marked *. Smoke grids at 1 thread over "
+        f"{fmt_range([p['queries'] for p in points])} queries, {fmt_range([p['passes'] for p in points])} timed "
+        "passes each, with every index read into memory first. The three panels share one log scale."
+    ], 30 + row_h * longest + 36 + 10 * max(len(lines) for lines in short) + 4, [" ".join(foot)])
 
-    for c in curves:
-        x = [p["p50_us"] for p in c["points"]]
-        y = [p["recall10"] for p in c["points"]]
+    for b, board in enumerate(boards):
+        x0 = MARGIN + b * (panel_w + gap)
+        ax = page.axes(x0 + label_w, page.top + 30, plot_w, row_h * longest)
+        ax.set_xscale("log")
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(longest - 0.5, -0.5)
+        ax.yaxis.set_major_locator(m.NullLocator())
+        ax.spines["left"].set_visible(False)
+        _log_ticks(ax, lo, hi, fmt=lambda v: f"{v / 1000:g}")
+        ax.tick_params(axis="x", labelsize=7)
+        ax.set_xlabel("ms, log scale", size=7.5, labelpad=3)
+        _grid(ax, t)
+        page.text(x0, page.top + 18, f"Recall@10 {board['recall10']:.2f}", size=10, weight="bold", color=t["ink"])
+        pos = m.blended(ax.transAxes, ax.transData)
 
-        if c["system"] == "coldivf":
-            line = ax.plot(x, y, color=t["coldivf"], linewidth=2.8, marker="o", markersize=7, zorder=5,
-                           markeredgecolor=t["surface"], markeredgewidth=1.2, label="ColdIVF")[0]
-        elif len(c["points"]) == 1:
-            line = ax.plot(x, y, linestyle="none", marker=LONE_MARKERS[lone % len(LONE_MARKERS)], markersize=7,
-                           color=t["rest"], markeredgecolor=t["surface"], markeredgewidth=0.8, zorder=4,
-                           label=c["label"])[0]
-            lone += 1
-        else:
-            family = next((f for f, names in FAMILIES.items() if c["system"] in names), "graph")
-            color = PALETTE[used % len(PALETTE)]
-            color = t["ink"] if color == "ink" else color
-            used += 1
-            line = ax.plot(x, y, color=color, linewidth=1.5, linestyle="-" if family == "ivf" else (0, (4, 2)),
-                           marker="o", markersize=4, markeredgecolor=t["surface"], markeredgewidth=0.6, zorder=3,
-                           label=c["label"])[0]
+        for i, r in enumerate(board["rows"]):
+            ours = r["system"] == "coldivf"
+            color = t["coldivf"] if ours else t["rest"]
+            ink = t["coldivf"] if ours else t["ink"]
+            weight = "bold" if ours else "normal"
+            ax.plot([lo, r["p50_us"]], [i, i], color=color, linewidth=2 if ours else 1.2, zorder=2,
+                    solid_capstyle="butt")
+            ax.plot([r["p50_us"]], [i], marker="o", markersize=6 if ours else 4.5, color=color,
+                    markeredgecolor=t["surface"], markeredgewidth=0.8, zorder=3)
+            ax.text(-label_w / plot_w, i, f"{i + 1}", transform=pos, ha="left", va="center", size=7.5,
+                    color=t["ink2"])
+            ax.text(-0.04, i, r["label"], transform=pos, ha="right", va="center", size=8, color=ink, weight=weight)
+            ax.text(1 + value_w / plot_w, i, fmt_us(r["p50_us"]) + ("" if r["between"] else "*"), transform=pos,
+                    ha="right", va="center", size=8, color=ink, weight=weight)
 
-        handles.append(line)
+        for k, line in enumerate(short[b]):
+            page.text(x0, page.top + 30 + row_h * longest + 40 + 10 * k, line, size=7.5, color=t["ink2"])
 
-    page.fig.legend(handles=handles, loc="upper left", ncol=1, handlelength=2.6, labelspacing=0.55, borderaxespad=0,
-                    borderpad=0, fontsize=8.5, bbox_to_anchor=page.anchor(left + plot_w + 18, page.top + 20))
     page.save(path)
 
 
@@ -1464,8 +1523,8 @@ def draw_memory(data: dict, chart: dict, t: dict, path: Path) -> None:
     page.save(path)
 
 
-DRAW = {"cold-coldivf": draw_cold_matched, "cold-head-to-head": draw_cold_matched, "warm-recall": draw_warm_recall,
-        "cold-smoke": draw_cold_smoke, "memory": draw_memory}
+DRAW = {"cold-coldivf": draw_cold_matched, "cold-head-to-head": draw_cold_matched,
+        "warm-leaderboard": draw_warm_leaderboard, "cold-smoke": draw_cold_smoke, "memory": draw_memory}
 
 
 def draw(data: dict, out: Path) -> list[Path]:
