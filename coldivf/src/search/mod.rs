@@ -3,7 +3,8 @@
 //! 1. Route: score every cluster center with its 4-bit code and keep the `nprobe` nearest, or those of them within the
 //!    reach.
 //! 2. Scan: estimate the distance to every vector in those clusters, 32 at a time, and keep the best candidates. Codes
-//!    measured from the clusters' centers first take the query's distance to each center.
+//!    measured from the clusters' centers first take the query's distance to each center. The pending inserts of the
+//!    clusters ranked next, up to the 256 nearest, are scanned too.
 //! 3. Rerank: rescore the candidates with their 8-bit rows and return the top `k`.
 //!
 //! Candidates and results are ordered by score and then internal id, so they never depend on the order of the scan.
@@ -27,11 +28,27 @@ use crate::{Anchor, Hit, LeafId, Limits, Metric, SearchCtx, SearchParams};
 use candidates::{Candidate, Candidates};
 use rerank::rerank;
 use route::{CHUNK, Centers, route_chunked, within_reach};
-use scan::scan_leaf;
+pub(crate) use scan::Pending;
+use scan::{Hides, scan_inserts, scan_probed};
 
 /// The largest squared length a query's or a vector's offset from the mean may have, a quarter of the largest f32, so
 /// adding two of them can't overflow.
 pub(crate) const LIMIT: f64 = f32::MAX as f64 / 4.0;
+
+/// The clusters nearest the query whose pending inserts a search scans, though it reads the file's vectors of only
+/// `nprobe` of them when that is fewer. An insert joins its nearest cluster, which a query near the insert may rank
+/// just past the clusters it reads. Scanning the inserts of the next clusters finds most of those, for far less than a
+/// scan of every insert.
+pub(crate) const PENDING_LISTS: usize = 256;
+
+/// The number of clusters a search routes to. It is `nprobe`, or `PENDING_LISTS` when that is more and the index has
+/// pending inserts.
+pub(crate) fn depth(nprobe: usize, pending: bool) -> usize {
+    match pending {
+        true => nprobe.max(PENDING_LISTS),
+        false => nprobe,
+    }
+}
 
 /// One cluster's place in an index.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -72,6 +89,8 @@ pub(crate) struct View<'a> {
     pub(crate) centers: Centers<'a>,
     pub(crate) lists: &'a [List],
     pub(crate) tier: Tier,
+    /// The rows that the search skips, as of its snapshot of the changes.
+    pub(crate) hides: Hides<'a>,
 }
 
 /// Every cluster's blocks and every row, read in place from RAM or a mapped file.
@@ -93,9 +112,9 @@ pub(crate) fn run<'a>(
     let SearchCtx {
         limits, scratch, hits, ..
     } = ctx;
-    let s = scratch_for(scratch, view.dim, view.lists.len(), limits);
+    let s = scratch_for(scratch, view.dim, limits);
     prepare_query(view, query, s)?;
-    scan_in_place(view, data.blocks, params, s);
+    scan_in_place(view, data.blocks, params, s, None);
     let row = |id: u32| data.rows.row(id);
     rerank(
         s.candidates.as_slice(),
@@ -111,20 +130,27 @@ pub(crate) fn run<'a>(
 }
 
 /// Routes the query that `s` holds and scans the `params.nprobe` nearest clusters, or those of them within
-/// `params.reach`, reading their blocks in place from `blocks`. It leaves the best `max(params.rerank, params.k)`
-/// candidates in `s`.
-pub(crate) fn scan_in_place(view: &View, blocks: &[u8], params: &SearchParams, s: &mut Scratch) {
+/// `params.reach`, reading their blocks in place from `blocks`. With `pending`, it then scans the inserts of the
+/// clusters ranked after those, up to the `PENDING_LISTS` nearest. It leaves the best `max(params.rerank, params.k)`
+/// candidates in `s`, and the clusters whose blocks it read in `s.routes`.
+pub(crate) fn scan_in_place(
+    view: &View,
+    blocks: &[u8],
+    params: &SearchParams,
+    s: &mut Scratch,
+    pending: Option<Pending>,
+) {
     route_chunked(
         view.tier,
         &view.centers,
         &s.q8,
         s.lut.mean.t2,
-        params.nprobe,
+        depth(params.nprobe, pending.is_some()),
         &mut s.chunk,
         &mut s.best,
         &mut s.routes,
     );
-    s.routes.truncate(within_reach(&s.routes, params.reach));
+    let read = within_reach(&s.routes[..params.nprobe.min(s.routes.len())], params.reach);
     s.candidates.reset(params.rerank.max(params.k));
     let Scratch {
         routes,
@@ -134,35 +160,75 @@ pub(crate) fn scan_in_place(view: &View, blocks: &[u8], params: &SearchParams, s
         survivors,
         ..
     } = s;
-    let leaves = routes.iter().map(|r| r.id);
-    scan_lists(view, blocks, leaves, lut, q32, candidates, survivors);
+    let leaves = routes[..read].iter().map(|r| r.id);
+    scan_lists(view, blocks, leaves, lut, q32, pending, candidates, survivors);
+
+    if let Some(p) = pending {
+        let next = routes[read..].iter().map(|r| r.id);
+        scan_next(view, next, lut, q32, p, candidates, survivors);
+    }
+
+    routes.truncate(read);
 }
 
-/// Scans the clusters `leaves`, reading their blocks in place from `blocks`, and offers their vectors to `candidates`.
+/// Scans the clusters `leaves`, reading their blocks in place from `blocks`, with their inserts in `pending`, and
+/// offers their vectors to `candidates`. While it scans one cluster, the memory of the next one's inserts starts
+/// coming into the cache.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_lists(
     view: &View,
     blocks: &[u8],
     leaves: impl Iterator<Item = LeafId>,
     lut: &mut QueryLut,
     q32: &QueryS32,
+    pending: Option<Pending>,
     candidates: &mut Candidates,
     survivors: &mut [Candidate; BLOCK],
 ) {
     let size = block_bytes(padded_dim(view.dim));
+    let mut leaves = leaves.peekable();
 
-    for leaf in leaves {
+    while let Some(leaf) = leaves.next() {
+        if let (Some(p), Some(&next)) = (pending, leaves.peek()) {
+            p.touch(next);
+        }
         let list = view.lists[leaf as usize];
         let blocks = &blocks[list.offset..list.offset + list.count.div_ceil(BLOCK) * size];
-        scan_leaf(view, leaf, blocks, lut, q32, candidates, survivors);
+        scan_probed(view, leaf, blocks, lut, q32, pending, candidates, survivors);
     }
 }
 
-/// Writes the `nprobe` clusters nearest the query into `out`, nearest first, keeping only those within `reach`.
+/// Scans only the pending inserts in `pending` of the clusters `leaves`, eg. those that the route ranks past the ones
+/// a search reads, and offers them to `candidates`. While it scans one cluster's inserts, the memory of the next one's
+/// starts coming into the cache.
+pub(crate) fn scan_next(
+    view: &View,
+    leaves: impl Iterator<Item = LeafId>,
+    lut: &mut QueryLut,
+    q32: &QueryS32,
+    pending: Pending,
+    candidates: &mut Candidates,
+    survivors: &mut [Candidate; BLOCK],
+) {
+    let mut leaves = leaves.peekable();
+
+    while let Some(leaf) = leaves.next() {
+        if let Some(&next) = leaves.peek() {
+            pending.touch(next);
+        }
+        scan_inserts(view, leaf, lut, q32, pending, candidates, survivors);
+    }
+}
+
+/// Writes the `nprobe` clusters nearest the query into `out`, nearest first, keeping only those within `reach`, and the
+/// clusters ranked after those, up to the `deep` nearest, into the context's `next`, which then belongs to no index
+/// until the caller names one.
 pub(crate) fn run_route(
     view: &View,
     query: &[f32],
     nprobe: usize,
     reach: Option<f32>,
+    deep: usize,
     ctx: &mut SearchCtx,
     out: &mut Vec<LeafId>,
 ) -> Result<(), Error> {
@@ -174,21 +240,31 @@ pub(crate) fn run_route(
     };
     check_search(query, view.dim, &params, &ctx.limits)?;
 
-    let SearchCtx { limits, scratch, .. } = ctx;
-    let s = scratch_for(scratch, view.dim, view.lists.len(), limits);
+    let SearchCtx {
+        limits,
+        scratch,
+        next,
+        next_of,
+        ..
+    } = ctx;
+    *next_of = None;
+    let s = scratch_for(scratch, view.dim, limits);
     prepare_route(view, query, s)?;
     route_chunked(
         view.tier,
         &view.centers,
         &s.q8,
         s.lut.mean.t2,
-        nprobe,
+        deep.max(nprobe),
         &mut s.chunk,
         &mut s.best,
         &mut s.routes,
     );
+    let read = within_reach(&s.routes[..nprobe.min(s.routes.len())], reach);
     out.clear();
-    out.extend(s.routes[..within_reach(&s.routes, reach)].iter().map(|r| r.id));
+    out.extend(s.routes[..read].iter().map(|r| r.id));
+    next.clear();
+    next.extend(s.routes[read..].iter().map(|r| r.id));
 
     Ok(())
 }
@@ -233,10 +309,9 @@ fn prepare_route(view: &View, query: &[f32], s: &mut Scratch) -> Result<f64, Err
     Ok(t2)
 }
 
-/// The buffers of one search, sized for one index's dimension. Routing scores the clusters a chunk at a time, so no
-/// buffer of a search grows with the cluster count, apart from the distances to the clusters that hold inserts, which a
-/// `SearchCtx` fits with room to spare. It keeps one scratch per dimension, so a search allocates nothing once one with
-/// as many such clusters has run.
+/// The buffers of one search, sized for one index's dimension and a context's limits. Routing scores the clusters a
+/// chunk at a time, so no buffer of a search grows with the cluster count, and a `SearchCtx` keeps one scratch per
+/// dimension, so a search allocates nothing once it has one.
 pub(crate) struct Scratch {
     dim: usize,
     /// The query, normalized for cosine.
@@ -260,10 +335,6 @@ pub(crate) struct Scratch {
     pub(crate) candidates: Candidates,
     pub(crate) survivors: [Candidate; BLOCK],
     pub(crate) rescored: Vec<Candidate>,
-    /// The query's squared distance to the center of each cluster that holds inserted vectors measured from it, as
-    /// `Delta::clusters` lists them. It has room for every cluster of the largest index it was fitted to, and a quarter
-    /// more.
-    pub(crate) inserted: Vec<f32>,
 }
 
 impl Scratch {
@@ -274,15 +345,6 @@ impl Scratch {
 
     pub(crate) fn dim(&self) -> usize {
         self.dim
-    }
-
-    /// Fits the distances to the clusters that hold inserts to an index with `nlist` clusters. Their room only grows,
-    /// to a quarter more than asked, so a cluster count no larger than the room allocates nothing.
-    pub(crate) fn fit(&mut self, nlist: usize) {
-        if nlist > self.inserted.capacity() {
-            self.inserted.clear();
-            self.inserted.reserve(nlist + nlist / 4);
-        }
     }
 
     /// Buffers for a search of `dim` dimensions within `limits`. Calibration's router scores all `nlist` clusters at
@@ -300,24 +362,18 @@ impl Scratch {
             q32: QueryS32::new(dim),
             dots: vec![0; nlist],
             chunk: vec![0; CHUNK],
-            best: Candidates::new(limits.max_nprobe),
-            routes: Vec::with_capacity(nlist.max(limits.max_nprobe)),
+            best: Candidates::new(limits.max_nprobe.max(PENDING_LISTS)),
+            routes: Vec::with_capacity(nlist.max(limits.max_nprobe).max(PENDING_LISTS)),
             candidates: Candidates::new(keep),
             survivors: [Candidate::NONE; BLOCK],
             rescored: Vec::with_capacity(keep),
-            inserted: Vec::with_capacity(nlist),
         }
     }
 }
 
-/// The scratch in `slots` for an index with this dimension, made first if there isn't one yet, fitted to its `nlist`
-/// clusters. Every maintenance run changes an index's cluster count, so a scratch per count would pile up.
-pub(crate) fn scratch_for<'a>(
-    slots: &'a mut Vec<Scratch>,
-    dim: usize,
-    nlist: usize,
-    limits: &Limits,
-) -> &'a mut Scratch {
+/// The scratch in `slots` for an index with this dimension, made first if there isn't one yet. It fits an index of any
+/// cluster count, which every maintenance run changes.
+pub(crate) fn scratch_for<'a>(slots: &'a mut Vec<Scratch>, dim: usize, limits: &Limits) -> &'a mut Scratch {
     let i = match slots.iter().position(|s| s.dim == dim) {
         Some(i) => i,
         None => {
@@ -326,7 +382,6 @@ pub(crate) fn scratch_for<'a>(
         }
     };
 
-    slots[i].fit(nlist);
     &mut slots[i]
 }
 

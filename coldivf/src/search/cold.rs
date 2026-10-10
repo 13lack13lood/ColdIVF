@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use super::candidates::Candidate;
-use super::scan::scan_leaf;
+use super::scan::{Pending, scan_probed};
 use super::{List, Scratch, View};
 use crate::format::{Layout, Part, Tables};
 use crate::index::{Inner, Shared};
@@ -30,9 +30,11 @@ const EARLY: usize = 1;
 /// spare.
 pub(crate) struct Reads {
     /// The cell of the index it reads, held weakly so it tells when the index closed, and the cell's number, which
-    /// keys the reads in a context. Numbers are never used twice, unlike addresses.
+    /// keys the reads in a context with the copy, the index's place among the collections of a set that name the same
+    /// one, or 0. Numbers are never used twice, unlike addresses.
     owner: Weak<Shared>,
     cell: u64,
+    copy: usize,
     /// The number of the generation that the reads are planned for, and of the one that the cluster arena was sized
     /// for, or 0 before the cluster tables of any loaded.
     generation: u64,
@@ -48,6 +50,8 @@ pub(crate) struct Reads {
     rows: RowSection,
     /// The fetched clusters' blocks, one span per cluster that has vectors.
     clusters: Batch,
+    /// Every fetched cluster, once each, with or without vectors in the file, whose pending inserts a scan reads.
+    probed: Vec<LeafId>,
     /// Whether every range of `clusters` is in.
     clusters_in: bool,
     /// Whether a read of `clusters` failed, which leaves them incomplete.
@@ -97,6 +101,7 @@ impl Reads {
         let mut reads = Reads {
             owner: owner.owner(),
             cell: owner.cell(),
+            copy: 0,
             generation: owner.uid(),
             sized_for: 0,
             wave,
@@ -106,6 +111,7 @@ impl Reads {
             block: block_bytes(padded_dim(layout.dim)),
             rows,
             clusters: Batch::new(limits.max_nprobe, 0),
+            probed: Vec::with_capacity(limits.max_nprobe),
             clusters_in: true,
             failed: false,
             early: Batch::new(keep, row_arena),
@@ -215,6 +221,8 @@ impl Reads {
         c.keys.extend_from_slice(leaves);
         c.keys.sort_unstable();
         c.keys.dedup();
+        self.probed.clear();
+        self.probed.extend_from_slice(&c.keys);
         c.keys.retain(|&l| lists[l as usize].count > 0);
         c.spans.clear();
         c.spans.extend(c.keys.iter().map(|&l| {
@@ -235,22 +243,42 @@ impl Reads {
         (self.clusters_in, self.failed, self.early_pending) = (true, false, false);
         self.hits_at = self.wave.hits();
         self.clusters.clear();
+        self.probed.clear();
         self.early.clear();
         self.late.clear();
     }
 
-    /// Scans every fetched cluster for the query in `s`. While the fetch is still arriving, it scans each range as it
-    /// comes in.
-    pub(crate) fn scan(&mut self, file: &File, view: &View, s: &mut Scratch) -> Result<(), Error> {
+    /// Every fetched cluster, once each, in increasing order.
+    pub(crate) fn probed(&self) -> &[LeafId] {
+        &self.probed
+    }
+
+    /// Scans every fetched cluster for the query in `s`, with its inserts in `pending`. While the fetch is still
+    /// arriving, it scans each range as it comes in. The inserts of a fetched cluster whose own blocks hold no vector
+    /// come last, since the fetch reads nothing of it.
+    pub(crate) fn scan(
+        &mut self,
+        file: &File,
+        view: &View,
+        s: &mut Scratch,
+        pending: Option<Pending>,
+    ) -> Result<(), Error> {
         if self.failed {
             return Err(Error::other("an earlier read of these clusters failed"));
         }
 
         let c = &mut self.clusters;
+        let unread = |probed: &[LeafId], s: &mut Scratch| {
+            for &leaf in probed.iter().filter(|&&l| view.lists[l as usize].count == 0) {
+                let (lut, q32, candidates, survivors) = (&mut s.lut, &s.q32, &mut s.candidates, &mut s.survivors);
+                scan_probed(view, leaf, &[], lut, q32, pending, candidates, survivors);
+            }
+        };
 
         if self.clusters_in {
             self.waited = Duration::ZERO;
-            (0..c.ranges.len()).for_each(|i| scan_range(c, i, view, s));
+            (0..c.ranges.len()).for_each(|i| scan_range(c, i, view, s, pending));
+            unread(&self.probed, s);
             return Ok(());
         }
 
@@ -260,7 +288,7 @@ impl Reads {
 
         while let Some(i) = self.wave.next(MAIN, file, &c.ranges, c.arena.memory())? {
             self.waited += clock.lap();
-            scan_range(c, i, view, s);
+            scan_range(c, i, view, s, pending);
             clock.lap();
             arrived += 1;
         }
@@ -269,6 +297,7 @@ impl Reads {
             return Err(lost());
         }
 
+        unread(&self.probed, s);
         (self.clusters_in, self.failed) = (true, false);
         Ok(())
     }
@@ -363,16 +392,17 @@ impl Reads {
     }
 }
 
-/// The slot in `slots` of the reads of `index`, made with `make` if there isn't one yet, and planned again in place if
-/// it was planned for another generation of the same index. Making one first drops the reads of indexes that have
-/// closed.
+/// The slot in `slots` of the reads of `index` for its copy `copy` in a set of collections, made with `make` if there
+/// isn't one yet, and planned again in place if it was planned for another generation of the same index. Making one
+/// first drops the reads of indexes that have closed.
 pub(crate) fn reads_for(
     slots: &mut Vec<Reads>,
     index: &Arc<Inner>,
+    copy: usize,
     limits: &Limits,
     make: impl FnOnce() -> Reads,
 ) -> usize {
-    if let Some(i) = slots.iter().position(|r| r.cell == index.cell()) {
+    if let Some(i) = slots.iter().position(|r| r.cell == index.cell() && r.copy == copy) {
         if slots[i].generation != index.uid() {
             slots[i].replan(index, index.layout(), index.file_len(), limits);
         }
@@ -380,7 +410,7 @@ pub(crate) fn reads_for(
     }
 
     slots.retain(|r| r.owner.strong_count() > 0);
-    slots.push(make());
+    slots.push(Reads { copy, ..make() });
     slots.len() - 1
 }
 
@@ -472,18 +502,22 @@ impl RowSection {
     }
 }
 
-/// Scans the clusters that range i of `c` read.
-fn scan_range(c: &Batch, i: usize, view: &View, s: &mut Scratch) {
+/// Scans the clusters that range i of `c` read, with their inserts in `pending`.
+fn scan_range(c: &Batch, i: usize, view: &View, s: &mut Scratch, pending: Option<Pending>) {
     let end = c.ranges.get(i + 1).map_or(c.spans.len(), |r| r.tag);
 
     for j in c.ranges[i].tag..end {
+        if let (Some(p), Some(&next)) = (pending, c.keys.get(j + 1)) {
+            p.touch(next);
+        }
         let blocks = c.arena.part(c.at[j], c.spans[j].len);
-        scan_leaf(
+        scan_probed(
             view,
             c.keys[j],
             blocks,
             &mut s.lut,
             &s.q32,
+            pending,
             &mut s.candidates,
             &mut s.survivors,
         );

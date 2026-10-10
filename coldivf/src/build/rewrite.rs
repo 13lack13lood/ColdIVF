@@ -25,7 +25,7 @@ use rayon::ThreadPool;
 use rayon::prelude::*;
 
 use super::create_temp;
-use super::stream::{Section, write_at};
+use super::stream::{Reached, Section, Sink, write_at};
 use crate::Anchor;
 use crate::LeafId;
 use crate::format::{self, Layout, Part, Tables, Trailer};
@@ -72,6 +72,46 @@ pub(crate) struct PlanList {
     pub(crate) group: u16,
 }
 
+impl Plan {
+    /// A checksum of everything the plan says, so a job that plans again can tell whether it got the same plan.
+    pub(crate) fn fingerprint(&self) -> u32 {
+        let mut crc = crc32fast::Hasher::new();
+        let floats = |crc: &mut crc32fast::Hasher, xs: &[f32]| xs.iter().for_each(|x| crc.update(&x.to_le_bytes()));
+
+        for list in &self.lists {
+            match &list.center {
+                PlanCenter::Keep(j) => crc.update(&[&[0u8][..], &j.to_le_bytes()].concat()),
+                PlanCenter::New(c) => {
+                    crc.update(&[1u8]);
+                    floats(&mut crc, c);
+                }
+            }
+            crc.update(&list.group.to_le_bytes());
+        }
+
+        match &self.groups {
+            PlanGroups::Keep(groups) => {
+                crc.update(&[2u8]);
+                groups.iter().for_each(|g| crc.update(&g.to_le_bytes()));
+            }
+            PlanGroups::New(centers) => {
+                crc.update(&[3u8]);
+                floats(&mut crc, centers);
+            }
+        }
+
+        for l in self.file_rows.iter().chain(&self.delta_rows) {
+            crc.update(&l.to_le_bytes());
+        }
+
+        if let Some(t) = &self.trailer {
+            crc.update(&format::encode_trailer(t));
+        }
+
+        crc.finalize()
+    }
+}
+
 pub(crate) enum PlanCenter {
     /// The old cluster at this file position keeps its 4-bit center codes and factors, so the codes measured from it
     /// are copied.
@@ -86,6 +126,105 @@ pub(crate) enum PlanGroups {
     Keep(Vec<u16>),
     /// New group centers, one after another, which the rewrite encodes as 8-bit rows.
     New(Vec<f32>),
+}
+
+/// What a rewrite's reads of the old file wait for, eg. a maintenance job's gate, which lets them through only while no
+/// search runs.
+pub(crate) trait Gate: Sync {
+    /// Waits until the rewrite may read `len` bytes of the old file. A job that was cancelled fails with `Interrupted`.
+    fn read(&self, len: usize) -> Result<(), Error>;
+}
+
+/// The gate of a run that blocks the writer, which never waits.
+pub(crate) struct Open;
+
+impl Gate for Open {
+    fn read(&self, _: usize) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// Where a rewrite writes the new file.
+pub(crate) trait Out: Sink {
+    /// When what searches of the old file held in memory should start in memory in the new one, eg. for an index that
+    /// was warm, which of the old file's row pages were in memory. The rewrite then writes the codes section, and the
+    /// row pages that hold rows whose old pages were in memory, through `write_kept_at`.
+    fn kept_rows(&self) -> Option<&[bool]> {
+        None
+    }
+    /// Makes the file `len` bytes long, with the space set aside where the system can.
+    fn set_len(&self, len: u64) -> Result<(), Error>;
+    /// Makes every write so far reach the disk before any later one, eg. before the header.
+    fn order(&self) -> Result<(), Error>;
+    /// Makes every write so far survive a power cut.
+    fn sync(&self) -> Result<(), Error>;
+}
+
+/// A file that a rewrite writes as fast as it can, at `path`.
+pub(crate) struct Plain<'a> {
+    pub(crate) file: &'a File,
+    pub(crate) path: &'a Path,
+}
+
+impl Sink for Plain<'_> {
+    fn write_at(&self, bytes: &[u8], offset: usize) -> Result<(), Error> {
+        write_at(self.file, bytes, offset)
+    }
+}
+
+impl Out for Plain<'_> {
+    fn set_len(&self, len: u64) -> Result<(), Error> {
+        self.file.set_len(len)
+    }
+
+    fn order(&self) -> Result<(), Error> {
+        self.file.sync_data()
+    }
+
+    fn sync(&self) -> Result<(), Error> {
+        io::sync_file(self.file, self.path)
+    }
+}
+
+/// Where a rewrite stands after a window of clusters: the windows it wrote, how far the codes, rows and ids sections
+/// got, the rows of the page it started, and what it counted. Another try of the same rewrite can go on from it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Mark {
+    pub(crate) windows: usize,
+    pub(crate) sections: [Reached; 3],
+    pub(crate) page: Vec<u8>,
+    pub(crate) copied: usize,
+    pub(crate) reencoded: usize,
+    pub(crate) bytes_read: u64,
+}
+
+/// What a rewrite tells whoever runs it, and where it starts.
+pub(crate) trait Progress {
+    /// The mark that an earlier try of the same rewrite reached and made durable, to go on from.
+    fn start(&self) -> Option<Mark>;
+    /// Called with the plan and the new file's small tables, eg. its cluster centers, before any write and before
+    /// `start`.
+    fn planned(&mut self, plan: &Plan, frame: &InMemory) -> Result<(), Error>;
+    /// Called after each window with where the rewrite stands. It may make the writes so far durable and keep the
+    /// mark.
+    fn reached(&mut self, mark: &Mark) -> Result<(), Error>;
+}
+
+/// The progress of a run that blocks the writer, which keeps nothing.
+pub(crate) struct Once;
+
+impl Progress for Once {
+    fn start(&self) -> Option<Mark> {
+        None
+    }
+
+    fn planned(&mut self, _: &Plan, _: &InMemory) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn reached(&mut self, _: &Mark) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// What a rewrite did.
@@ -125,11 +264,15 @@ pub(crate) fn rewrite_with(
     pool: &ThreadPool,
     window: usize,
 ) -> Result<(PathBuf, Rewritten), Error> {
-    let src = Old::new(old, delta, seen, window)?;
+    let src = Old::new(old, delta, seen, window, &Open)?;
     check(plan, &src)?;
     let members = Members::of(plan, src.count);
     let (file, tmp) = create_temp(out)?;
-    let result = write(&src, plan, &members, &file, &tmp, pool);
+    let plain = Plain {
+        file: &file,
+        path: &tmp,
+    };
+    let result = write(&src, plan, &members, &plain, &mut Once, pool);
     drop(file);
 
     match result {
@@ -141,20 +284,26 @@ pub(crate) fn rewrite_with(
     }
 }
 
-/// The same, into `file`, the empty file at `path`, which it syncs fully at the end. On an error the caller deletes it.
+/// The same, through `out`, which it syncs fully at the end, reading the old file as `gate` lets it and telling
+/// `progress` where it stands, with windows of at most `window` bytes of rows, or `WINDOW` with 0. On an error the
+/// caller deletes the new file, unless `progress` kept a mark to go on from.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rewrite_into(
     old: &Inner,
     delta: &Delta,
     seen: Seen,
     plan: &Plan,
-    file: &File,
-    path: &Path,
+    out: &dyn Out,
+    gate: &dyn Gate,
+    progress: &mut dyn Progress,
     pool: &ThreadPool,
+    window: usize,
 ) -> Result<Rewritten, Error> {
-    let src = Old::new(old, delta, seen, WINDOW)?;
+    let window = if window == 0 { WINDOW } else { window };
+    let src = Old::new(old, delta, seen, window, gate)?;
     check(plan, &src)?;
     let members = Members::of(plan, src.count);
-    write(&src, plan, &members, file, path, pool)
+    write(&src, plan, &members, out, progress, pool)
 }
 
 /// The old file and its changes as of a snapshot, with the sizes that the rewrite needs.
@@ -163,6 +312,7 @@ struct Old<'a> {
     layout: &'a Layout,
     tables: &'a Tables,
     delta: &'a Delta,
+    gate: &'a dyn Gate,
     /// The old file's vectors, and the inserts of the snapshot.
     count: usize,
     inserts: usize,
@@ -178,7 +328,13 @@ struct Old<'a> {
 }
 
 impl<'a> Old<'a> {
-    fn new(inner: &'a Inner, delta: &'a Delta, seen: Seen, window: usize) -> Result<Old<'a>, Error> {
+    fn new(
+        inner: &'a Inner,
+        delta: &'a Delta,
+        seen: Seen,
+        window: usize,
+        gate: &'a dyn Gate,
+    ) -> Result<Old<'a>, Error> {
         let layout = inner.layout();
         let (dim, d_pad) = (layout.dim, padded_dim(layout.dim));
 
@@ -191,6 +347,7 @@ impl<'a> Old<'a> {
             layout,
             tables: inner.tables()?,
             delta,
+            gate,
             count: layout.count,
             inserts: seen.inserts(),
             dim,
@@ -203,8 +360,10 @@ impl<'a> Old<'a> {
         })
     }
 
-    fn file(&self) -> &File {
-        self.inner.cold_file()
+    /// Reads `buf.len()` bytes of the old file at `offset` through the cold handle, once the gate lets it.
+    fn read(&self, buf: &mut [u8], offset: usize) -> Result<(), Error> {
+        self.gate.read(buf.len())?;
+        io::read_at(self.inner.cold_file(), buf, offset)
     }
 
     /// The old cluster that file row `r` sits in.
@@ -342,14 +501,14 @@ impl Members {
     }
 }
 
-/// Writes every section of the new file into `file`, the file at `path`, then checks the old file's checksums, then
-/// writes the header and syncs the file fully.
+/// Writes every section of the new file through `out`, then checks the old file's checksums, then writes the header
+/// and syncs the file fully. It goes on from where `progress` says an earlier try got.
 fn write(
     src: &Old,
     plan: &Plan,
     members: &Members,
-    file: &File,
-    path: &Path,
+    out: &dyn Out,
+    progress: &mut dyn Progress,
     pool: &ThreadPool,
 ) -> Result<Rewritten, Error> {
     let layout = src.layout;
@@ -361,6 +520,7 @@ fn write(
     };
     let small = read_small(src, &mut done)?;
     let frame = frame(src, plan, members, &small)?;
+    progress.planned(plan, &frame)?;
     let mut sections = format::small_sections(&frame);
     // The rotation section is copied as the old file stores it.
     sections[0] = small.rotation;
@@ -383,18 +543,23 @@ fn write(
         Some(t) => format::trailer_at(spans[6]) + t.len(),
         None => spans[6].end(),
     };
-    file.set_len(end as u64)?;
+    out.set_len(end as u64)?;
     let mut crcs = [0u32; 7];
     let mut pieces = (Pieces::rows(layout), Pieces::codes(layout, &src.tables.lists));
-    (crcs[4], crcs[5], crcs[6]) = write_lists(src, plan, members, &frame, file, &spans, &mut pieces, &mut done, pool)?;
+    let lists = Lists {
+        frame: &frame,
+        out,
+        spans: &spans,
+    };
+    (crcs[4], crcs[5], crcs[6]) = write_lists(src, plan, members, &lists, &mut pieces, &mut done, progress, pool)?;
 
     for (i, bytes) in sections.iter().enumerate() {
-        write_at(file, bytes, spans[i + 1].offset)?;
+        out.write_at(bytes, spans[i + 1].offset)?;
         crcs[i + 1] = crc32fast::hash(bytes);
     }
 
     if let Some(t) = &trailer {
-        write_at(file, t, format::trailer_at(spans[6]))?;
+        out.write_at(t, format::trailer_at(spans[6]))?;
     }
 
     let (mut rows, mut codes) = pieces;
@@ -405,11 +570,18 @@ fn write(
         codes.finish(src, Part::Codes, &mut done)?;
     }
     // The header goes last, once every other section is on the disk, so a half-written file never opens.
-    file.sync_data()?;
-    write_at(file, &format::header(&frame, n, &spans, &crcs), 0)?;
-    io::sync_file(file, path)?;
+    out.order()?;
+    out.write_at(&format::header(&frame, n, &spans, &crcs), 0)?;
+    out.sync()?;
     done.bytes_written = end as u64;
     Ok(done)
+}
+
+/// Where `write_lists` writes: the new file's small tables, its sections' places and the file.
+struct Lists<'a> {
+    frame: &'a InMemory,
+    out: &'a dyn Out,
+    spans: &'a [Span; 7],
 }
 
 /// The old file's small sections, each checked against the old header.
@@ -422,7 +594,7 @@ fn read_small(src: &Old, done: &mut Rewritten) -> Result<Small, Error> {
     let mut read = |part: Part| -> Result<Vec<u8>, Error> {
         let span = src.layout.span(part);
         let mut bytes = vec![0u8; span.len];
-        io::read_at(src.file(), &mut bytes, span.offset)?;
+        src.read(&mut bytes, span.offset)?;
         done.bytes_read += span.len as u64;
         format::check_section(src.layout, part, crc32fast::hash(&bytes))?;
         Ok(bytes)
@@ -497,31 +669,47 @@ fn frame(src: &Old, plan: &Plan, members: &Members, small: &Small) -> Result<InM
 
 /// Writes the codes, rows and ids sections in the new order, a window of clusters at a time. Each window takes its rows
 /// from the old file and from the snapshot, then copies each code that stays, from whole old clusters or the snapshot,
-/// and measures the others again from the rows on `pool`. Returns the three sections' checksums.
+/// and measures the others again from the rows on `pool`. After each window it tells `progress` where it stands, and
+/// it starts after the windows of the mark that `progress` gives. Returns the three sections' checksums.
 #[allow(clippy::too_many_arguments)]
 fn write_lists(
     src: &Old,
     plan: &Plan,
     members: &Members,
-    frame: &InMemory,
-    file: &File,
-    spans: &[Span; 7],
+    to: &Lists,
     pieces: &mut (Pieces, Pieces),
     done: &mut Rewritten,
+    progress: &mut dyn Progress,
     pool: &ThreadPool,
 ) -> Result<(u32, u32, u32), Error> {
     let (rb, cb, page_size) = (src.row, src.code, src.layout.page_size);
+    let (frame, spans) = (to.frame, to.spans);
+    let start = progress.start().unwrap_or_else(|| Mark {
+        sections: [4, 5, 6].map(|s| Reached {
+            at: spans[s].offset,
+            ..Reached::default()
+        }),
+        ..Mark::default()
+    });
+    let [r1, r2, r3] = start.sections;
     let (mut t1, mut t2, mut ids) = (
-        Section::new(file, spans[4].offset),
-        Section::new(file, spans[5].offset),
-        Section::new(file, spans[6].offset),
+        Section::resume(to.out, r1),
+        Section::resume(to.out, r2),
+        Section::resume(to.out, r3),
     );
-    let (mut page, mut in_page) = (vec![0u8; page_size], 0);
+    // Which of the old file's row pages were in memory, when the new file keeps what was.
+    let (keeps, resident) = (to.out.kept_rows().is_some(), to.out.kept_rows().unwrap_or(&[]));
+    let (mut page_kept, mut kept_slots) = (false, Vec::new());
+    let (mut page, mut in_page) = (vec![0u8; page_size], start.page.len() / rb);
+    page[..start.page.len()].copy_from_slice(&start.page);
+    (done.copied, done.reencoded) = (start.copied, start.reencoded);
+    done.bytes_read += start.bytes_read;
     let (mut rows, mut wanted) = (Vec::new(), Vec::new());
     let (mut codes, mut factors, mut keep, mut copies, mut block) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let windows = members.windows(src.window);
 
-    for window in members.windows(src.window) {
+    for (w, window) in windows.into_iter().enumerate().skip(start.windows) {
         let first = members.starts[window.start];
         let slice = &members.order[first..members.starts[window.end]];
         rows.resize(slice.len() * rb, 0);
@@ -534,13 +722,23 @@ fn write_lists(
         }
         wanted.sort_unstable();
         gather_rows(src, &wanted, &mut rows, &mut pieces.0, done)?;
-        for row in rows.chunks_exact(rb) {
+        // A slot's row stays in memory when its old page was.
+        kept_slots.clear();
+        kept_slots.resize(slice.len(), false);
+        wanted
+            .iter()
+            .filter(|&&(v, _)| resident.get(v as usize / src.per_page).copied().unwrap_or(false))
+            .for_each(|&(_, slot)| kept_slots[slot as usize] = true);
+        for (slot, row) in rows.chunks_exact(rb).enumerate() {
             page[in_page * rb..(in_page + 1) * rb].copy_from_slice(row);
-            in_page += 1;
+            (in_page, page_kept) = (in_page + 1, page_kept || kept_slots[slot]);
             if in_page == src.per_page {
-                t2.write(&page)?;
+                match page_kept {
+                    true => t2.write_kept(&page)?,
+                    false => t2.write(&page)?,
+                }
                 page.fill(0);
-                in_page = 0;
+                (in_page, page_kept) = (0, false);
             }
             ids.write(&sq8::id(row, src.dim).to_le_bytes())?;
         }
@@ -581,11 +779,26 @@ fn write_lists(
             &rows,
             pool,
         )?;
-        blocks.iter().try_for_each(|b| t1.write(b))?;
+        match keeps {
+            true => blocks.iter().try_for_each(|b| t1.write_kept(b))?,
+            false => blocks.iter().try_for_each(|b| t1.write(b))?,
+        }
+        let mark = Mark {
+            windows: w + 1,
+            sections: [t1.reached()?, t2.reached()?, ids.reached()?],
+            page: page[..in_page * rb].to_vec(),
+            copied: done.copied,
+            reencoded: done.reencoded,
+            bytes_read: done.bytes_read,
+        };
+        progress.reached(&mark)?;
     }
 
     if in_page > 0 {
-        t2.write(&page)?;
+        match page_kept {
+            true => t2.write_kept(&page)?,
+            false => t2.write(&page)?,
+        }
     }
 
     // The ids section ends in the tombstones, one bit per vector, all clear in a new file.
@@ -621,7 +834,7 @@ fn gather_rows(
             j += 1;
         }
         buf.resize((last + 1 - first) * page_size, 0);
-        io::read_at(src.file(), &mut buf, section + first * page_size)?;
+        src.read(&mut buf, section + first * page_size)?;
         done.bytes_read += buf.len() as u64;
         for (k, page) in buf.chunks_exact(page_size).enumerate() {
             pieces.record(first + k, page);
@@ -656,7 +869,7 @@ fn copy_lanes(
         let j0 = copies[i].0 as usize;
         let list = src.tables.lists[j0];
         buf.resize(list.count.div_ceil(BLOCK) * size, 0);
-        io::read_at(src.file(), buf, section + list.offset)?;
+        src.read(buf, section + list.offset)?;
         done.bytes_read += buf.len() as u64;
         pieces.record_list(j0, buf);
         while i < copies.len() && copies[i].0 as usize == j0 {
@@ -848,7 +1061,7 @@ impl Pieces {
                 q += 1;
             }
             buf.resize(self.bounds[q] - self.bounds[p], 0);
-            io::read_at(src.file(), &mut buf, self.bounds[p])?;
+            src.read(&mut buf, self.bounds[p])?;
             done.bytes_read += buf.len() as u64;
             for k in p..q {
                 let bytes = &buf[self.bounds[k] - self.bounds[p]..self.bounds[k + 1] - self.bounds[p]];

@@ -36,6 +36,11 @@ pub struct Trace {
     pub rerank: Duration,
     /// The vectors in the clusters it scanned, not counting inserted ones.
     pub scanned: usize,
+    /// The inserts since the last maintenance run that it scanned, those of the clusters it scanned and of the clusters
+    /// ranked next, and the generation of the index that it searched, which each maintenance run's commit moves on by
+    /// one. Over several collections it adds up the inserts and keeps the last collection's generation.
+    pub inserts_scanned: usize,
+    pub generation: u64,
     /// The cluster reads, in bytes and in ranges, once rounded out to pages.
     pub cluster_bytes: usize,
     pub cluster_ranges: usize,

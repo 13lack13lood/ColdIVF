@@ -35,13 +35,13 @@ pub(crate) fn plan(ctx: &Ctx, report: &mut RunReport) -> Result<Plan, Error> {
         spherical: false,
         seed: rng.next_u64(),
     };
-    let all = Streamed::new(ctx.old, ctx.delta, &ids);
+    let all = Streamed::new(ctx.old, ctx.gate, ctx.delta, &ids);
     let (centers, trained) = match per > 0 && per.saturating_mul(k) < n {
         true => {
             let picked = kmeans::pick(n, per * k, &mut rng);
             let sample: Vec<u32> = picked.iter().map(|&i| ids[i as usize]).collect();
             let mut rows = Vec::new();
-            report.bytes_read += rows::read_rows(ctx.old, ctx.delta, &sample, &mut rows)?;
+            report.bytes_read += rows::read_rows(ctx.old, ctx.gate, ctx.delta, &sample, &mut rows)?;
             let held = Held {
                 rows,
                 dim,

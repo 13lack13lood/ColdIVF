@@ -1135,7 +1135,7 @@ fn every_open_handle_of_an_index_moves_with_its_writer_s_commits() {
     for index in [&a, &b, &set.indexes[0], &writer.index] {
         assert!(Arc::ptr_eq(&index.shared, &a.shared));
         assert_eq!(index.inner().layout().epoch, epoch + 1);
-        assert_eq!(index.inner().changes().read().len(), 0);
+        assert_eq!(index.inner().changes().load().len(), 0);
     }
 
     let sp = SearchParams {
@@ -1229,6 +1229,74 @@ fn a_writer_frees_an_old_generation_once_no_search_or_fetch_holds_it() {
     writer.delete(5).unwrap();
     assert_eq!(index.shared.retired(), 0);
     assert!(old.upgrade().is_none());
+}
+
+#[test]
+fn a_route_of_another_index_with_the_same_context_keeps_a_stale_route_from_being_fetched() {
+    let (a_path, rows) = rooted("routes-a.coldivf");
+    let (b_path, _) = rooted("routes-b.coldivf");
+    let (a, b) = (Index::open(&a_path).unwrap(), Index::open(&b_path).unwrap());
+    let mut writer = crate::Writer::open(&a_path).unwrap();
+    let q = &rows.data[..128];
+    let mut c = ctx();
+    let (mut la, mut lb) = (Vec::new(), Vec::new());
+    a.route(q, 8, None, &mut c, &mut la).unwrap();
+    b.route(q, 8, None, &mut c, &mut lb).unwrap();
+    // A major run into clusters half as large, so the old positions name other clusters.
+    let finer = crate::MaintainParams {
+        vectors_per_list: 25,
+        ..crate::maintain::tests::settings()
+    };
+    writer.maintain(&finer, crate::RunKind::Major).unwrap();
+    assert_eq!(
+        a.fetch(&la, &mut c).map(|_| ()).unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    // B's route is still of B's generation, and A's next route fetches.
+    b.fetch(&lb, &mut c).unwrap().search(q, 10, 40).unwrap();
+    a.route(q, 8, None, &mut c, &mut la).unwrap();
+    a.fetch(&la, &mut c).unwrap().search(q, 10, 40).unwrap();
+}
+
+#[test]
+fn a_prepare_after_a_commit_of_this_process_s_writer_opens_nothing_and_frees_nothing() {
+    let (path, rows) = rooted("own-commit.coldivf");
+    let index = Index::open(&path).unwrap();
+    let mut writer = crate::Writer::open(&path).unwrap();
+    let mut c = ctx();
+    let mut leaves = Vec::new();
+    index.prepare(&mut c).unwrap();
+    index.route(&rows.data[..128], 8, None, &mut c, &mut leaves).unwrap();
+    let fetched = index.fetch(&leaves, &mut c).unwrap();
+    writer.insert(90_000, &rows.data[128..256]).unwrap();
+    writer.compact().unwrap();
+    // The fetch held the old generation through the commit, so it waits to be freed.
+    fetched.search(&rows.data[..128], 10, 40).unwrap();
+    assert!(!index.shared.may_have_moved(), "the commit left a stamp of other files");
+
+    let at = index.inner().located().clone();
+    let slot = crate::root::folder(&path).join(crate::root::SLOTS[(at.generation % 2) as usize]);
+
+    // Then a slot that looks written again, with the same root, changes the stamp, so a prepare looks, but nothing
+    // moved, so it frees nothing either.
+    for when in ["after the commit", "after the slot write"] {
+        if when == "after the slot write" {
+            let file = std::fs::File::options().write(true).open(&slot).unwrap();
+            let written = file.metadata().unwrap().modified().unwrap();
+            file.set_modified(written + std::time::Duration::from_secs(1)).unwrap();
+            assert!(index.shared.may_have_moved());
+        }
+        let locks = crate::update::LOCKS.with(|n| n.get());
+        index.prepare(&mut c).unwrap();
+        assert_eq!(
+            crate::update::LOCKS.with(|n| n.get()),
+            locks,
+            "a prepare {when} took a lock"
+        );
+        assert_eq!(index.inner().located(), &at, "{when}");
+        assert_eq!(index.shared.retired(), 1, "a prepare {when} freed the old generation");
+        assert!(!index.shared.may_have_moved(), "{when}");
+    }
 }
 
 /// Every cluster read and every candidate rescored, within `ctx`'s limits.

@@ -312,26 +312,73 @@ fn assemble(
     Ok((t1.finish()?, t2.finish()?, ids.finish()?))
 }
 
+/// Where a section's bytes go: a file, or a maintenance job's gated writes to one.
+pub(crate) trait Sink: Sync {
+    /// Writes all of `bytes` at `offset`.
+    fn write_at(&self, bytes: &[u8], offset: usize) -> Result<(), Error>;
+
+    /// The same, for bytes that should stay in the system's cache of file pages once written, eg. what searches of a
+    /// warm index read.
+    fn write_kept_at(&self, bytes: &[u8], offset: usize) -> Result<(), Error> {
+        self.write_at(bytes, offset)
+    }
+}
+
+impl Sink for File {
+    fn write_at(&self, bytes: &[u8], offset: usize) -> Result<(), Error> {
+        write_at(self, bytes, offset)
+    }
+}
+
+/// How far a section got: the offset it reached in the file, and the checksum and length of what it wrote.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Reached {
+    pub(crate) at: usize,
+    pub(crate) crc: u32,
+    pub(crate) len: u64,
+}
+
 /// A section of the file written in order through a buffer, with a running checksum.
-pub(crate) struct Section<'a> {
-    file: &'a File,
+pub(crate) struct Section<'a, S: Sink + ?Sized = File> {
+    out: &'a S,
     at: usize,
+    len: u64,
     buffer: Vec<u8>,
+    /// The parts of the buffer that `write_kept` wrote, in order.
+    kept: Vec<std::ops::Range<usize>>,
     crc: crc32fast::Hasher,
 }
 
-impl<'a> Section<'a> {
-    pub(crate) fn new(file: &'a File, at: usize) -> Section<'a> {
+impl<'a, S: Sink + ?Sized> Section<'a, S> {
+    pub(crate) fn new(out: &'a S, at: usize) -> Section<'a, S> {
+        Section::resume(out, Reached { at, crc: 0, len: 0 })
+    }
+
+    /// The section as `reached` left it, eg. in an earlier try of the same write.
+    pub(crate) fn resume(out: &'a S, reached: Reached) -> Section<'a, S> {
         Section {
-            file,
-            at,
+            out,
+            at: reached.at,
+            len: reached.len,
             buffer: Vec::with_capacity(SPILL_BUFFER),
-            crc: crc32fast::Hasher::new(),
+            kept: Vec::new(),
+            crc: crc32fast::Hasher::new_with_initial_len(reached.crc, reached.len),
         }
+    }
+
+    /// Writes what the buffer holds and returns how far the section got.
+    pub(crate) fn reached(&mut self) -> Result<Reached, Error> {
+        self.flush()?;
+        Ok(Reached {
+            at: self.at,
+            crc: self.crc.clone().finalize(),
+            len: self.len,
+        })
     }
 
     pub(crate) fn write(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.crc.update(bytes);
+        self.len += bytes.len() as u64;
         self.buffer.extend_from_slice(bytes);
 
         if self.buffer.len() >= SPILL_BUFFER {
@@ -341,8 +388,32 @@ impl<'a> Section<'a> {
         Ok(())
     }
 
+    /// The same, for bytes that should stay in the system's cache once written, which go out through `write_kept_at`.
+    pub(crate) fn write_kept(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let start = self.buffer.len();
+        match self.kept.last_mut() {
+            Some(last) if last.end == start => last.end += bytes.len(),
+            _ => self.kept.push(start..start + bytes.len()),
+        }
+        self.write(bytes)
+    }
+
     fn flush(&mut self) -> Result<(), Error> {
-        write_at(self.file, &self.buffer, self.at)?;
+        let mut done = 0;
+
+        for kept in std::mem::take(&mut self.kept) {
+            if kept.start > done {
+                self.out.write_at(&self.buffer[done..kept.start], self.at + done)?;
+            }
+            self.out
+                .write_kept_at(&self.buffer[kept.clone()], self.at + kept.start)?;
+            done = kept.end;
+        }
+
+        if done < self.buffer.len() {
+            self.out.write_at(&self.buffer[done..], self.at + done)?;
+        }
+
         self.at += self.buffer.len();
         self.buffer.clear();
         Ok(())

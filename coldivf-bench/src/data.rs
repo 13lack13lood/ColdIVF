@@ -334,12 +334,23 @@ impl Dataset {
 
     /// Opens it the same way, from the data folder `root` and the folder of derived data `derived`.
     pub fn open_in(root: &Path, derived: &Path, name: &str, n: Option<usize>) -> Result<Dataset, Error> {
+        Dataset::open_from(root, derived, name, n, true)
+    }
+
+    /// Opens it from the data folder `root` with the truth that `gt` writes in `derived`, `<name>-<n>.gt.ibin`, even
+    /// for the whole base, eg. to take a truth that has its distances file where the data folder's has none.
+    pub fn open_derived(root: &Path, derived: &Path, name: &str, n: Option<usize>) -> Result<Dataset, Error> {
+        Dataset::open_from(root, derived, name, n, false)
+    }
+
+    /// Opens it with the truth of the whole base from the data folder when `shipped` allows it and it is there.
+    fn open_from(root: &Path, derived: &Path, name: &str, n: Option<usize>, shipped: bool) -> Result<Dataset, Error> {
         let base = Fbin::open(&root.join(format!("{name}.base.fbin")))?;
         let queries = Fbin::open(&root.join(format!("{name}.query.fbin")))?;
         let n = n.unwrap_or(base.len()).min(base.len());
-        let shipped = root.join(format!("{name}.gt.ibin"));
-        let path = match n == base.len() && shipped.exists() {
-            true => shipped,
+        let whole = root.join(format!("{name}.gt.ibin"));
+        let path = match shipped && n == base.len() && whole.exists() {
+            true => whole,
             false => subset_truth_in(derived, name, n),
         };
         let truth = Ibin::open(&path)?;

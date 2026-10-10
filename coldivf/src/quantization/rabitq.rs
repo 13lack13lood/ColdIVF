@@ -146,6 +146,16 @@ impl<'a> Encoder<'a> {
         assert!(center.len() == dim && bits.len() == code_bytes(padded_dim(dim)));
 
         rotate_offset(self.rotation, o, self.mean, &mut self.rotated, &mut self.tmp);
+        self.again_from(center, bits)
+    }
+
+    /// Encodes the vector of the last `encode_from` again, measured from another center, eg. its cluster's center in
+    /// another generation of the index. It reuses the rotation, so it gives the bits that `encode_from` of the same
+    /// vector and center gives.
+    pub(crate) fn again_from(&mut self, center: &[f32], bits: &mut [u8]) -> Factors {
+        let dim = self.rotation.dim();
+        assert!(center.len() == dim && bits.len() == code_bytes(padded_dim(dim)));
+
         bits.fill(0);
         let (mut l2, mut abs_sum, mut bc, mut pop) = (0f64, 0f64, 0f64, 0u32);
 
@@ -217,6 +227,10 @@ pub(crate) struct QueryLut {
     pub(crate) qu: Vec<u8>,
     /// 16 entries per 4-bit group, d_pad/4 groups.
     pub(crate) lut: Vec<u8>,
+    /// Bit b of each q_u,i, as 4 planes of d_pad/8 bytes laid out as codes are, so one code's sum is a few popcounts,
+    /// and whether they are made for the query that `prepare` took. Only scans of few codes need them.
+    pub(crate) planes: Vec<u8>,
+    planes_made: bool,
     /// The constants of est for the codes it scans next.
     pub(crate) k: QueryConsts,
     /// The constants as `prepare` set them, with t and t2 measured from the mean.
@@ -232,6 +246,8 @@ impl QueryLut {
             dim,
             qu: vec![0; d_pad],
             lut: vec![0; 4 * d_pad],
+            planes: vec![0; 4 * code_bytes(d_pad)],
+            planes_made: false,
             k: QueryConsts::default(),
             mean: QueryConsts::default(),
             e2: 0.0,
@@ -245,6 +261,7 @@ impl QueryLut {
 
         self.qu.fill(0);
         self.lut.fill(0);
+        self.planes_made = false;
         self.k = QueryConsts::default();
         self.mean = self.k;
         self.e2 = 0.0;
@@ -314,6 +331,43 @@ impl QueryLut {
     pub(crate) fn set_anchor(&mut self, t2: f64) {
         self.k = self.anchored(t2);
     }
+
+    /// Makes the bit planes of the prepared query, unless they are made.
+    pub(crate) fn make_planes(&mut self) {
+        if self.planes_made {
+            return;
+        }
+
+        let cb = self.planes.len() / 4;
+        self.planes.fill(0);
+
+        for (i, &q) in self.qu.iter().enumerate() {
+            for b in 0..4 {
+                self.planes[b * cb + i / 8] |= ((q >> b) & 1) << (i % 8);
+            }
+        }
+
+        self.planes_made = true;
+    }
+}
+
+/// The sum s of one code, as `code_sum` gives it, from the query's bit planes `planes`, which `make_planes` made. It is
+/// the sum over b of 2^b times the number of bits that the code and plane b both set.
+pub(crate) fn plane_sum(code: &[u8], planes: &[u8]) -> u32 {
+    let cb = code.len();
+    let code = code.as_chunks::<8>().0;
+
+    (0..4)
+        .map(|b| {
+            let plane = planes[b * cb..(b + 1) * cb].as_chunks::<8>().0;
+            let ones: u32 = code
+                .iter()
+                .zip(plane)
+                .map(|(c, p)| (u64::from_le_bytes(*c) & u64::from_le_bytes(*p)).count_ones())
+                .sum();
+            ones << b
+        })
+        .sum()
 }
 
 /// The estimated squared distance to a vector, from its sum s and its factors. Every path uses these three fused

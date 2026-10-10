@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use maintain::job::{Cancel, Done, Job, SyncKind, Throttle, ThrottleParams};
 #[cfg(feature = "bench")]
 pub use trace::{ReadPath, Trace};
 
@@ -52,7 +53,7 @@ pub enum LeafOrder {
 pub enum Anchor {
     /// The center of the vector's cluster. It sits nearer to the vector than the mean does, so a search needs fewer
     /// rescored candidates for the same recall. Each search also measures the query's distance to the center of every
-    /// cluster it scans, and of every cluster that holds inserts until a compaction. This is the default.
+    /// cluster it scans, and of each cluster past them whose pending inserts it scans. This is the default.
     #[default]
     Cluster,
     /// The mean of all the vectors. It is the baseline for measuring what the cluster anchor gains.
@@ -204,16 +205,19 @@ impl Index {
         self.shared.refresh()
     }
 
-    /// Call this when the query text arrives. It moves to the index's newest generation, as `refresh` does, then starts
-    /// reading the cluster tables, so that read overlaps the embedding model, and it makes `ctx`'s buffers for this
-    /// index ahead of the search and readies its reads, eg. an io_uring ring on Linux. The buffer for the clusters is
-    /// sized from the tables, so until a search has loaded them, the first search still makes that one. Once a search
-    /// has gone through `ctx`'s reads of the index, it also does the setup that waits, so no search pays for it, eg. on
-    /// Linux 5.13 and later it registers the buffers with the kernel where they fit the locked-memory limit. A failed
-    /// move leaves the index on the generation it has.
+    /// Call this when the query text arrives. It moves to the index's newest generation, as `refresh` does, but frees
+    /// old generations only when it moved. Then it starts reading the cluster tables, so that read overlaps the
+    /// embedding model, and it makes `ctx`'s buffers for this index ahead of the search and readies its reads, eg. an
+    /// io_uring ring on Linux. The buffer for the clusters is sized from the tables, so until a search has loaded them,
+    /// the first search still makes that one. Once a search has gone through `ctx`'s reads of the index, it also does
+    /// the setup that waits, so no search pays for it, eg. on Linux 5.13 and later it registers the buffers with the
+    /// kernel where they fit the locked-memory limit. A failed move leaves the index on the generation it has.
     pub fn prepare(&self, ctx: &mut SearchCtx) -> Result<(), Error> {
-        if self.shared.may_have_moved() {
-            let _ = self.shared.refresh();
+        self.shared.note();
+
+        // A move opened the new generation already, so freeing the old ones costs it little more.
+        if self.shared.may_have_moved() && self.shared.follow().unwrap_or(false) {
+            self.shared.reclaim();
         }
 
         let inner = self.shared.load();
@@ -226,6 +230,7 @@ impl Index {
     /// their vectors, then reads and rescores the best candidates in a second small batch. On a warm index it scores
     /// the clusters in place instead of reading them. The hits live in `ctx`, so a query allocates nothing.
     pub fn search<'a>(&self, query: &[f32], params: &SearchParams, ctx: &'a mut SearchCtx) -> Result<&'a [Hit], Error> {
+        self.shared.note();
         let inner = self.shared.load();
 
         if inner.is_warm() {
@@ -244,7 +249,9 @@ impl Index {
 
     /// Writes the positions of the clusters `query` would read into `out`, nearest first. They are the `nprobe`
     /// nearest, or with a `reach`, those of them within it, as in [`SearchParams`]. The positions belong to the
-    /// index's current generation, and `ctx` keeps which one, so a fetch with `ctx` after a commit fails.
+    /// index's current generation, and `ctx` keeps which one, so a fetch with `ctx` after a commit fails. When the
+    /// index has pending inserts, `ctx` also keeps the clusters ranked after those, up to the 256 nearest, whose
+    /// inserts a search of what is fetched scans too.
     pub fn route(
         &self,
         query: &[f32],
@@ -253,30 +260,59 @@ impl Index {
         ctx: &mut SearchCtx,
         out: &mut Vec<LeafId>,
     ) -> Result<(), Error> {
+        self.shared.note();
         let inner = self.shared.load();
         inner.route(query, nprobe, reach, ctx, out)?;
-        ctx.routed = Some((inner.cell(), inner.uid()));
+        let SearchCtx { routed, next, .. } = ctx;
+        let at = match routed.iter().position(|r| r.of(&self.shared)) {
+            Some(at) => at,
+            None => {
+                // The first route of an index with a context makes its entry, and drops those of closed indexes.
+                routed.retain(|r| r.cell.strong_count() > 0);
+                routed.push(Routed {
+                    cell: Arc::downgrade(&self.shared),
+                    generation: 0,
+                    next: Vec::with_capacity(next.capacity()),
+                });
+                routed.len() - 1
+            }
+        };
+        let r = &mut routed[at];
+        r.generation = inner.uid();
+        r.next.clear();
+        r.next.extend_from_slice(next);
         Ok(())
     }
 
     /// Starts reading `leaves` in one batch. On macOS and Linux it returns while the reads are still running. On other
     /// systems, and on Mac drives that refuse read hints, eg. FAT32 (File Allocation Table), it returns once they are
-    /// done. The handle then ranks those clusters, and only those, for one or more queries, along with any vectors
-    /// inserted since the last maintenance run, all of the generation that the index had at the fetch. [`Index::search`]
-    /// is `route` with the same `nprobe` and `reach`, then `fetch`, then [`Fetched::search`]. On a warm index it gives
-    /// the same hits, but scores the clusters in place. When `ctx`'s last route of this index was of an older
-    /// generation, its positions would name other clusters, so the fetch fails with `InvalidInput`, and the caller
-    /// routes again.
+    /// done. The handle then ranks those clusters, and only those, for one or more queries, along with their pending
+    /// inserts and those of the clusters that `ctx`'s last route of the index ranked next, all of the generation that
+    /// the index had at the fetch. [`Index::search`] is `route` with the same `nprobe` and `reach`, then `fetch`, then
+    /// [`Fetched::search`]. On a warm index it gives the same hits, but scores the clusters in place. When `ctx`'s
+    /// last route of this index was of an older generation, its positions would name other clusters, so the fetch
+    /// fails with `InvalidInput`, and the caller routes again.
     pub fn fetch<'a>(&'a self, leaves: &[LeafId], ctx: &'a mut SearchCtx) -> Result<Fetched<'a>, Error> {
+        self.shared.note();
         let inner = self.shared.load_full();
+        let SearchCtx {
+            routed, next, next_of, ..
+        } = &mut *ctx;
+        let last = routed.iter().find(|r| r.of(&self.shared));
 
-        if ctx
-            .routed
-            .is_some_and(|(cell, uid)| cell == inner.cell() && uid != inner.uid())
-        {
+        if last.is_some_and(|r| r.generation != inner.uid()) {
             return Err(search::invalid(
                 "the index moved to a newer generation since the route, so route again",
             ));
+        }
+
+        // The search of what is fetched scans the pending inserts of the clusters that the route ranked next.
+        *next_of = None;
+
+        if let Some(r) = last {
+            next.clear();
+            next.extend_from_slice(&r.next);
+            *next_of = Some((inner.cell(), inner.uid()));
         }
 
         let slot = inner.fetch(leaves, ctx)?;
@@ -347,7 +383,9 @@ impl InMemoryIndex {
 pub struct SearchParams {
     /// How many results to return.
     pub k: usize,
-    /// Clusters to read. At 1M vectors, 160 to 192 finds ~95% of each query's true 10 nearest neighbors.
+    /// Clusters to read. At 1M vectors, 160 to 192 finds ~95% of each query's true 10 nearest neighbors. A search also
+    /// scans the pending inserts of the clusters ranked next, up to the 256 nearest, whose vectors in the file it
+    /// skips.
     pub nprobe: usize,
     /// Candidates to rescore with the more precise copy of each vector. 29 to 39 gives that same ~95%.
     pub rerank: usize,
@@ -388,9 +426,13 @@ pub struct SearchCtx {
     reads: Vec<search::cold::Reads>,
     /// The clusters that a search routes to.
     leaves: Vec<LeafId>,
-    /// The cell and the generation of the index that the last `Index::route` routed, so a fetch of another generation
-    /// fails.
-    routed: Option<(u64, u64)>,
+    /// What the last `Index::route` of each index kept, so a fetch of another generation fails, and a fetch of the
+    /// same one scans the inserts of the clusters that the route ranked next.
+    routed: Vec<Routed>,
+    /// The clusters that the last route of an index with pending inserts ranked after the ones it returned, whose
+    /// inserts a search of what is fetched scans too, and the cell and the generation of the index it routed.
+    next: Vec<LeafId>,
+    next_of: Option<(u64, u64)>,
     hits: Vec<Hit>,
     /// Each collection's part of a search over several, and the routes and candidates of all of them.
     parts: Vec<multi::Part>,
@@ -408,7 +450,9 @@ impl SearchCtx {
             scratch: Vec::new(),
             reads: Vec::new(),
             leaves: Vec::with_capacity(limits.max_nprobe),
-            routed: None,
+            routed: Vec::new(),
+            next: Vec::with_capacity(limits.max_nprobe.max(search::PENDING_LISTS)),
+            next_of: None,
             hits: Vec::with_capacity(limits.max_k),
             parts: Vec::new(),
             loaded: Vec::new(),
@@ -421,6 +465,21 @@ impl SearchCtx {
     #[cfg(feature = "bench")]
     pub fn trace(&self) -> Trace {
         self.trace
+    }
+}
+
+/// What a context keeps of its last route of one index: the index's cell, held weakly so the entry goes once the
+/// index closes, the generation that it routed, and the clusters that it ranked after the ones it returned.
+struct Routed {
+    cell: std::sync::Weak<index::Shared>,
+    generation: u64,
+    next: Vec<LeafId>,
+}
+
+impl Routed {
+    /// Whether this is the entry of the index whose cell is `cell`.
+    fn of(&self, cell: &Arc<index::Shared>) -> bool {
+        std::sync::Weak::as_ptr(&self.cell) == Arc::as_ptr(cell)
     }
 }
 
@@ -473,11 +532,11 @@ impl Index {
 /// only with [`LeafOrder::Id`].
 pub type LeafId = u32;
 
-/// Clusters being read in one batch. Rank them for any number of queries. Nothing outside them is ever read, though the
-/// vectors inserted since the last maintenance run are ranked with them. It keeps the generation that the index had at
-/// the fetch, so a commit meanwhile changes nothing it ranks. Use it to read once and rank several versions of a query,
-/// or to start reading from a guessed query before the final one is known. Dropping it cancels or finishes the pending
-/// reads.
+/// Clusters being read in one batch. Rank them for any number of queries. Nothing outside them is ever read, though
+/// their pending inserts, and those of the clusters that the route ranked next, are ranked with them. It keeps the
+/// generation that the index had at the fetch, so a commit meanwhile changes nothing it ranks. Use it to read once and
+/// rank several versions of a query, or to start reading from a guessed query before the final one is known. Dropping
+/// it cancels or finishes the pending reads.
 pub struct Fetched<'a> {
     index: &'a Index,
     inner: Arc<index::Inner>,
@@ -493,8 +552,8 @@ impl<'a> Fetched<'a> {
         self.inner.prefetch_rows(query, n, self.ctx, self.slot)
     }
 
-    /// Ranks the fetched clusters for `query`. It scores every vector, reads any precise copies not read yet,
-    /// rescores the best `rerank` candidates and returns the top `k`.
+    /// Ranks the fetched clusters for `query`. It scores every vector, and the pending inserts that `fetch` names,
+    /// reads any precise copies not read yet, rescores the best `rerank` candidates and returns the top `k`.
     pub fn search(self, query: &[f32], k: usize, rerank: usize) -> Result<&'a [Hit], Error> {
         let params = SearchParams {
             k,
@@ -537,7 +596,8 @@ impl Collections {
 
 /// Inserts and deletes for one collection. They go to a crash-safe log next to the file. The next search of any open
 /// index of the file in this process sees them, and so does any index opened later, in any process. `maintain` folds
-/// them into a new file and clusters again what drifted, and `compact` only folds them.
+/// them into a new file and clusters again what drifted, and `compact` only folds them. `begin_compact` starts the
+/// same as a job that runs on another thread.
 pub struct Writer {
     path: PathBuf,
     index: Index,
@@ -546,6 +606,21 @@ pub struct Writer {
     root: root::Owner,
     /// For routing each insert to its nearest cluster.
     ctx: SearchCtx,
+    /// What the writer shares with its job while one may run, and the lanes in the job's next generation of the
+    /// inserts made since the job's plan fixed that generation's centers.
+    job: Option<Arc<maintain::job::Link>>,
+    lanes: Vec<maintain::Lane>,
+    /// The inserts waiting at which inserts fail, while the write budget defers maintenance and a hard cap is set.
+    cap: Option<usize>,
+}
+
+impl Drop for Writer {
+    /// Cancels the writer's job, which keeps what it recorded for the next job of the same generation.
+    fn drop(&mut self) {
+        if let Some(link) = &self.job {
+            link.cancel();
+        }
+    }
 }
 
 impl Writer {
@@ -579,24 +654,52 @@ impl Writer {
             log,
             root,
             ctx: SearchCtx::new(limits),
+            job: None,
+            lanes: Vec::new(),
+            cap: None,
         })
     }
 
-    /// Adds `vector` with the id `id`, replacing any earlier vector with that id. With the cluster anchor its code is
-    /// measured from the center of its nearest cluster, so it scores as it would in the file. Until a compaction, each
-    /// search then also measures the query's distance to the center of every cluster that holds inserts, and each of
-    /// those costs about as much as scanning 10 inserts. Every open index of the file in this process sees it from its
-    /// next search, and indexes opened later read it from the log. It survives the process dying, and
-    /// [`Writer::sync`] makes it survive a power loss too.
+    /// Adds `vector` with the id `id`, replacing any earlier vector with that id. It joins its nearest cluster, and
+    /// with the cluster anchor its code is measured from that cluster's center, so it scores as it would in the file.
+    /// Until a maintenance run folds it in, a search scans it when its cluster is among the `nprobe` nearest the query,
+    /// or among the 256 nearest when that is more. Every open index of the file in this process sees it from its next
+    /// search, and indexes opened later read it from the log. It survives the process dying, and [`Writer::sync`] makes
+    /// it survive a power loss too.
     pub fn insert(&mut self, id: u64, vector: &[f32]) -> Result<(), Error> {
         self.index.shared.reclaim();
         let inner = self.index.inner();
-        let (leaf, code, factors, row) = inner.encode_insert(id, vector, &mut self.ctx)?;
-        update::insert(&mut self.log, inner.changes(), id, leaf, &code, factors, &row)
+
+        // A job that ended without a file to commit no longer needs the inserts measured for its generation.
+        if self.job.as_ref().is_some_and(|l| !l.live()) {
+            (self.job, self.lanes) = (None, Vec::new());
+        }
+
+        if self.cap.is_some_and(|cap| inner.changes().load().len() >= cap) {
+            return Err(Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "maintenance is deferred and the inserts that wait reached the hard cap",
+            ));
+        }
+
+        let next = self.job.as_ref().and_then(|l| l.centers()).map(|c| c.centers());
+        let e = inner.encode_insert(id, vector, &mut self.ctx, next)?;
+        let seq = update::insert(&mut self.log, inner.changes(), id, e.leaf, &e.code, e.factors, &e.row)?;
+
+        if let Some((list, code, factors)) = e.next {
+            self.lanes.push(maintain::Lane {
+                seq,
+                list,
+                code,
+                factors,
+            });
+        }
+
+        Ok(())
     }
 
-    /// Removes the vector with the id `id`, if there is one, the same way. Until a compaction, a deleted vector still
-    /// takes a place among the candidates that a search rescores.
+    /// Removes the vector with the id `id`, if there is one, the same way. A search skips it before it ranks the
+    /// candidates to rescore, and a maintenance run drops its row from the file.
     pub fn delete(&mut self, id: u64) -> Result<(), Error> {
         self.index.shared.reclaim();
         update::delete(&mut self.log, self.index.inner().changes(), id)
@@ -626,25 +729,125 @@ impl Writer {
     /// [`Index::refresh`] or [`Index::prepare`]. A damaged trailer, which holds only the regions and the counts that say
     /// when runs are due, is made again as for a fresh build. A run that fails before its commit leaves the index as it
     /// was. One that fails while it writes the root leaves unknown whether it committed, so the writer then refuses
-    /// changes until it is opened again, which finds the generation that is current.
+    /// changes until it is opened again, which finds the generation that is current. It is a job of `kind`, run at once
+    /// on the calling thread with [`Throttle::none`], then committed, whatever `params.start` says.
     pub fn maintain(&mut self, params: &MaintainParams, kind: RunKind) -> Result<RunReport, Error> {
+        let mut job = self.begin(params, kind)?;
+        let done = job.run(&Throttle::none())?;
+        drop(job);
+        self.finish_compact(done)
+    }
+
+    /// Starts a maintenance run as a job that runs on any thread while the writer goes on, eg. a background thread of
+    /// the app's: [`Job::run`] plans and writes the next generation's data file, and `finish_compact` commits it. The
+    /// job folds in the changes made until now, which it first makes survive a power loss, as [`Writer::sync`] does,
+    /// and those made later move to the new generation's log at the commit. It is a run of [`RunKind::Auto`], or
+    /// [`RunKind::Major`] when the read-cost indicator calls for one. Returns `None` when no run is due, as
+    /// `params.start` says, or when the minimum interval or the write budget holds it back. While the budget defers
+    /// maintenance, [`Writer::status`] says so, and with `params.start.hard_cap` set inserts fail with `WouldBlock`
+    /// once enough wait. When an earlier job of the current generation was cancelled, eg. because its writer dropped,
+    /// the new job goes on from where it got, whatever is due. A writer runs one job at a time, so while its job or
+    /// that job's [`Done`] lives, this fails with `WouldBlock`.
+    pub fn begin_compact(&mut self, params: &MaintainParams) -> Result<Option<Job>, Error> {
+        if !maintain::job::kept(&self.root).is_empty() {
+            return self.begin(params, RunKind::Auto).map(Some);
+        }
+
+        let inner = self.index.inner();
+        let (status, decision) = maintain::status(&inner, params, self.idle())?;
+        let (count, nlist) = (inner.layout().count + status.pending, inner.layout().nlist);
+        let soft = maintain::policy::soft_limit(&params.start, count, inner.dim(), nlist);
+        let cap = params
+            .start
+            .hard_cap
+            .map(|f| (f64::from(f) * soft as f64).ceil() as usize);
+        drop(inner);
+        self.cap = cap.filter(|_| decision.deferred);
+
+        match decision.start {
+            Some(kind) => self.begin(params, kind).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Starts a job of `kind`.
+    fn begin(&mut self, params: &MaintainParams, kind: RunKind) -> Result<Job, Error> {
+        self.log.check()?;
+
+        if self.job.as_ref().is_some_and(|l| l.live()) {
+            return Err(Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "a maintenance job of this writer is still under way",
+            ));
+        }
+
+        self.lanes.clear();
+        // The changes that the job's snapshot takes survive a power cut before any resume file names the snapshot, so
+        // a job that goes on from one never reuses what it wrote from changes that are gone.
+        self.log.sync()?;
+        let (job, link) = maintain::job::begin(&mut self.root, &self.index.shared, params, kind)?;
+        (self.job, self.cap) = (Some(link), None);
+        Ok(job)
+    }
+
+    /// Commits the next generation that a job of this writer wrote, as `maintain` does once its run ends, and returns
+    /// what the run did. The inserts made since the job began take the lanes that the job and the writer measured for
+    /// them. When the index was warm as the job began, the new generation is warm too: the job wrote its codes, and
+    /// the row pages that hold rows whose old pages were in memory, through the system's cache, and the commit touches
+    /// each page of the codes, so the first searches after it take no page faults for them. A job of another writer, or
+    /// one whose generation is no longer current, fails with `InvalidInput`, and its file goes.
+    pub fn finish_compact(&mut self, mut done: Done) -> Result<RunReport, Error> {
         self.log.check()?;
         let old = self.index.shared.load_full();
-        let (next, file) = self.root.next()?;
-        let (snapshot, report) = maintain::run(&old, &file, &next.data, params, kind)?;
-        drop(file);
-        let (new, log) = maintain::commit(&mut self.root, next, &self.path, old.layout(), &snapshot, &mut self.log)?;
-        // A refresh of this process may have moved the cell to the new generation first, which is as good.
-        self.index.shared.publish(&old, new);
+
+        if done.writer != self.root.writer() || done.base.uid() != old.uid() {
+            return Err(search::invalid(
+                "the job belongs to another writer, or the index moved on since it began",
+            ));
+        }
+
+        let mut lanes = std::mem::take(&mut self.lanes);
+        lanes.append(&mut done.lanes);
+        // Where both measured an insert, the writer's lane, from the vector itself, comes first and stays.
+        lanes.sort_by_key(|l| l.seq);
+        lanes.dedup_by_key(|l| l.seq);
+        self.job = None;
+        let next = done
+            .next
+            .take()
+            .ok_or_else(|| search::invalid("the job's files are gone"))?;
+        let (snapshot, layout) = (done.snapshot, old.layout());
+        let committing = self.index.shared.committing();
+        let (new, log) = maintain::commit(
+            &mut self.root,
+            next,
+            &self.path,
+            layout,
+            &snapshot,
+            &mut self.log,
+            &lanes,
+            done.warm,
+        )?;
+        self.index.shared.publish_own(&old, new);
+        drop(committing);
         self.log = log;
         drop(old);
+        let report = done.report.clone();
+        let ran = maintain::policy::Ran::of(&report, maintain::policy::now_ms(), done.cost);
+        maintain::policy::record(&self.path, &ran);
+        drop(done);
         self.index.shared.reclaim();
         Ok(report)
     }
 
     /// What maintenance with `params` would do now. It reads the file's ids when a change hid any vector.
     pub fn status(&self, params: &MaintainParams) -> Result<Status, Error> {
-        maintain::status(&self.index.inner(), params)
+        Ok(maintain::status(&self.index.inner(), params, self.idle())?.0)
+    }
+
+    /// How long no search of the index ran, in any process that shares its activity word.
+    fn idle(&self) -> Duration {
+        Duration::from_nanos(io::now_ns().saturating_sub(self.index.shared.activity().last()))
     }
 }
 
@@ -667,6 +870,10 @@ pub struct MaintainParams {
     /// Seeds every k-means of a run. 0 takes the file's seed plus its epoch, so each run of a file draws other starting
     /// centers, and a repeat of the same run draws the same ones.
     pub seed: u64,
+    /// When [`Writer::begin_compact`] starts a job, and what holds it back.
+    pub start: StartParams,
+    /// How a job spaces its disk work, for the [`Throttle`] that runs it.
+    pub throttle: ThrottleParams,
 }
 
 impl Default for MaintainParams {
@@ -680,6 +887,56 @@ impl Default for MaintainParams {
             order: LeafOrder::Chained,
             threads: 0,
             seed: 0,
+            start: StartParams::default(),
+            throttle: ThrottleParams::default(),
+        }
+    }
+}
+
+/// When [`Writer::begin_compact`] starts a job. A run is due once what changes cost searches passes a threshold: the
+/// inserts that wait in memory, the vectors that changes hid, or the extra scanning that both cause. With `idle` set it
+/// is also due once the index sits idle with half as much to do, or with a region due. A region that is due alone never
+/// starts a run. Then the minimum interval and the write budget can hold a due run back.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StartParams {
+    /// A run is due once the inserts that wait in the log reach this share of the vector count, 5%, or as many as
+    /// `ram_budget` bytes hold in memory, if fewer. In memory each cluster's pending inserts take whole blocks of 32
+    /// codes, so the budget holds fewer inserts the more clusters the index has, eg. with the default 32 MB about
+    /// 12,000 of 768 dimensions in an index of 1M vectors, and 7,000 in one of 10M.
+    pub pending_share: f32,
+    pub ram_budget: usize,
+    /// Or once the vectors that changes hid reach this share of the vector count, 5%.
+    pub dead_share: f32,
+    /// Or once the searches since the last run, at least `excess_queries` of them, 1,000, scanned this share more than
+    /// they would with every change folded in, 5%: the pending inserts of the clusters they read, and the hidden
+    /// vectors.
+    pub read_excess: f32,
+    pub excess_queries: usize,
+    /// When set, eg. to 10 minutes while the device is plugged in, also once no search ran for this long and half the
+    /// inserts that make a run due wait, or a region is due. `None` by default.
+    pub idle: Option<Duration>,
+    /// The least time from the end of one run to the start of the next: this, 1 hour, or 10 times the last run's
+    /// length, whichever is more.
+    pub min_interval: Duration,
+    /// The bytes that runs may write in any 24 hours, as a multiple of the data file's size, 2.
+    pub write_budget: f32,
+    /// When set, inserts fail with `WouldBlock` while the budget defers maintenance and the inserts that wait reach
+    /// this multiple of those that make a run due. `None` by default, so inserts never fail for it.
+    pub hard_cap: Option<f32>,
+}
+
+impl Default for StartParams {
+    fn default() -> StartParams {
+        StartParams {
+            pending_share: 0.05,
+            ram_budget: 32 << 20,
+            dead_share: 0.05,
+            read_excess: 0.05,
+            excess_queries: 1000,
+            idle: None,
+            min_interval: Duration::from_secs(3600),
+            write_budget: 2.0,
+            hard_cap: None,
         }
     }
 }
@@ -745,9 +1002,11 @@ pub struct MajorParams {
     pub inserts: Option<f32>,
     /// Once the deletes since the last major run reach this share of the vector count then.
     pub deletes: Option<f32>,
-    /// Once the read-cost indicator stays above this for two minor runs in a row. The indicator divides the bytes a
-    /// query reads for 95% recall by what a fresh clustering of as many vectors would read. Runs don't measure it, so
-    /// this never fires.
+    /// Once the read-cost indicator stays above this for two minor runs in a row, eg. 1.03. The indicator divides the
+    /// bytes a query reads for 95% recall by what a fresh clustering of as many vectors would read, which the last
+    /// major run's bytes, grown by the vector count to the power `beta`, stand for. With this set, each run of a job
+    /// measures it on 500 of the new file's rows and reports it. That reads every row once more and compares it with
+    /// each of the 500.
     pub indicator: Option<f32>,
     /// The indicator's growth exponent β, where a fresh clustering's bytes per query grow as the vector count to the
     /// power β.
@@ -810,6 +1069,10 @@ pub struct RunReport {
     /// Processor time of the run's threads, and the time it took.
     pub cpu: Duration,
     pub wall: Duration,
+    /// The read-cost indicator of the new file, when the run measured it, which it does when `major.indicator` is
+    /// set: the bytes that a query reads for 95% recall over what a fresh clustering of as many vectors would read, as
+    /// the last major run sets it. A major run sets it to 1.
+    pub indicator: Option<f32>,
 }
 
 /// What maintenance would do now.
@@ -820,6 +1083,14 @@ pub struct Status {
     pub deleted: usize,
     pub regions_due: usize,
     pub major_due: bool,
+    /// Whether a run is due, as [`StartParams`] says, and whether the write budget holds it back while the inserts that
+    /// wait reach twice what makes a run due.
+    pub due: bool,
+    pub deferred: bool,
+    /// What the runs of the last 24 hours wrote, measured again from the 8-bit copies, and used of the processor.
+    pub bytes_written_24h: u64,
+    pub reencoded_24h: u64,
+    pub cpu_24h: Duration,
 }
 
 /// The accuracy setting. It is the share of each query's true 10 nearest neighbors that a search must find, eg.

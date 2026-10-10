@@ -195,6 +195,46 @@ pub(crate) fn scan_block(
     }
 }
 
+/// The bytes that one hint of `prefetch` covers, the cache line of Apple's Arm cores, or of other CPUs. A hint may not
+/// reach past its line.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+const LINE: usize = 128;
+#[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+const LINE: usize = 64;
+
+/// Asks the CPU to start bringing every cache line of `items` into its caches and returns without waiting for them, eg.
+/// for the pending inserts of the cluster that a scan reads next. Where the CPU has no such hint, it does nothing.
+#[inline]
+pub(crate) fn prefetch<T>(items: &[T]) {
+    let start = items.as_ptr().cast::<u8>();
+
+    for at in (0..std::mem::size_of_val(items)).step_by(LINE) {
+        let line = start.wrapping_add(at);
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: PRFM only hints the memory system. It loads no register and never faults, and `line` points into
+        // `items` anyway.
+        unsafe {
+            std::arch::asm!(
+                "prfm pldl1keep, [{line}]",
+                line = in(reg) line,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: PREFETCHT0 only hints the memory system. It loads no register and never faults, and `line` points
+        // into `items` anyway.
+        unsafe {
+            std::arch::asm!(
+                "prefetcht0 [{line}]",
+                line = in(reg) line,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let _ = line;
+    }
+}
+
 /// The lanes of a block whose id is below the bound's, from lane 0, as one bit per lane. Lane j has id `first_id + j`,
 /// so they come first.
 #[cfg(target_arch = "x86_64")]

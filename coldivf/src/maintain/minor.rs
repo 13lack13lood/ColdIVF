@@ -79,7 +79,7 @@ fn far_inserts(ctx: &Ctx, share: f32, report: &mut RunReport) -> Result<Vec<u32>
         .map(|&i| rows[i as usize])
         .collect();
     let mut bytes = Vec::new();
-    report.bytes_read += rows::read_rows(old, ctx.delta, &picked, &mut bytes)?;
+    report.bytes_read += rows::read_rows(old, ctx.gate, ctx.delta, &picked, &mut bytes)?;
     let (rb, lists) = (sq8::row_bytes(dim), &ctx.tables.lists);
     let mut o = vec![0f32; dim];
     let mut far_of = |row: &[u8], leaf: usize| {
@@ -382,7 +382,7 @@ fn cluster(
     }
 
     let mut rows = Vec::new();
-    report.bytes_read += rows::read_rows(ctx.old, ctx.delta, members, &mut rows)?;
+    report.bytes_read += rows::read_rows(ctx.old, ctx.gate, ctx.delta, members, &mut rows)?;
     let held = Held {
         rows,
         dim,
@@ -414,7 +414,7 @@ fn nearest_of_all(ctx: &Ctx, d: &mut Drafts, moving: &[u32], report: &mut RunRep
     }
 
     let (ids, centers) = d.centers_of(|_| true);
-    let src = Streamed::new(ctx.old, ctx.delta, moving);
+    let src = Streamed::new(ctx.old, ctx.gate, ctx.delta, moving);
     let best = kmeans::nearest_rows(&centers, &src, 1, CHUNK, ctx.pool)?.0;
     report.bytes_read += src.read.get();
     report.distances += (moving.len() * ids.len()) as u64;
@@ -463,7 +463,7 @@ fn ring(ctx: &Ctx, d: &mut Drafts, report: &mut RunReport) -> Result<(), Error> 
         return Ok(());
     }
 
-    let src = Streamed::new(ctx.old, ctx.delta, &vectors);
+    let src = Streamed::new(ctx.old, ctx.gate, ctx.delta, &vectors);
     let mut moves = Vec::new();
     kmeans::scan_nearest(&new_centers, &src, 1, CHUNK, ctx.pool, |start, decoded, best, _| {
         for (k, (x, &b)) in decoded.chunks_exact(dim).zip(best).enumerate() {
@@ -485,7 +485,7 @@ fn ring(ctx: &Ctx, d: &mut Drafts, report: &mut RunReport) -> Result<(), Error> 
 fn global_pass(ctx: &Ctx, d: &mut Drafts, report: &mut RunReport) -> Result<(), Error> {
     let all = ctx.live_ids();
     let (ids, centers) = d.centers_of(|_| true);
-    let src = Streamed::new(ctx.old, ctx.delta, &all);
+    let src = Streamed::new(ctx.old, ctx.gate, ctx.delta, &all);
     let best = kmeans::nearest_rows(&centers, &src, 1, CHUNK, ctx.pool)?.0;
     report.bytes_read += src.read.get();
     report.distances += (all.len() * ids.len()) as u64;
@@ -565,7 +565,7 @@ fn means(ctx: &Ctx, d: &Drafts, new: &[usize], report: &mut RunReport) -> Result
         }
     }
 
-    let (sums, read) = rows::sums(ctx.old, ctx.delta, &ids, &group, new.len(), ctx.pool)?;
+    let (sums, read) = rows::sums(ctx.old, ctx.gate, ctx.delta, &ids, &group, new.len(), ctx.pool)?;
     report.bytes_read += read;
     let counts: Vec<usize> = new.iter().map(|&l| d.members[l].len()).collect();
     let means = sums.chunks_exact(dim).zip(&counts);

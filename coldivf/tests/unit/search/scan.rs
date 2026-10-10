@@ -268,7 +268,16 @@ fn scan_list_keeps_the_best_vectors_of_a_cluster() {
         for cap in [1, 10, 70, 100] {
             let mut candidates = Candidates::new(cap);
             let mut survivors = [Candidate::NONE; BLOCK];
-            scan_list(tier, &blocks, count, first_id, &query, &mut candidates, &mut survivors);
+            scan_list(
+                tier,
+                &blocks,
+                count,
+                first_id,
+                &query,
+                Hides::NONE,
+                &mut candidates,
+                &mut survivors,
+            );
             let mut kept = candidates.as_slice().to_vec();
             kept.sort_unstable_by(order);
             assert_eq!(kept, want[..cap.min(count)], "cap {cap}");

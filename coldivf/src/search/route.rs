@@ -6,6 +6,7 @@ use crate::kernels::{Tier, center_distance2, sq4_dots};
 use crate::quantization::sq4::{CenterFactors, QueryS8, QueryS32, route_score};
 
 /// The 4-bit codes of every cluster center, back to back, and the factors stored with them.
+#[derive(Clone, Copy)]
 pub(crate) struct Centers<'a> {
     pub(crate) codes: &'a [u8],
     pub(crate) factors: &'a [CenterFactors],

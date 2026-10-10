@@ -6,11 +6,14 @@
 //!   and header checksum, and its records are numbered by their place, from 1.
 //! - Version 2 is the log of a generation. Its header names the index, the generation, the data file's header checksum
 //!   and the sequence number of its first record. Each record carries its own sequence number and hints for that
-//!   generation, eg. the cluster that an insert was routed to.
+//!   generation, eg. the cluster that an insert was routed to, and the row or insert that its change hides, which the
+//!   writer looked up. The first logs of this version left that hint unset, which its record's kind tells.
 //!
 //! In a version 2 log only a damaged last frame counts as a torn write, which readers ignore and a writer cuts off. A
 //! damaged frame that a whole one follows, or a whole frame whose record doesn't fit the data file, fails with
-//! `InvalidData`, and nothing is cut off. A version 1 log ends at its first record that is cut short, damaged or doesn't
+//! `InvalidData`, and nothing is cut off. A frame whose length is a record's, or zeros as a power cut leaves them, ends
+//! where its length says, so a whole frame must start there. A frame of any other length has a damaged length, and a
+//! whole frame anywhere after it counts. A version 1 log ends at its first record that is cut short, damaged or doesn't
 //! fit, as it always has.
 
 use std::fs::{File, OpenOptions};
@@ -38,6 +41,11 @@ pub(crate) const HEADER_2_BYTES: usize = 8 + 4 + 8 + 8 + 4 + 8 + 4;
 /// The kinds of records.
 pub(crate) const INSERT: u8 = 1;
 pub(crate) const DELETE: u8 = 2;
+
+/// Set in the kind of a version 2 record whose hint of what its change hides is the writer's lookup, so a hint that
+/// names nothing means the id had no visible version. The first version 2 logs wrote records without it, whose hints
+/// name nothing whatever the change hides, so a replay looks their ids up.
+pub(crate) const LOOKED_UP: u8 = 0x80;
 
 /// A hint that names nothing, eg. the row of a delete of an id that no vector has.
 pub(crate) const NONE: u32 = u32::MAX;
@@ -176,6 +184,7 @@ pub(crate) fn encode(record: &Record, version: Version) -> Vec<u8> {
             }
         }
         Version::Two { generation, .. } => {
+            out[0] |= LOOKED_UP;
             out.extend(seq.to_le_bytes());
             out.extend(id.to_le_bytes());
             out.extend(generation.to_le_bytes());
@@ -246,7 +255,7 @@ pub(crate) fn decode(bytes: &[u8], version: Version, dim: usize, nlist: usize, s
         (Version::Two { generation, .. }, Some(&kind))
             if bytes.len() >= HEAD_2 && u64_at(17) == generation && u64_at(1) == seq =>
         {
-            match kind {
+            match kind & !LOOKED_UP {
                 INSERT if bytes.len() == HEAD_2 + cb + 16 + rb => {
                     let (code, factors, row) = payload(HEAD_2);
                     Record::Insert {
@@ -279,6 +288,12 @@ pub(crate) fn decode(bytes: &[u8], version: Version, dim: usize, nlist: usize, s
     Ok(record)
 }
 
+/// Whether `bytes`, a record of a log of `version`, says that its hint of what its change hides is the writer's
+/// lookup, which a version 2 record of a later log does.
+pub(crate) fn looked_up(bytes: &[u8], version: Version) -> bool {
+    version != Version::One && bytes.first().is_some_and(|&kind| kind & LOOKED_UP != 0)
+}
+
 /// The sequence number that a version 2 record says it has, or `None` for a record too short to hold one.
 pub(crate) fn seq_of(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.get(1..9)?.try_into().ok()?))
@@ -306,21 +321,15 @@ pub(crate) fn next_record(bytes: &[u8], at: usize) -> Option<&[u8]> {
     (len > 0 && crc32fast::hash(record) == crc).then_some(record)
 }
 
-/// The whole frames' records in `bytes`, part of a log of `version`, and where they end. A version 1 log ends at its
-/// first frame that is cut short or damaged. A version 2 log ends only at a damaged last frame, and a damaged frame that
-/// a whole one follows fails with `InvalidData`.
-pub(crate) fn records(bytes: &[u8], version: Version) -> Result<(Vec<&[u8]>, usize), Error> {
+/// The whole frames' records in `bytes`, part of a log of `version` for a data file of `dim` dimensions, and where they
+/// end. A version 1 log ends at its first frame that is cut short or damaged. A version 2 log ends only at a damaged
+/// last frame, and a damaged frame that a whole one follows fails with `InvalidData`.
+pub(crate) fn records(bytes: &[u8], version: Version, dim: usize) -> Result<(Vec<&[u8]>, usize), Error> {
     let (mut out, mut at) = (Vec::new(), 0);
 
     while at < bytes.len() {
         let Some(record) = next_record(bytes, at) else {
-            // A frame whose length is whole but whose checksum fails is torn only if no whole frame comes after it.
-            let len = bytes
-                .get(at..at + 4)
-                .map(|b| u32::from_le_bytes(b.try_into().unwrap_or_default()));
-            let after = len.and_then(|len| at.checked_add(8 + len as usize));
-            let followed = after.is_some_and(|after| after < bytes.len() && next_record(bytes, after).is_some());
-            if version != Version::One && followed {
+            if version != Version::One && followed(bytes, at, dim) {
                 return Err(damaged());
             }
             break;
@@ -330,6 +339,28 @@ pub(crate) fn records(bytes: &[u8], version: Version) -> Result<(Vec<&[u8]>, usi
     }
 
     Ok((out, at))
+}
+
+/// Whether a whole frame of a record of a version 2 log for a data file of `dim` dimensions comes after the frame at
+/// `at` of `bytes`, which isn't whole, so that frame isn't a torn last write. A frame whose length is a record's, or 0
+/// as zeros that a power cut left give it, ends where its length says, and the next frame must start there. Any other
+/// length is damaged, so the frame may end anywhere, and a whole frame anywhere after it counts.
+fn followed(bytes: &[u8], at: usize, dim: usize) -> bool {
+    let insert = HEAD_2 + code_bytes(padded_dim(dim)) + 16 + sq8::row_bytes(dim);
+    let length = |p: usize| {
+        bytes
+            .get(p..p + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap_or_default()) as usize)
+    };
+    // Only frames of a record's length count, so the search past a damaged length computes few checksums.
+    let whole =
+        |p: usize| length(p).is_some_and(|len| len == HEAD_2 || len == insert) && next_record(bytes, p).is_some();
+
+    match length(at) {
+        None => false,
+        Some(len) if len == 0 || len == HEAD_2 || len == insert => whole(at + 8 + len),
+        Some(_) => (at + 1..bytes.len()).any(whole),
+    }
 }
 
 /// Opens the log at `path` when it was written for the data file whose header says `layout`, as `version` says, and
@@ -362,6 +393,8 @@ pub(crate) struct Log {
     pub(super) file: File,
     path: PathBuf,
     version: Version,
+    /// The dimension of the data file's vectors, which sets the length of each kind of record.
+    dim: usize,
     _lock: Arc<File>,
     /// How many bytes its whole records take, which is where the next one goes.
     len: usize,
@@ -404,11 +437,11 @@ impl Log {
             io::sync_parent(path)?;
         }
 
-        let mut delta = changes.write();
-        let ours = super::catch_up(&mut delta, path, layout, version)?;
+        let mut a = changes.applier();
+        let ours = super::catch_up(changes, &mut a, path, layout, version)?;
         let len = file.metadata()?.len();
 
-        if (!ours && delta.log_len() > 0) || len < delta.log_len() as u64 {
+        if (!ours && a.log_len() > 0) || len < a.log_len() as u64 {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 "the log no longer holds the changes read from it",
@@ -426,19 +459,21 @@ impl Log {
             file.set_len(0)?;
             file.write_all(&version.header(layout))?;
             io::sync_file(&file, path)?;
-            delta.set_log_len(version.header_len());
-        } else if len > delta.log_len() as u64 {
-            file.set_len(delta.log_len() as u64)?;
+            a.set_log_len(version.header_len());
+            changes.publish(&mut a);
+        } else if len > a.log_len() as u64 {
+            file.set_len(a.log_len() as u64)?;
             io::sync_file(&file, path)?;
         }
 
-        file.seek(SeekFrom::Start(delta.log_len() as u64))?;
+        file.seek(SeekFrom::Start(a.log_len() as u64))?;
         Ok(Log {
             file,
             path: path.to_path_buf(),
             version,
+            dim: layout.dim,
             _lock: lock,
-            len: delta.log_len(),
+            len: a.log_len(),
             broken: false,
             poisoned: false,
         })
@@ -464,6 +499,7 @@ impl Log {
             file,
             path: path.to_path_buf(),
             version,
+            dim: layout.dim,
             _lock: lock,
             len: bytes.len(),
             broken: false,
@@ -541,7 +577,7 @@ impl Log {
         // Appends go where the cursor is, so it goes back to the end whatever the read did.
         self.file.seek(SeekFrom::Start(self.len as u64))?;
         read?;
-        let (records, used) = records(&bytes, self.version)?;
+        let (records, used) = records(&bytes, self.version, self.dim)?;
 
         if used != bytes.len() {
             return Err(damaged());
@@ -554,14 +590,7 @@ impl Log {
     /// first.
     pub(crate) fn write(&mut self, changes: &Changes, record: &[u8]) -> Result<(), Error> {
         let end = self.append(record)?;
-        let mut delta = changes.write();
-
-        if delta.log_len() < end {
-            delta.apply(record)?;
-            delta.set_log_len(end);
-        }
-
-        Ok(())
+        changes.apply(record, end)
     }
 }
 

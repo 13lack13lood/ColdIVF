@@ -470,6 +470,7 @@ fn a_run_round_trips_through_its_saved_text() {
             bytes_written: 12,
             cpu: Duration::from_nanos(13),
             wall: Duration::from_nanos(14),
+            indicator: None,
         },
         cost: Cost {
             wall_ns: 15,

@@ -16,7 +16,10 @@
 //! A crash before step 4 leaves G current with every change in its log, and the next writer's open deletes the files
 //! that no slot names. A crash in step 4 leaves a slot whose checksum fails, so the other slot stays current, and its
 //! files still exist. A slot damaged later is made again from the newest data file and log that verify against each
-//! other. A build at the path of an index that has a root commits its file the same way, with an empty log.
+//! other. When the files of the generation that the other slot names are still there, eg. because a power cut undid
+//! their deletes, the newer generation wins only once its log holds changes past that one's, since a writer appends
+//! those only after the commit. A build at the path of an index that has a root commits its file the same way, with an
+//! empty log.
 
 use std::fs::{self, File};
 use std::hash::{BuildHasher, RandomState};
@@ -26,6 +29,7 @@ use std::sync::Arc;
 
 use crate::format::{self, HEADER_BYTES, Layout, Root, read_header};
 use crate::io;
+use crate::maintain::job;
 use crate::update::{self, Version, log};
 
 /// The two root slots' file names, by slot.
@@ -89,12 +93,22 @@ fn named(dir: &Path, root: Root) -> Located {
     }
 }
 
-/// The root slots in `dir`, each one that is there and whole.
-fn read_slots(dir: &Path) -> [Option<Root>; 2] {
-    SLOTS.map(|name| {
-        let bytes = fs::read(dir.join(name)).ok()?;
-        format::read_root(&bytes).ok()
-    })
+/// The root slots in `dir`, each one that is there and whole, and whether one is there but damaged, i.e. neither whole
+/// nor the zeros of a slot never written. A slot that can't be read for another reason than being missing fails.
+fn read_slots(dir: &Path) -> Result<([Option<Root>; 2], bool), Error> {
+    let (mut slots, mut damaged) = ([None, None], false);
+
+    for (slot, name) in slots.iter_mut().zip(SLOTS) {
+        let bytes = match fs::read(dir.join(name)) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        *slot = format::read_root(&bytes).ok();
+        damaged |= slot.is_none() && bytes.iter().any(|&b| b != 0);
+    }
+
+    Ok((slots, damaged))
 }
 
 /// The slot of `slots` with the higher generation.
@@ -112,7 +126,7 @@ pub(crate) fn locate(path: &Path) -> Result<Located, Error> {
     let mut last: Option<Root> = None;
 
     for _ in 0..TRIES {
-        let slots = read_slots(&dir);
+        let (slots, damaged) = read_slots(&dir)?;
         let Some(root) = newest(&slots).cloned() else {
             // Before the first commit, or after a failed one, the data file is the index's path. Only when it is gone
             // too did both slots break after a commit.
@@ -123,7 +137,11 @@ pub(crate) fn locate(path: &Path) -> Result<Located, Error> {
         };
         let at = named(&dir, root.clone());
 
+        // A damaged slot may have named a newer generation, whose files are there too.
         if at.data.exists() && at.log.exists() {
+            if damaged && let Some(newer) = committed_after(&dir, &root) {
+                return Ok(newer);
+            }
             return Ok(at);
         }
 
@@ -174,6 +192,26 @@ fn recover(dir: &Path, index_id: Option<u64>, from: u64) -> Result<Option<Locate
     Ok(None)
 }
 
+/// The generation after the one that `root` names in `dir`, when its data file and log verify against each other and
+/// its log holds changes past the end of `root`'s log. A writer appends those only once that generation is committed,
+/// so it was, and a slot that named it broke. At the commit both logs end at the same change.
+fn committed_after(dir: &Path, root: &Root) -> Option<Located> {
+    let files = generation_files(dir).ok()?;
+    let pair = |generation: u64| {
+        let stems = files.iter().filter(|(_, g)| *g == generation);
+        let stems = stems.filter_map(|(name, _)| name.strip_suffix(".data"));
+        stems
+            .filter_map(|stem| verify_pair(dir, stem, generation, Some(root.index_id)))
+            .collect::<Vec<Pair>>()
+    };
+    let end = pair(root.generation)
+        .into_iter()
+        .find(|p| p.located.data == dir.join(&root.data))?
+        .end;
+    let newer = pair(root.generation + 1).into_iter().filter(|p| p.end > end);
+    newer.max_by_key(|p| p.end).map(|p| p.located)
+}
+
 /// The header of the data file at `path`. A damaged one fails with `InvalidData`.
 pub(crate) fn header_of(path: &Path) -> Result<Layout, Error> {
     let mut file = File::open(path)?;
@@ -202,7 +240,7 @@ fn verify_pair(dir: &Path, stem: &str, generation: u64, index_id: Option<u64>) -
         generation,
         base: head.base,
     };
-    let (records, _) = log::records(&bytes[log::HEADER_2_BYTES..], version).ok()?;
+    let (records, _) = log::records(&bytes[log::HEADER_2_BYTES..], version, layout.dim).ok()?;
     let end = match records.last() {
         Some(r) => log::seq_of(r)? + 1,
         None => head.base,
@@ -254,6 +292,15 @@ fn generation_of(name: &str) -> Option<u64> {
     }
 
     generation.parse().ok()
+}
+
+/// The resume files in `dir`, by name, which jobs leave next to their data files.
+fn resume_files(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let names = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned());
+    names.filter(|n| n.ends_with(".resume")).collect()
 }
 
 /// A random number, eg. an id or a file's tag.
@@ -317,7 +364,7 @@ impl Owner {
         if let Some(root) = owner.current.root.clone() {
             owner.slots = Some(owner.open_slots()?);
             let slot = (root.generation % 2) as usize;
-            if read_slots(&owner.dir)[slot].as_ref() != Some(&root) {
+            if read_slots(&owner.dir)?.0[slot].as_ref() != Some(&root) {
                 owner.check_slot(slot)?;
                 owner.write_slot(&root)?;
             }
@@ -328,6 +375,16 @@ impl Owner {
 
     pub(crate) fn lock(&self) -> Arc<File> {
         Arc::clone(&self.lock)
+    }
+
+    /// The index's path.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// This writer's id, which each slot it writes records.
+    pub(crate) fn writer(&self) -> u64 {
+        self.writer
     }
 
     pub(crate) fn current(&self) -> &Located {
@@ -346,14 +403,18 @@ impl Owner {
         let Ok(files) = generation_files(&self.dir) else {
             return;
         };
+        // A job of the current generation that stopped early leaves its data file and resume file for the next one.
+        let kept = job::kept(self);
         let keep = |name: &str| {
-            self.current
-                .root
-                .as_ref()
-                .is_some_and(|r| name == r.data || name == r.log)
+            let current = self.current.root.as_ref();
+            current.is_some_and(|r| name == r.data || name == r.log) || kept.iter().any(|k| k == name)
         };
 
         for (name, _) in files.iter().filter(|(name, _)| !keep(name)) {
+            let _ = io::remove(&self.dir.join(name));
+        }
+
+        for name in resume_files(&self.dir).iter().filter(|name| !keep(name)) {
             let _ = io::remove(&self.dir.join(name));
         }
 
@@ -392,6 +453,35 @@ impl Owner {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// The next generation's files for the data file `data` that an earlier job of the current generation left, with
+    /// the data file open, so a job goes on with it.
+    pub(crate) fn reopen(&mut self, data: &Path) -> Result<(Next, File), Error> {
+        self.make_folder()?;
+        let name = file_name(data);
+        let (generation, index_id) = (
+            self.current.generation + 1,
+            self.current.root.as_ref().map_or_else(random, |r| r.index_id),
+        );
+
+        if generation_of(&name) != Some(generation) || !name.ends_with(".data") {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "the file isn't the next generation's data file",
+            ));
+        }
+
+        let file = fs::OpenOptions::new().read(true).write(true).open(data)?;
+        let next = Next {
+            generation,
+            index_id,
+            log: data.with_extension("log"),
+            data: data.to_path_buf(),
+            dir: self.dir.clone(),
+            committed: false,
+        };
+        Ok((next, file))
     }
 
     /// The same, for the data file `tmp`, which a build wrote next to the index and synced. It renames it into the
@@ -543,6 +633,11 @@ impl Next {
     /// Syncs the folder, so the names of the data file and the log survive a power loss.
     pub(crate) fn seal(&self) -> Result<(), Error> {
         io::sync_folder(&self.dir)
+    }
+
+    /// Leaves the files where they are, eg. for a job that goes on with them later.
+    pub(crate) fn keep(mut self) {
+        self.committed = true;
     }
 }
 

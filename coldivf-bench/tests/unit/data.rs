@@ -131,6 +131,12 @@ fn the_whole_base_s_truth_can_be_the_one_gt_writes() {
     write_ibin(&root.join("t-euclidean.gt.ibin"), &[9, 8, 7, 6, 5, 4], 2).unwrap();
     let shipped = open();
     assert_eq!((shipped.truth.row(1), shipped.dists.is_some()), (&[7, 6][..], false));
+    // Asked for, the derived folder's truth and its distances come first even for the whole base.
+    let asked = Dataset::open_derived(&root, &derived, "t-euclidean", None).unwrap();
+    assert_eq!(
+        (asked.n, asked.truth.row(1), asked.dists.is_some()),
+        (10, &[3, 4][..], true)
+    );
     std::fs::remove_dir_all(&root).unwrap();
     std::fs::remove_dir_all(&derived).unwrap();
 }

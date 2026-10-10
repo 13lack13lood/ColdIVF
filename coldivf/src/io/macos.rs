@@ -104,6 +104,48 @@ pub(crate) fn full_sync(file: &File) -> Result<bool, Error> {
     Ok(true)
 }
 
+/// Asks the drive to write `file`'s data before any later write, without waiting for its cache to empty, which
+/// `F_FULLFSYNC` does. Returns false when the file system refuses it, so the caller syncs as usual.
+pub(crate) fn barrier_sync(file: &File) -> Result<bool, Error> {
+    // SAFETY: F_BARRIERFSYNC takes no argument and touches no memory.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } == -1 {
+        let e = Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::ENOTSUP | libc::EINVAL | libc::ENOTTY) => Ok(false),
+            _ => Err(e),
+        };
+    }
+
+    Ok(true)
+}
+
+/// Sets aside `len` bytes on the disk for `file`, all in one piece if it can. A file system that refuses it, or a disk
+/// without that much room left, sets nothing aside, which the caller finds when it writes.
+pub(crate) fn preallocate(file: &File, len: u64) {
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATECONTIG,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: len as libc::off_t,
+        fst_bytesalloc: 0,
+    };
+    // SAFETY: `store` outlives the call, and F_PREALLOCATE only reads and writes it.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) } == -1 {
+        store.fst_flags = libc::F_ALLOCATEALL;
+        // SAFETY: as above, asking for the space in any number of pieces.
+        let _ = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+    }
+}
+
+/// Whether the calling thread runs at utility quality of service, eg. a background job's thread.
+#[cfg(test)]
+pub(crate) fn is_utility() -> bool {
+    let (mut class, mut priority) = (libc::qos_class_t::QOS_CLASS_UNSPECIFIED, 0);
+    // SAFETY: the call writes the calling thread's QoS class and priority into the two locals.
+    unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut priority) };
+    class as u32 == libc::qos_class_t::QOS_CLASS_UTILITY as u32
+}
+
 /// Runs the calling thread at utility quality of service (QoS), which macOS schedules after interactive work.
 pub(crate) fn utility() {
     // SAFETY: the call changes only the calling thread's QoS class and touches no memory.

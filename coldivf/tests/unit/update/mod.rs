@@ -12,10 +12,13 @@ use crate::build::write;
 use crate::format::Part;
 use crate::index::Inner;
 use crate::quantization::SplitMix64;
-use crate::quantization::rabitq::unpack_lane;
-use crate::quantization::testutil::{HOOK, Hooked, Rows, TempFile, clustered, gaussian, group, params, temp_file};
+use crate::quantization::rabitq::{BLOCK, block_bytes, code_bytes, unpack_lane};
+use crate::quantization::testutil::{
+    HOOK, Hooked, Rows, TempFile, clustered, dist2, gaussian, group, params, temp_file,
+};
+use crate::quantization::{padded_dim, sq8};
 use crate::search::inmem::InMemory;
-use crate::{Anchor, BuildParams, Collections, Index, Limits, Metric, SearchCtx, SearchParams, Writer};
+use crate::{Anchor, BuildParams, Collections, Hit, Index, Limits, Metric, SearchCtx, SearchParams, Writer};
 use log::HEADER_BYTES;
 
 /// An index file of 600 clustered vectors with ids 0 to 599, and those vectors.
@@ -226,7 +229,7 @@ fn compaction_folds_the_changes_into_the_file() {
             (600 - 10 + 20 - 1, 1, 12, anchor),
             "{metric:?}"
         );
-        assert_eq!(inner.changes().read().len(), 0);
+        assert_eq!(inner.changes().load().len(), 0);
         let ((bytes, file), data) = (inner.parts(), inner.in_place());
         let ids = &bytes[file.span(Part::Ids).range()];
         let id_of = |i: usize| sq8::id(data.rows.row(i as u32), dim).to_le_bytes();
@@ -395,11 +398,27 @@ fn a_search_sees_the_changes_as_they_were_when_it_scanned() {
     assert_eq!(out.iter().filter(|(_, h)| h.id == 5).count(), 1);
     assert_eq!(one(&index), 1);
 
-    // On its own, a later change hides only what came before it.
-    let mut delta = Delta::new(index.inner().layout(), Version::One);
-    let seen = delta.seen();
-    delta.delete(5);
-    assert!(delta.is_live(5, 0, seen) && !delta.is_live(5, 0, delta.seen()));
+    // On its own, a later change hides only what came before it, and a snapshot from before judges the row as it was.
+    let inner = index.inner();
+    let (data, dim) = (inner.in_place(), inner.layout().dim);
+    let row = (0..600).find(|&r| sq8::id(data.rows.row(r), dim) == 6).unwrap();
+    let mut a = Applier::new(inner.layout(), Version::One, &inner.located().data);
+    let before = a.snapshot();
+    a.apply(
+        &log::encode(
+            &Record::Delete {
+                seq: 0,
+                id: 6,
+                hides: log::NONE,
+            },
+            Version::One,
+        ),
+        false,
+    )
+    .unwrap();
+    let after = a.snapshot();
+    assert!(before.row_visible(row, before.seen()) && after.row_visible(row, before.seen()));
+    assert!(!after.row_visible(row, after.seen()));
 }
 
 #[test]
@@ -570,15 +589,16 @@ fn an_insert_scores_like_the_same_vector_built_into_the_file() {
 
         // Each insert has the code and the factors of its row in the file.
         let inner = index.inner();
-        let delta = inner.changes().read();
+        let delta = inner.changes().load();
         let mut bits = vec![0u8; cb];
         for (i, &(built, leaf)) in pairs.iter().enumerate() {
             let list = memory.lists[leaf];
             let j = (built - list.first_id) as usize;
             let block = &memory.blocks[list.offset + j / BLOCK * size..list.offset + (j / BLOCK + 1) * size];
             let factors = unpack_lane(block, d_pad, j % BLOCK, &mut bits);
-            assert_eq!(delta.codes[i * cb..(i + 1) * cb], bits, "{anchor:?}: insert {i}");
-            assert_eq!(delta.factors[i], factors, "{anchor:?}: insert {i}");
+            let (code, f) = delta.lane(i);
+            assert_eq!(code, bits, "{anchor:?}: insert {i}");
+            assert_eq!(f, factors, "{anchor:?}: insert {i}");
         }
         drop(delta);
 
@@ -621,7 +641,7 @@ fn an_open_while_a_run_reads_the_changes_waits_for_nothing() {
     // A maintenance run holds the read lock of the changes for its whole length, as this guard does. An open that
     // waited for the write lock would make every later search of the file wait too.
     let inner = writer.index.inner();
-    let guard = inner.changes().read();
+    let guard = inner.changes().load();
     let (send, opened) = std::sync::mpsc::channel();
 
     std::thread::scope(|scope| {
@@ -634,4 +654,564 @@ fn an_open_while_a_run_reads_the_changes_waits_for_nothing() {
         drop(guard);
         assert!(hits.is_ok_and(|h| h.contains(&9000)), "the open waited for the run");
     });
+}
+
+/// The external ids of the candidates that the last search with `c` kept, sorted.
+fn candidate_ids(index: &Index, c: &SearchCtx) -> Vec<u64> {
+    let inner = index.inner();
+    let (data, layout, delta) = (inner.in_place(), inner.layout(), inner.changes().load());
+    let s = c.scratch.iter().find(|s| s.fits(layout.dim)).unwrap();
+    let mut ids: Vec<u64> = s
+        .candidates
+        .as_slice()
+        .iter()
+        .map(|cand| sq8::id(inner.row_of(&delta, cand.id, |id| data.rows.row(id)), layout.dim))
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+fn deleted_rows_take_no_rescore_place_and_every_path_finds_what_the_folded_file_finds() {
+    use crate::maintain::tests::{DIM, build_params, sample};
+
+    let (path, rows) = sample(
+        "deleted.coldivf",
+        &build_params(Metric::L2, Anchor::Cluster),
+        3000,
+        30,
+        80,
+    );
+    let folded = temp_file("deleted-folded.coldivf");
+    crate::quantization::testutil::copy_index(&path, &folded);
+    let mut rng = SplitMix64::new(81);
+    let gone: Vec<u64> = (0..300).map(|_| rng.next_u64() % 3000).collect();
+    let mut writer = Writer::open(&path).unwrap();
+    let mut other = Writer::open(&folded).unwrap();
+
+    for &id in &gone {
+        writer.delete(id).unwrap();
+        other.delete(id).unwrap();
+    }
+
+    // A fold keeps every cluster, its center and its order, and copies every code, so the two files differ only in
+    // where the deleted rows went.
+    other.compact().unwrap();
+    let (index, fold) = (Index::open(&path).unwrap(), Index::open(&folded).unwrap());
+    let limits = Limits {
+        max_k: 10,
+        max_nprobe: 30,
+        max_rerank: 400,
+    };
+
+    for (nprobe, rerank) in [(4, 20), (8, 60), (30, 400)] {
+        let sp = SearchParams {
+            k: 10,
+            nprobe,
+            rerank,
+            reach: None,
+        };
+        for q in rows.data.as_chunks::<DIM>().0.iter().step_by(150).map(|q| &q[..]) {
+            let (mut a, mut b) = (SearchCtx::new(limits), SearchCtx::new(limits));
+            for warm in [false, true] {
+                index.set_warm(warm);
+                fold.set_warm(warm);
+                let hits = |index: &Index, c: &mut SearchCtx| -> Vec<(u64, u32)> {
+                    let hits = index.search(q, &sp, c).unwrap();
+                    hits.iter().map(|h| (h.id, h.score.to_bits())).collect()
+                };
+                assert_eq!(
+                    hits(&index, &mut a),
+                    hits(&fold, &mut b),
+                    "nprobe {nprobe}, warm {warm}"
+                );
+                let kept = candidate_ids(&index, &a);
+                assert!(
+                    kept.iter().all(|id| !gone.contains(id)),
+                    "a deleted row took a rescore place"
+                );
+                assert_eq!(kept, candidate_ids(&fold, &b), "nprobe {nprobe}, warm {warm}");
+            }
+        }
+    }
+}
+
+#[test]
+fn pending_inserts_add_no_read_to_a_cold_search() {
+    let (path, rows) = sample("no-reads.coldivf", Metric::L2);
+    let index = Index::open(&path).unwrap();
+    let mut writer = Writer::open(&path).unwrap();
+    let sp = SearchParams {
+        k: 10,
+        nprobe: 4,
+        rerank: 40,
+        reach: None,
+    };
+    let queries: Vec<&[f32]> = rows
+        .data
+        .as_chunks::<128>()
+        .0
+        .iter()
+        .step_by(60)
+        .map(|q| &q[..])
+        .collect();
+    let traffic = |c: &SearchCtx| (c.trace.cluster_bytes, c.trace.cluster_ranges);
+    let before: Vec<_> = queries
+        .iter()
+        .map(|q| {
+            let mut c = ctx();
+            index.search(q, &sp, &mut c).unwrap();
+            (traffic(&c), c.trace.row_bytes)
+        })
+        .collect();
+
+    // Inserts near the queries, so they win candidates' places.
+    for (i, q) in queries.iter().enumerate() {
+        for k in 0..30 {
+            let v: Vec<f32> = q.iter().map(|&x| x + 0.01 * (k as f32 + 1.0)).collect();
+            writer.insert(50_000 + (i * 100 + k) as u64, &v).unwrap();
+        }
+    }
+
+    for (q, (clusters, rows_before)) in queries.iter().zip(before) {
+        let mut c = ctx();
+        let hits = index.search(q, &sp, &mut c).unwrap();
+        assert!(hits.iter().filter(|h| h.id >= 50_000).count() >= 5);
+        // The same clusters, read the same way, and no more rows from the file, since the inserts' rows are in memory.
+        assert_eq!(traffic(&c), clusters);
+        assert!(c.trace.row_bytes <= rows_before);
+    }
+}
+
+/// Sets its flag when dropped, eg. as a thread that fails a check unwinds.
+struct Stops<'a>(&'a AtomicBool);
+
+impl Drop for Stops<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+#[test]
+fn searches_take_no_lock_and_see_every_id_once_while_a_writer_upserts() {
+    let (path, rows) = sample("upserts.coldivf", Metric::L2);
+    let index = Index::open(&path).unwrap();
+    let done = AtomicBool::new(false);
+    let limits = Limits {
+        max_k: 600,
+        max_nprobe: 12,
+        max_rerank: 800,
+    };
+    let sp = SearchParams {
+        k: 600,
+        nprobe: 12,
+        rerank: 800,
+        reach: None,
+    };
+    let searches = std::sync::atomic::AtomicUsize::new(0);
+    // A searcher that stops early stops the writer, so a failed check fails the test rather than leaves it waiting.
+    let stopped = AtomicBool::new(false);
+
+    std::thread::scope(|scope| {
+        for t in 0..4 {
+            let (index, done, searches, rows, stopped) = (&index, &done, &searches, &rows, &stopped);
+            scope.spawn(move || {
+                let _stops = Stops(stopped);
+                let mut c = SearchCtx::new(limits);
+                let q = &rows.data[t * 128..(t + 1) * 128];
+                index.search(q, &sp, &mut c).unwrap();
+                while !done.load(Ordering::Acquire) {
+                    let locks = LOCKS.with(|n| n.get());
+                    let mut ids: Vec<u64> = index.search(q, &sp, &mut c).unwrap().iter().map(|h| h.id).collect();
+                    assert_eq!(LOCKS.with(|n| n.get()), locks, "a search took a lock");
+                    ids.sort_unstable();
+                    assert!(
+                        ids == (0..600).collect::<Vec<u64>>(),
+                        "a search saw an id twice or missed one"
+                    );
+                    searches.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+
+        // The writer replaces ids 0 to 99 with vectors near their own, over and over, and folds now and then, which
+        // moves every reader to a new generation.
+        let mut writer = Writer::open(&path).unwrap();
+        let mut rng = SplitMix64::new(82);
+        let started = std::time::Instant::now();
+        let mut changes = 0;
+        let enough = || started.elapsed().as_secs() >= 3 && searches.load(Ordering::Relaxed) >= 40;
+        while !enough() && !stopped.load(Ordering::Acquire) {
+            let id = rng.next_u64() % 100;
+            let v: Vec<f32> = rows.data[id as usize * 128..(id as usize + 1) * 128]
+                .iter()
+                .map(|&x| x + 0.2 * rng.normal() as f32)
+                .collect();
+            writer.insert(id, &v).unwrap();
+            changes += 1;
+            if changes % 500 == 0 {
+                writer.compact().unwrap();
+            }
+        }
+        done.store(true, Ordering::Release);
+        assert!(changes > 500, "the writer folded nothing");
+    });
+}
+
+#[test]
+fn an_insert_into_a_cluster_with_no_vector_in_the_file_is_found() {
+    // Cluster 5 has a center but no vector, far from the others, so an insert near it routes there.
+    let (rows, mut clusters) = clustered(&mut SplitMix64::new(83), 600, 128, 6, 0.5);
+    clusters.assignment.iter_mut().for_each(|c| *c = (*c).min(4));
+    clusters.centroids[5 * 128..6 * 128].iter_mut().for_each(|x| *x += 20.0);
+    group(&mut clusters, 2);
+    let index = InMemory::build(&params(Metric::L2), &rows, &clusters).unwrap();
+    let path = temp_file("empty-cluster.coldivf");
+    write(&index, &path).unwrap();
+    let opened = Index::open(&path).unwrap();
+    let empty = opened.inner().tables().unwrap().lists.iter().position(|l| l.count == 0);
+    assert!(empty.is_some(), "the file has no empty cluster");
+    let v = clusters.centroids[5 * 128..6 * 128].to_vec();
+    Writer::open(&path).unwrap().insert(9000, &v).unwrap();
+    let sp = SearchParams {
+        k: 1,
+        nprobe: 1,
+        rerank: 10,
+        reach: None,
+    };
+
+    for warm in [false, true] {
+        opened.set_warm(warm);
+        let mut c = ctx();
+        assert_eq!(opened.search(&v, &sp, &mut c).unwrap()[0].id, 9000, "warm {warm}");
+        let mut leaves = Vec::new();
+        opened.route(&v, 1, None, &mut c, &mut leaves).unwrap();
+        let hits = opened.fetch(&leaves, &mut c).unwrap().search(&v, 1, 10).unwrap();
+        assert_eq!(hits[0].id, 9000);
+        // A search of clusters that a guess at the query already scanned scans them again.
+        let mut fetched = opened.fetch(&leaves, &mut c).unwrap();
+        fetched.prefetch_rows(&v, 10).unwrap();
+        assert_eq!(
+            fetched.search(&v, 1, 10).unwrap()[0].id,
+            9000,
+            "warm {warm}, after a guess"
+        );
+    }
+
+    let mut c = ctx();
+    assert_eq!(opened.inner().search_mapped(&v, &sp, &mut c).unwrap()[0].id, 9000);
+    let (set, mut out) = (Collections::open(&[&*path]).unwrap(), Vec::new());
+    set.search(&v, &sp, &mut c, &mut out).unwrap();
+    assert_eq!(out[0].1.id, 9000);
+
+    // With the next cluster probed too, and an insert in it, the insert near the empty cluster's center keeps the
+    // estimate that it gets alone, on every path, since the search measures the empty cluster's distance itself.
+    let mut leaves = Vec::new();
+    opened.route(&v, 2, None, &mut c, &mut leaves).unwrap();
+    let next = opened.inner().tables().unwrap().lists[leaves[1] as usize].count;
+    assert!(
+        leaves[0] == 5 && next > 0,
+        "the query doesn't probe the empty cluster first"
+    );
+    let center = clusters.centroids[leaves[1] as usize * 128..(leaves[1] as usize + 1) * 128].to_vec();
+    Writer::open(&path).unwrap().insert(9001, &center).unwrap();
+    let estimate = |nprobe: usize, how: &str| {
+        let sp = SearchParams { nprobe, ..sp };
+        let mut c = ctx();
+        opened.set_warm(how == "warm");
+        match how {
+            "mapped" => opened.inner().search_mapped(&v, &sp, &mut c).map(|_| ()),
+            _ => opened.search(&v, &sp, &mut c).map(|_| ()),
+        }
+        .unwrap();
+        let s = c.scratch.iter().find(|s| s.fits(128)).unwrap();
+        let first = opened.inner().layout().count as u32;
+        s.candidates
+            .as_slice()
+            .iter()
+            .find(|x| x.id == first)
+            .map(|x| x.score.to_bits())
+    };
+
+    for how in ["mapped", "cold", "warm"] {
+        assert!(
+            estimate(1, how).is_some() && estimate(1, how) == estimate(2, how),
+            "{how}"
+        );
+    }
+}
+
+/// The dimension of the files of `gapped`.
+const GAPPED: usize = 128;
+
+/// An index file of 6400 vectors with ids 0 to 6399 in 320 tight clusters, more than the 256 whose pending inserts a
+/// search scans, and the clusters' centers. Each cluster keeps its row's position in the file.
+fn gapped(name: &str) -> (TempFile, Rows, Vec<f32>) {
+    let (rows, mut clusters) = clustered(&mut SplitMix64::new(91), 6400, GAPPED, 320, 0.2);
+    group(&mut clusters, 8);
+    let index = InMemory::build(&params(Metric::L2), &rows, &clusters).unwrap();
+    let path = temp_file(name);
+    write(&index, &path).unwrap();
+    let _ = std::fs::remove_file(log_path(&path));
+    (path, rows, clusters.centroids)
+}
+
+/// Room to route every cluster of a file of `gapped`.
+const ROOM: Limits = Limits {
+    max_k: 10,
+    max_nprobe: 320,
+    max_rerank: 60,
+};
+
+#[test]
+fn queries_aimed_at_fresh_inserts_find_them_in_clusters_past_the_ones_they_read() {
+    let (path, rows, _) = gapped("aimed.coldivf");
+    let folded = temp_file("aimed-folded.coldivf");
+    crate::quantization::testutil::copy_index(&path, &folded);
+    // Each query sits in a gap between the clusters, nearly as far from each of a few dozen centers, with 10 inserts
+    // close around it, nearer than any vector of the file. Each insert joins its own nearest cluster, which the query
+    // may rank past the few clusters it reads.
+    let mut rng = SplitMix64::new(92);
+    let queries = gaussian(&mut rng, 40, GAPPED, |_| 1.0);
+    let mut inserts: Vec<f32> = Vec::new();
+
+    for q in queries.as_chunks::<GAPPED>().0 {
+        for _ in 0..10 {
+            inserts.extend(q.iter().map(|&x| x + 0.5 * rng.normal() as f32));
+        }
+    }
+
+    let (mut writer, mut other) = (Writer::open(&path).unwrap(), Writer::open(&folded).unwrap());
+
+    for (i, v) in inserts.as_chunks::<GAPPED>().0.iter().enumerate() {
+        writer.insert(100_000 + i as u64, v).unwrap();
+        other.insert(100_000 + i as u64, v).unwrap();
+    }
+
+    other.compact().unwrap();
+    let (index, fold) = (Index::open(&path).unwrap(), Index::open(&folded).unwrap());
+    let truth: Vec<Vec<u64>> = queries
+        .as_chunks::<GAPPED>()
+        .0
+        .iter()
+        .map(|q| {
+            let file = rows.data.as_chunks::<GAPPED>().0.iter().enumerate();
+            let inserted = inserts.as_chunks::<GAPPED>().0.iter().enumerate();
+            let mut all: Vec<(f64, u64)> = file
+                .map(|(i, r)| (dist2(r, q), i as u64))
+                .chain(inserted.map(|(i, v)| (dist2(v, q), 100_000 + i as u64)))
+                .collect();
+            all.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            all[..10].iter().map(|x| x.1).collect()
+        })
+        .collect();
+    // The share of the true 10 nearest that are inserts and that `search` finds, for `nprobe`.
+    let recall = |nprobe: usize, search: &mut dyn FnMut(&[f32], &SearchParams) -> Vec<u64>| {
+        let sp = SearchParams {
+            k: 10,
+            nprobe,
+            rerank: 60,
+            reach: None,
+        };
+        let (mut found, mut inserted) = (0, 0);
+        for (q, t) in queries.as_chunks::<GAPPED>().0.iter().zip(&truth) {
+            let hits = search(q, &sp);
+            let want: Vec<u64> = t.iter().copied().filter(|&id| id >= 100_000).collect();
+            inserted += want.len();
+            found += want.iter().filter(|id| hits.contains(id)).count();
+        }
+        assert!(inserted >= 300, "only {inserted} of the true neighbors are inserts");
+        found as f64 / inserted as f64
+    };
+    let mut c = SearchCtx::new(ROOM);
+    let mut ids = |index: &Index, q: &[f32], sp: &SearchParams| -> Vec<u64> {
+        index.search(q, sp, &mut c).unwrap().iter().map(|h| h.id).collect()
+    };
+    let read = recall(4, &mut |q, sp| ids(&fold, q, sp));
+    let all_read = recall(256, &mut |q, sp| ids(&fold, q, sp));
+    let aimed = recall(4, &mut |q, sp| ids(&index, q, sp));
+
+    // A fold leaves an insert in its cluster, so a search finds it only when it reads that cluster. Scanning the
+    // pending inserts of the 256 nearest clusters finds about what reading all of them would.
+    assert!(
+        read <= 0.85,
+        "a fold finds {read:.3} at nprobe 4, so the inserts tell nothing"
+    );
+    assert!(
+        aimed >= 0.95 && aimed >= all_read - 0.02,
+        "{aimed:.3}, against {all_read:.3} reading 256"
+    );
+
+    // Every path finds the same.
+    let sp = SearchParams {
+        k: 10,
+        nprobe: 4,
+        rerank: 60,
+        reach: None,
+    };
+    let set = Collections::open(&[&*path]).unwrap();
+    let mut c = SearchCtx::new(ROOM);
+
+    for q in queries.as_chunks::<GAPPED>().0 {
+        let mut paths: Vec<Vec<(u64, u32)>> = Vec::new();
+        let pairs = |hits: &[Hit]| hits.iter().map(|h| (h.id, h.score.to_bits())).collect::<Vec<_>>();
+        for warm in [false, true] {
+            index.set_warm(warm);
+            paths.push(pairs(index.search(q, &sp, &mut c).unwrap()));
+            set.indexes[0].set_warm(warm);
+            let mut out = Vec::new();
+            set.search(q, &sp, &mut c, &mut out).unwrap();
+            paths.push(out.iter().map(|(_, h)| (h.id, h.score.to_bits())).collect());
+        }
+        paths.push(pairs(index.inner().search_mapped(q, &sp, &mut c).unwrap()));
+        let mut leaves = Vec::new();
+        index.route(q, 4, None, &mut c, &mut leaves).unwrap();
+        paths.push(pairs(index.fetch(&leaves, &mut c).unwrap().search(q, 10, 60).unwrap()));
+        assert!(paths.iter().all(|p| *p == paths[0]), "the paths disagree");
+    }
+}
+
+#[test]
+fn a_search_scans_the_pending_inserts_of_the_256_nearest_clusters_once_each() {
+    let (path, _, centers) = gapped("next-clusters.coldivf");
+    let mut writer = Writer::open(&path).unwrap();
+
+    // Two inserts at every cluster's center, which each join that cluster.
+    for (c, center) in centers.as_chunks::<GAPPED>().0.iter().enumerate() {
+        for k in 0..2 {
+            let v: Vec<f32> = center.iter().map(|&x| x + 0.01 * (k as f32 + 1.0)).collect();
+            writer.insert(50_000 + (2 * c + k) as u64, &v).unwrap();
+        }
+    }
+
+    let index = Index::open(&path).unwrap();
+    let held = |l: u32| index.inner().changes().load().groups(l).map(|g| g.len()).sum::<usize>();
+    assert!((0..320).all(|l| held(l) == 2), "an insert joined another cluster");
+    let q = gaussian(&mut SplitMix64::new(93), 1, GAPPED, |_| 1.0);
+    let mut c = SearchCtx::new(ROOM);
+    let mut order = Vec::new();
+    index.route(&q, 320, None, &mut c, &mut order).unwrap();
+    let count = |l: u32| index.inner().tables().unwrap().lists[l as usize].count;
+    let read: usize = order[..8].iter().map(|&l| count(l)).sum();
+
+    // Whatever it reads, a search scans the inserts of the 256 nearest clusters, or of more when it reads more, and
+    // the vectors in the file of only the clusters it reads.
+    for (nprobe, reach, clusters, vectors) in [
+        (8, None, 256, Some(read)),
+        (300, None, 300, None),
+        (8, Some(0.0), 256, None),
+    ] {
+        let sp = SearchParams {
+            k: 10,
+            nprobe,
+            rerank: 60,
+            reach,
+        };
+        let what = format!("nprobe {nprobe}, reach {reach:?}");
+        let reads = |c: &SearchCtx| vectors.is_none_or(|v| c.trace.scanned == v);
+        for warm in [false, true] {
+            index.set_warm(warm);
+            index.search(&q, &sp, &mut c).unwrap();
+            assert_eq!(c.trace.inserts_scanned, 2 * clusters, "{what}, warm {warm}");
+            assert!(reads(&c), "{what}, warm {warm}: {} vectors", c.trace.scanned);
+        }
+        index.set_warm(false);
+        index.inner().search_mapped(&q, &sp, &mut c).unwrap();
+        assert_eq!(c.trace.inserts_scanned, 2 * clusters, "{what}, mapped");
+        assert!(reads(&c), "{what}, mapped: {} vectors", c.trace.scanned);
+        let mut leaves = Vec::new();
+        index.route(&q, nprobe, reach, &mut c, &mut leaves).unwrap();
+        index.fetch(&leaves, &mut c).unwrap().search(&q, 10, 60).unwrap();
+        assert_eq!(c.trace.inserts_scanned, 2 * clusters, "{what}, fetched");
+    }
+
+    // A fetch of clusters of the caller's choosing, one of them among those that the route ranked next, scans the
+    // inserts of each cluster once.
+    let mut leaves = Vec::new();
+    index.route(&q, 8, None, &mut c, &mut leaves).unwrap();
+    let hits = index
+        .fetch(&[order[3], order[100]], &mut c)
+        .unwrap()
+        .search(&q, 10, 60)
+        .unwrap();
+    let mut ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 10);
+    // The two fetched clusters and the 247 others of the 248 ranked next.
+    assert_eq!(c.trace.inserts_scanned, 2 * 249);
+
+    // A route of another index, a copy with the same inserts that reads 100 clusters, keeps the clusters that this
+    // index's last route ranked next, and a fetch of the other index's route scans the inserts of the 156 that it
+    // ranked next.
+    let twin = temp_file("next-clusters-twin.coldivf");
+    crate::quantization::testutil::copy_index(&path, &twin);
+    let other = Index::open(&twin).unwrap();
+    let mut other_leaves = Vec::new();
+    other.route(&q, 100, None, &mut c, &mut other_leaves).unwrap();
+    index
+        .fetch(&[order[3], order[100]], &mut c)
+        .unwrap()
+        .search(&q, 10, 60)
+        .unwrap();
+    assert_eq!(c.trace.inserts_scanned, 2 * 249);
+    other
+        .fetch(&other_leaves[..2], &mut c)
+        .unwrap()
+        .search(&q, 10, 60)
+        .unwrap();
+    assert_eq!(c.trace.inserts_scanned, 2 * 158);
+
+    // A fetch with a context that never routed this index scans the inserts of the fetched clusters alone.
+    let mut fresh = SearchCtx::new(ROOM);
+    index
+        .fetch(&[order[3], order[100]], &mut fresh)
+        .unwrap()
+        .search(&q, 10, 60)
+        .unwrap();
+    assert_eq!(fresh.trace.inserts_scanned, 2 * 2);
+
+    // An insert of a cluster ranked next gets the estimate that it gets once a search reads its cluster.
+    let all = Limits {
+        max_rerank: 3000,
+        ..ROOM
+    };
+    let estimates = |nprobe: usize| -> Vec<u32> {
+        let mut c = SearchCtx::new(all);
+        let sp = SearchParams {
+            k: 10,
+            nprobe,
+            rerank: 3000,
+            reach: None,
+        };
+        index.inner().search_mapped(&q, &sp, &mut c).unwrap();
+        let s = c.scratch.iter().find(|s| s.fits(GAPPED)).unwrap();
+        let first = 6400 + 2 * order[99];
+        let score = |id: u32| {
+            s.candidates
+                .as_slice()
+                .iter()
+                .find(|x| x.id == id)
+                .map(|x| x.score.to_bits())
+        };
+        (first..first + 2)
+            .map(|id| score(id).expect("an insert isn't a candidate"))
+            .collect()
+    };
+    assert_eq!(estimates(8), estimates(120));
+
+    // Two collections of the same file rank each cluster twice, so the 256 nearest overall are 128 of each.
+    let (set, mut out) = (Collections::open(&[&*path, &*path]).unwrap(), Vec::new());
+    let sp = SearchParams {
+        k: 10,
+        nprobe: 8,
+        rerank: 60,
+        reach: None,
+    };
+
+    for warm in [false, true] {
+        set.indexes.iter().for_each(|i| i.set_warm(warm));
+        set.search(&q, &sp, &mut c, &mut out).unwrap();
+        assert_eq!(c.trace.inserts_scanned, 2 * 256, "two collections, warm {warm}");
+    }
 }

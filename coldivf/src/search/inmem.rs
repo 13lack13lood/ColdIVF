@@ -226,6 +226,7 @@ impl InMemory {
     /// What a search reads from the tables.
     pub(crate) fn view(&self) -> View<'_> {
         View {
+            hides: super::scan::Hides::NONE,
             dim: self.dim,
             metric: self.metric,
             anchor: self.anchor,
@@ -275,7 +276,7 @@ impl InMemory {
         ctx: &mut SearchCtx,
         out: &mut Vec<LeafId>,
     ) -> Result<(), Error> {
-        run_route(&self.view(), query, nprobe, reach, ctx, out)
+        run_route(&self.view(), query, nprobe, reach, nprobe, ctx, out)
     }
 
     /// The same index with another kernel tier, so tests can check that every tier gives the same results.

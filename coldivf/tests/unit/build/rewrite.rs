@@ -70,9 +70,8 @@ fn change(writer: &mut Writer, rows: &Rows, seed: u64) {
 
 /// Whether each row of the old file and each insert of the snapshot is visible.
 fn visible(inner: &Inner, delta: &Delta, seen: Seen) -> (Vec<bool>, Vec<bool>) {
-    let (layout, data) = (inner.layout(), inner.in_place());
-    let rows = (0..layout.count as u32).map(|r| delta.is_live(sq8::id(data.rows.row(r), layout.dim), 0, seen));
-    let inserts = (0..seen.inserts()).map(|i| delta.is_live(sq8::id(delta.row(i), layout.dim), delta.seq(i), seen));
+    let rows = (0..inner.layout().count as u32).map(|r| delta.row_visible(r, seen));
+    let inserts = (0..seen.inserts()).map(|i| delta.insert_visible(i, seen));
     (rows.collect(), inserts.collect())
 }
 
@@ -332,7 +331,7 @@ fn a_rewrite_writes_exactly_the_sections_that_the_plan_gives() {
         let mut writer = Writer::open(&path).unwrap();
         change(&mut writer, &rows, 72);
         let inner = &writer.index.inner();
-        let delta = inner.changes().read();
+        let delta = inner.changes().load();
         let seen = delta.seen();
         let plan = mixed(inner, &delta, seen, new_groups, scatter, 73);
         let want = oracle(inner, &delta, seen, &plan);
@@ -428,7 +427,7 @@ fn folds_keep_every_section_without_changes_and_every_lane_with_them() {
     let mut inserted = std::collections::HashMap::new();
     let stays = {
         let inner = &writer.index.inner();
-        let delta = inner.changes().read();
+        let delta = inner.changes().load();
         let (rows, inserts) = visible(inner, &delta, delta.seen());
         for i in 0..delta.len() {
             let (code, f) = delta.lane(i);
@@ -478,7 +477,7 @@ fn codes_measured_again_from_rows_lose_little_recall() {
         delta_rows: Vec::new(),
         trailer: None,
     };
-    let delta = inner.changes().read();
+    let delta = inner.changes().load();
     let (tmp, done) = rewrite(inner, &delta, delta.seen(), &plan, &path, &threads(2).unwrap()).unwrap();
     assert_eq!((done.reencoded, done.copied), (4000, 0));
     // An open of the same file takes the changes' write lock.
@@ -581,11 +580,11 @@ fn measuring_codes_again_from_the_same_rows_gives_the_same_bytes() {
         })
         .collect();
     let pool = threads(2).unwrap();
-    let delta = inner.changes().read();
+    let delta = inner.changes().load();
     let plan = plan_for(&inner, &centers);
     let (first, _) = rewrite(&inner, &delta, delta.seen(), &plan, &path, &pool).unwrap();
     let again = Inner::open(&first).unwrap();
-    let delta_again = again.changes().read();
+    let delta_again = again.changes().load();
     let plan = plan_for(&again, &centers);
     let (second, done) = rewrite(&again, &delta_again, delta_again.seen(), &plan, &first, &pool).unwrap();
     assert_eq!(done.reencoded, 2000);
@@ -671,7 +670,7 @@ fn a_plan_that_does_not_fit_fails_with_invalid_input() {
     let (path, _) = sample("bad-plan.coldivf", &params(Metric::L2), 600, 24, 103);
     let index = Index::open(&path).unwrap();
     let inner = index.inner();
-    let delta = inner.changes().read();
+    let delta = inner.changes().load();
     let pool = threads(1).unwrap();
     let good = || Plan {
         lists: (0..24)

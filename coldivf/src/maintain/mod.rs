@@ -1,7 +1,8 @@
 //! Maintenance, which folds an index's changes into a new data file and clusters again the parts that drifted. A run
 //! takes a snapshot of the changes, plans the new file's clusters from the old file and the snapshot, then writes the
-//! new file as the plan says, as the index's next generation. It runs on the writer's thread and blocks it until the
-//! commit makes the new generation current.
+//! new file as the plan says, as the index's next generation. It runs as a job on any thread while the writer goes on,
+//! and the writer's commit then makes the new generation current. The changes made after the snapshot move to the new
+//! generation's log.
 //!
 //! There are three kinds of run:
 //! - A fold keeps every cluster and its center. It drops the deleted vectors and adds the inserted ones to the clusters
@@ -15,13 +16,13 @@
 //! changed gets its code measured again from its row. Every row is copied unchanged, and the mean and the rotation
 //! never change.
 
+pub(crate) mod job;
 pub(crate) mod major;
 pub(crate) mod minor;
+pub(crate) mod policy;
 pub(crate) mod regions;
 pub(crate) mod rows;
 
-use std::collections::HashSet;
-use std::fs::File;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::sync::Arc;
@@ -32,15 +33,15 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 use crate::build::Slice;
 use crate::build::kmeans::{self, KMeans};
 use crate::build::order::leaf_order;
-use crate::build::rewrite::{GONE, Plan, PlanCenter, PlanGroups, PlanList, rewrite_into};
+use crate::build::rewrite::{GONE, Gate, Out, Plan, PlanCenter, PlanGroups, PlanList, Progress, rewrite_into};
 use crate::format::{Layout, Part, Tables, Trailer};
 use crate::index::Inner;
 use crate::io;
-use crate::quantization::rabitq::{Encoder, code_bytes};
+use crate::quantization::rabitq::{Encoder, Factors, code_bytes};
 use crate::quantization::{padded_dim, rotate_offset, sq4, sq8};
 use crate::root::{self, Next, Owner};
 use crate::search::{LIMIT, invalid};
-use crate::update::{Delta, Log, NONE, Record, Seen, Version, log};
+use crate::update::{Delta, Log, Record, Seen, Version, log};
 use crate::{Anchor, Clusters, Limits, MaintainParams, Metric, RunKind, RunReport, SearchCtx, Status};
 use regions::Regions;
 use rows::damaged_row;
@@ -54,9 +55,31 @@ const PIECE: usize = 1 << 20;
 
 /// A run's snapshot: the changes it folds in, and where the log ended then, so the changes logged after it move to the
 /// new generation's log.
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Snapshot {
     pub(crate) seen: Seen,
     pub(crate) log_at: usize,
+}
+
+/// An insert's lane in the next generation, which a job or the writer measured before the commit: the cluster it
+/// routes to there, and its code and factors measured from that cluster's center, by its sequence number.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Lane {
+    pub(crate) seq: u64,
+    pub(crate) list: u32,
+    pub(crate) code: Vec<u8>,
+    pub(crate) factors: Factors,
+}
+
+/// How a run reads the old file and writes the new one: at once for a run that blocks the writer, or as a job's gate
+/// lets it, with marks to go on from.
+pub(crate) struct Writes<'a> {
+    pub(crate) out: &'a dyn Out,
+    pub(crate) gate: &'a dyn Gate,
+    pub(crate) progress: &'a mut dyn Progress,
+    pub(crate) pool: &'a ThreadPool,
+    /// The most bytes of rows that a window of the rewrite gathers, which is what a mark covers.
+    pub(crate) window: usize,
 }
 
 /// The vectors that a run keeps, as of its snapshot.
@@ -74,35 +97,24 @@ pub(crate) struct Live {
 }
 
 impl Live {
-    /// The vectors of `old` and of `delta` visible as of `seen`. With any delete, it reads the old file's ids section
-    /// for each row's id and checks it against the header. Returns the bytes it read too.
+    /// The vectors of `old` and of `delta` visible as of `seen`, judged by the stamps of the changes that hid rows and
+    /// inserts. Returns the bytes it read too, none, since the stamps are in memory.
     pub(crate) fn of(old: &Inner, delta: &Delta, seen: Seen) -> Result<(Live, u64), Error> {
         let (layout, tables) = (old.layout(), old.tables()?);
-        let dim = layout.dim;
         let inserts: Vec<u32> = (0..seen.inserts())
-            .filter(|&i| delta.is_live(sq8::id(delta.row(i), dim), delta.seq(i), seen))
+            .filter(|&i| delta.insert_visible(i, seen))
             .map(|i| i as u32)
             .collect();
-        let (mut rows, mut replaced_rows) = (vec![true; layout.count], Vec::new());
-        let mut read = 0;
-
-        if !delta.hides_nothing() {
-            let ids: HashSet<u64> = inserts.iter().map(|&i| sq8::id(delta.row(i as usize), dim)).collect();
-            replaced_rows = vec![false; layout.count];
-            read = visible_rows(old, delta, seen, &ids, &mut rows, &mut replaced_rows)?;
-        }
-
+        let rows: Vec<bool> = (0..layout.count as u32).map(|r| delta.row_visible(r, seen)).collect();
         let nlist = tables.lists.len();
         let (mut kept, mut added, mut deleted) = (vec![0u32; nlist], vec![0u32; nlist], vec![0u32; nlist]);
         let mut replaced = vec![0u32; nlist];
 
         for (j, list) in tables.lists.iter().enumerate() {
-            let rows_of = list.first_id as usize..list.first_id as usize + list.count;
-            kept[j] = rows[rows_of.clone()].iter().filter(|&&v| v).count() as u32;
+            let rows_of = list.first_id..list.first_id + list.count as u32;
+            kept[j] = rows_of.clone().filter(|&r| rows[r as usize]).count() as u32;
             deleted[j] = list.count as u32 - kept[j];
-            replaced[j] = replaced_rows
-                .get(rows_of)
-                .map_or(0, |r| r.iter().filter(|&&v| v).count() as u32);
+            replaced[j] = rows_of.filter(|&r| delta.row_replaced(r, seen)).count() as u32;
         }
 
         for &i in &inserts {
@@ -118,7 +130,7 @@ impl Live {
                 deleted,
                 replaced,
             },
-            read,
+            0,
         ))
     }
 
@@ -132,37 +144,15 @@ impl Live {
     }
 }
 
-/// Marks the rows of `old` that a change in `delta` hid as of `seen`, and among them those whose id is in `inserted`,
-/// the ids of the visible inserts. It reads each row's id from the ids section through the cold handle, and checks the
-/// section against the header. Returns the bytes read.
-fn visible_rows(
-    old: &Inner,
-    delta: &Delta,
-    seen: Seen,
-    inserted: &HashSet<u64>,
-    rows: &mut [bool],
-    replaced: &mut [bool],
-) -> Result<u64, Error> {
-    read_part(old, Part::Ids, |from, piece| {
-        let first = from / 8;
-        for (k, id) in piece.as_chunks::<8>().0.iter().enumerate() {
-            let (id, r) = (u64::from_le_bytes(*id), first + k);
-            if r < rows.len() && !delta.is_live(id, 0, seen) {
-                rows[r] = false;
-                replaced[r] = inserted.contains(&id);
-            }
-        }
-    })
-}
-
-/// Reads section `part` of `old` through the cold handle, `PIECE` bytes at a time, hands each piece to `each` with its
-/// offset in the section, then checks the section against the header. Returns the bytes read.
-fn read_part(old: &Inner, part: Part, mut each: impl FnMut(usize, &[u8])) -> Result<u64, Error> {
+/// Reads section `part` of `old` through the cold handle, `PIECE` bytes at a time, each once `gate` lets it, hands each
+/// piece to `each` with its offset in the section, then checks the section against the header. Returns the bytes read.
+fn read_part(old: &Inner, gate: &dyn Gate, part: Part, mut each: impl FnMut(usize, &[u8])) -> Result<u64, Error> {
     let span = old.layout().span(part);
     let (mut crc, mut buf) = (crc32fast::Hasher::new(), Vec::new());
 
     for at in (span.offset..span.end()).step_by(PIECE) {
         buf.resize(PIECE.min(span.end() - at), 0);
+        gate.read(buf.len())?;
         io::read_at(old.cold_file(), &mut buf, at)?;
         crc.update(&buf);
         each(at - span.offset, &buf);
@@ -183,6 +173,8 @@ pub(crate) struct Ctx<'a> {
     pub(crate) centers: &'a [f32],
     pub(crate) params: &'a MaintainParams,
     pub(crate) pool: &'a ThreadPool,
+    /// What every read of the old file waits for.
+    pub(crate) gate: &'a dyn Gate,
     /// The seed of this run's k-means, from the settings' seed and the old file's epoch.
     pub(crate) seed: u64,
 }
@@ -255,7 +247,7 @@ fn decoded_centers(old: &Inner, tables: &Tables) -> Vec<f32> {
 }
 
 /// Checks the settings that a run uses.
-fn check(params: &MaintainParams) -> Result<(), Error> {
+pub(crate) fn check(params: &MaintainParams) -> Result<(), Error> {
     let (m, j) = (&params.minor, &params.major);
     let shares = [m.change, m.shrink, m.hot_list, m.list_loss, m.split, m.merge, j.beta];
     let optional = [j.inserts, j.deletes, j.indicator, m.pool, m.global_pass];
@@ -280,11 +272,30 @@ fn check(params: &MaintainParams) -> Result<(), Error> {
         ));
     }
 
+    let s = &params.start;
+    let starts = [s.pending_share, s.dead_share, s.read_excess, s.write_budget];
+
+    if !starts
+        .iter()
+        .chain(s.hard_cap.iter())
+        .all(|x| x.is_finite() && *x >= 0.0)
+    {
+        return Err(invalid(
+            "every maintenance start threshold must be finite and at least 0",
+        ));
+    }
+
+    if params.throttle.burst_bytes == 0 || params.throttle.idle_burst_bytes == 0 {
+        return Err(invalid("a burst of a maintenance job's writes holds at least one byte"));
+    }
+
     Ok(())
 }
 
-/// The pool of a run's threads, `threads` of them, or with 0 `RAYON_NUM_THREADS` when it is set and otherwise 2.
-fn pool(threads: usize) -> Result<ThreadPool, Error> {
+/// The pool of a run's threads, `threads` of them, or with 0 `RAYON_NUM_THREADS` when it is set and otherwise 2. With
+/// `background` they run at low priority, as `io::background` sets it, eg. at utility quality of service (QoS) on
+/// macOS, so a job slows searches as little as it can.
+pub(crate) fn pool(threads: usize, background: bool) -> Result<ThreadPool, Error> {
     let env = std::env::var("RAYON_NUM_THREADS")
         .ok()
         .and_then(|n| n.parse::<usize>().ok());
@@ -292,11 +303,14 @@ fn pool(threads: usize) -> Result<ThreadPool, Error> {
         0 => env.filter(|&n| n > 0).unwrap_or(2),
         n => n,
     };
-    ThreadPoolBuilder::new()
+    let builder = ThreadPoolBuilder::new()
         .num_threads(n)
-        .thread_name(|i| format!("coldivf-maintain-{i}"))
-        .build()
-        .map_err(Error::other)
+        .thread_name(|i| format!("coldivf-maintain-{i}"));
+    let builder = match background {
+        true => builder.start_handler(|_| io::background()),
+        false => builder,
+    };
+    builder.build().map_err(Error::other)
 }
 
 /// The seed of a run's k-means on `old`: the settings' seed, or with 0 the file's seed plus its epoch.
@@ -307,37 +321,33 @@ fn seed_of(params: &MaintainParams, old: &Inner) -> u64 {
     }
 }
 
-/// Plans a run of `kind` for the open index `old` and writes its new data file into `out`, the empty file at
-/// `out_path`, as of a snapshot that it takes first. The changes made after the snapshot stay in the log. Returns the
-/// snapshot and what the run did.
+/// Plans a run of `kind` for the open index `old`, as of `snapshot` of its changes `delta`, and writes its new data file
+/// through `writes`. The changes made after the snapshot stay in the log. Returns what the run did.
 pub(crate) fn run(
     old: &Inner,
-    out: &File,
-    out_path: &Path,
+    delta: &Delta,
+    snapshot: &Snapshot,
     params: &MaintainParams,
     kind: RunKind,
-) -> Result<(Snapshot, RunReport), Error> {
+    writes: Writes,
+) -> Result<RunReport, Error> {
     check(params)?;
     let (started, cpu) = (Instant::now(), io::thread_cpu());
-    let pool = pool(params.threads)?;
-    let delta = old.changes().read();
-    let snapshot = Snapshot {
-        seen: delta.seen(),
-        log_at: delta.log_len(),
-    };
-    let (live, mut read) = Live::of(old, &delta, snapshot.seen)?;
+    let pool = writes.pool;
+    let (live, mut read) = Live::of(old, delta, snapshot.seen)?;
     let tables = old.tables()?;
     let centers = decoded_centers(old, tables);
     let seed = seed_of(params, old);
     let ctx = Ctx {
         old,
-        delta: &delta,
+        delta,
         seen: snapshot.seen,
         live: &live,
         tables,
         centers: &centers,
         params,
-        pool: &pool,
+        pool,
+        gate: writes.gate,
         seed,
     };
     let mut report = RunReport::default();
@@ -345,7 +355,7 @@ pub(crate) fn run(
         Some(t) => Regions::carried(t, &live),
         None => {
             let counts: Vec<usize> = tables.lists.iter().map(|l| l.count).collect();
-            let (r, distances) = Regions::made(&centers, ctx.dim(), &counts, &live, params, seed, &pool)?;
+            let (r, distances) = Regions::made(&centers, ctx.dim(), &counts, &live, params, seed, pool)?;
             report.distances += distances;
             r
         }
@@ -359,14 +369,25 @@ pub(crate) fn run(
         // The centers of a plan are means of rows, and each row passed the range checks of a build or an insert, so
         // a center out of range means a damaged row, unless the rows section checks out.
         Err(e) if e.kind() == ErrorKind::InvalidInput => {
-            read_part(old, Part::Rows, |_, _| {})?;
+            read_part(old, writes.gate, Part::Rows, |_, _| {})?;
             return Err(e);
         }
         planned => planned?,
     };
     report.moved = moved(&ctx, &plan);
     read += report.bytes_read;
-    let done = rewrite_into(old, &delta, snapshot.seen, &plan, out, out_path, &pool)?;
+    let (out, gate, progress) = (writes.out, writes.gate, writes.progress);
+    let done = rewrite_into(
+        old,
+        delta,
+        snapshot.seen,
+        &plan,
+        out,
+        gate,
+        progress,
+        pool,
+        writes.window,
+    )?;
     report.bytes_read = read + done.bytes_read;
     report.bytes_written = done.bytes_written;
     (report.reencoded, report.copied, report.count, report.lists) =
@@ -375,7 +396,7 @@ pub(crate) fn run(
     let threads: Duration = pool.broadcast(|_| io::thread_cpu()).iter().sum();
     report.cpu = io::thread_cpu().saturating_sub(cpu) + threads;
     report.wall = started.elapsed();
-    Ok((snapshot, report))
+    Ok(report)
 }
 
 /// The plan of a run of `report.kind`, from the old file's `regions`. A minor run with nothing to do becomes a fold.
@@ -407,8 +428,8 @@ fn trailer_of(old: &Inner) -> Result<Option<Trailer>, Error> {
     }
 }
 
-/// Whether a major run is due, i.e. whether the inserts since the last one reached `params.major.inserts` of the count
-/// then, or the deletes `params.major.deletes` of it. Runs don't measure the read-cost indicator, so it never fires.
+/// Whether a major run is due by the counts, i.e. whether the inserts since the last one reached `params.major.inserts`
+/// of the count then, or the deletes `params.major.deletes` of it. The policy adds the read-cost indicator's trigger.
 pub(crate) fn major_due(regions: &Regions, params: &MaintainParams) -> bool {
     // The shares are compared in f32, the type they are given in, as in the regions' due marks.
     let (base, j) = (regions.major_count.max(1) as f32, &params.major);
@@ -417,9 +438,13 @@ pub(crate) fn major_due(regions: &Regions, params: &MaintainParams) -> bool {
     inserted || deleted
 }
 
-/// What maintenance would do now with `params`.
-pub(crate) fn status(old: &Inner, params: &MaintainParams) -> Result<Status, Error> {
-    let delta = old.changes().read();
+/// What maintenance would do now with `params`, when no search ran for `idle`, and what the policy says of it.
+pub(crate) fn status(
+    old: &Inner,
+    params: &MaintainParams,
+    idle: Duration,
+) -> Result<(Status, policy::Decision), Error> {
+    let delta = old.changes().load_full();
     let seen = delta.seen();
     let (live, _) = Live::of(old, &delta, seen)?;
     let tables = old.tables()?;
@@ -430,17 +455,44 @@ pub(crate) fn status(old: &Inner, params: &MaintainParams) -> Result<Status, Err
                 decoded_centers(old, tables),
                 tables.lists.iter().map(|l| l.count).collect::<Vec<_>>(),
             );
-            let pool = pool(params.threads)?;
+            let pool = pool(params.threads, false)?;
             Regions::made(&centers, old.dim(), &counts, &live, params, seed_of(params, old), &pool)?.0
         }
     };
 
-    Ok(Status {
-        pending: live.inserts.len(),
-        deleted: live.deleted.iter().map(|&n| n as usize).sum(),
+    let (pending, deleted) = (live.inserts.len(), live.deleted.iter().map(|&n| n as usize).sum());
+    let count = old.layout().count - deleted + pending;
+    let (excess, queries) = old.scanned().excess(deleted as f64 / old.layout().count.max(1) as f64);
+    let at = policy::Now {
+        count,
+        rows: old.layout().count,
+        pending,
+        deleted,
         regions_due: regions.due(&live.sizes(), &params.minor).len(),
         major_due: major_due(&regions, params),
-    })
+        dim: old.dim(),
+        nlist: tables.lists.len(),
+        file_bytes: old.file_len() as u64,
+        excess,
+        queries,
+        idle,
+        now_ms: policy::now_ms(),
+    };
+    let runs = policy::runs(old.path());
+    let decision = policy::decide(params, &at, &runs);
+    let (bytes_written_24h, reencoded_24h, cpu_24h) = policy::last_day(&runs, at.now_ms);
+    let status = Status {
+        pending,
+        deleted,
+        regions_due: at.regions_due,
+        major_due: at.major_due,
+        due: decision.due,
+        deferred: decision.deferred,
+        bytes_written_24h,
+        reencoded_24h,
+        cpu_24h,
+    };
+    Ok((status, decision))
 }
 
 /// The plan of a fold: every old cluster that still holds a vector, with its center, in the old order, and the old
@@ -584,9 +636,12 @@ fn moved(ctx: &Ctx, plan: &Plan) -> usize {
 /// Makes the generation that a run wrote into `next` current, as of the run's `snapshot` of the old generation's `log`,
 /// and returns the new generation and its log. It makes the new log, syncs the folder, opens the new generation,
 /// moves the changes logged after the snapshot into the new log and syncs it, then commits through the root and deletes
-/// the old generation's files. On an error before the commit the old generation stays current, with every change, and
-/// the new files go. On one in the commit's slot write, whether it committed is unknown, so `log` refuses every change
-/// until the writer opens again.
+/// the old generation's files. An insert with a lane in `lanes`, sorted by sequence number, takes it. With `warm`, the
+/// new generation starts warm: before the commit it touches a byte of each page of its codes, which the job wrote
+/// through the system's cache, so its first searches take no page faults for them. On an error before the commit the
+/// old generation stays current, with every change, and the new files go. On one in the commit's slot write, whether
+/// it committed is unknown, so `log` refuses every change until the writer opens again.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn commit(
     owner: &mut Owner,
     mut next: Next,
@@ -594,6 +649,8 @@ pub(crate) fn commit(
     old: &Layout,
     snapshot: &Snapshot,
     log: &mut Log,
+    lanes: &[Lane],
+    warm: bool,
 ) -> Result<(Arc<Inner>, Log), Error> {
     let layout = root::header_of(&next.data)?;
     let base = snapshot.seen.next();
@@ -603,8 +660,14 @@ pub(crate) fn commit(
     let inner = Arc::new(Inner::open_at(path, next.located(layout.check, base))?);
     // The first searches of the new generation find its cluster tables loaded.
     inner.tables()?;
+
+    if warm {
+        inner.prefault_codes();
+        inner.set_warm(true);
+    }
+
     let later = log.records_after(snapshot.log_at)?;
-    carry(&inner, &later, log.version(), old, base, &mut new_log)?;
+    carry(&inner, &later, log.version(), old, base, lanes, &mut new_log)?;
     new_log.sync()?;
     io::step("carried", &next.data);
 
@@ -623,15 +686,19 @@ pub(crate) fn commit(
 }
 
 /// Appends the changes `records`, which a log of `from` holds for the data file whose header says `old` and which start
-/// at sequence number `base`, to `to`, the log of `inner`, fit for its data file. A delete stays as it is. An insert is
-/// routed again to its nearest cluster of the new file. With the cluster anchor its code is measured again from its
-/// row, against that cluster's center, and with the mean anchor it stays. Its row stays as it is.
+/// at sequence number `base`, to `to`, the log of `inner`, fit for its data file. A delete stays as it is. An insert
+/// takes its lane in `lanes`, by sequence number, when it has one. Otherwise it is routed again to its nearest cluster
+/// of the new file, and with the cluster anchor its code is measured again from its row, against that cluster's
+/// center, while with the mean anchor it stays. Its row stays as it is. Each record's hint of what it hides is looked
+/// up again in the new generation.
+#[allow(clippy::too_many_arguments)]
 fn carry(
     inner: &Inner,
     records: &[Vec<u8>],
     from: Version,
     old: &Layout,
     base: u64,
+    lanes: &[Lane],
     to: &mut Log,
 ) -> Result<(), Error> {
     let (dim, mean) = (inner.dim(), inner.mean());
@@ -646,15 +713,31 @@ fn carry(
 
     for (i, bytes) in records.iter().enumerate() {
         let seq = base + i as u64;
-        let carried = match log::decode(bytes, from, old.dim, old.nlist, seq)? {
-            Record::Delete { id, .. } => Record::Delete { seq, id, hides: NONE },
-            Record::Insert {
+        let record = log::decode(bytes, from, old.dim, old.nlist, seq)?;
+        // Where the visible version of the id is in the new generation, which is what the record now hides.
+        let (_, hides) = inner.changes().hint(record.id())?;
+        let lane = lanes.binary_search_by_key(&seq, |l| l.seq).ok().map(|i| &lanes[i]);
+        let carried = match (record, lane) {
+            (Record::Delete { id, .. }, _) => Record::Delete { seq, id, hides },
+            (Record::Insert { id, row, .. }, Some(lane)) => Record::Insert {
+                seq,
                 id,
-                code: old_code,
-                factors,
+                list: lane.list,
+                hides,
+                code: &lane.code,
+                factors: lane.factors,
                 row,
-                ..
-            } => {
+            },
+            (
+                Record::Insert {
+                    id,
+                    code: old_code,
+                    factors,
+                    row,
+                    ..
+                },
+                None,
+            ) => {
                 sq8::decode(row, mean, &mut o);
                 if !o.iter().all(|x| x.is_finite()) {
                     return Err(damaged_row());
@@ -676,7 +759,7 @@ fn carry(
                     seq,
                     id,
                     list: leaf,
-                    hides: NONE,
+                    hides,
                     code: &code,
                     factors,
                     row,

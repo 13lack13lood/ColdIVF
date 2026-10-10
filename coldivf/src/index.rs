@@ -7,11 +7,12 @@
 //! cell once and keeps that generation until it returns. A commit or a refresh swaps in a newer generation, and the old
 //! one waits in the cell until no search holds it, so a search never frees it.
 
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use arc_swap::{ArcSwap, Guard};
 
@@ -26,13 +27,13 @@ use crate::root::{self, Located};
 use crate::search::cold::{Reads, reads_for};
 use crate::search::rerank::rerank_live;
 use crate::search::route::Centers;
-use crate::search::scan::{scan_each, scan_list};
+use crate::search::scan::{Hides, Pending};
 use crate::search::{
-    InPlace, LIMIT, RowPages, Scratch, View, check_search, invalid, normalize, prepare_query, run_route, scan_in_place,
-    scratch_for,
+    InPlace, LIMIT, RowPages, View, check_search, depth, invalid, normalize, prepare_query, run_route, scan_in_place,
+    scan_next, scratch_for,
 };
 use crate::trace::{Clock, Trace};
-use crate::update::{self, Changes, Delta, Seen};
+use crate::update::{self, Changes, Delta};
 use crate::{Anchor, Hit, LeafId, Limits, Metric, SearchCtx, SearchParams};
 
 /// The most bytes that `verify` and a warm-up read at once.
@@ -61,9 +62,14 @@ pub(crate) struct Shared {
     /// The read backend of every generation, when a benchmark chose one.
     wave: Option<NewWave>,
     /// The files whose change tells that the index may have a newer generation: its two root slots and its data file
-    /// from before the first commit. And a stamp of them as the last refresh saw them.
+    /// from before the first commit. And a stamp of them as the last refresh, or this process's writer's last commit,
+    /// saw them.
     watched: [PathBuf; 3],
     stamp: AtomicU64,
+    /// Set while this process's writer commits a generation, which it then makes current itself.
+    committing: AtomicBool,
+    /// When a search of the index last ran, in any process, which a maintenance job waits on.
+    activity: Arc<io::Activity>,
 }
 
 impl Shared {
@@ -87,16 +93,17 @@ impl Shared {
     /// The cell for `inner`, a generation of the index at `path`: the one that holds it or an older generation of the
     /// same index, which moves forward to it, or else a new one.
     pub(crate) fn adopt(path: &Path, inner: Inner) -> Arc<Shared> {
-        let mut open = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut open = update::locked(&SHARED);
         open.retain(|s| s.strong_count() > 0);
         let joined = open.iter().filter_map(Weak::upgrade).find(|s| {
             let cur = s.current.load();
             s.path == path && cur.same_index(&inner)
         });
 
+        // While this process's writer commits, the generation it publishes takes the place of the one before.
         if let Some(shared) = joined {
             let cur = shared.current.load_full();
-            if inner.at.generation > cur.at.generation {
+            if inner.at.generation > cur.at.generation && !shared.committing.load(Ordering::Acquire) {
                 shared.publish(&cur, Arc::new(inner));
             }
             return shared;
@@ -113,6 +120,7 @@ impl Shared {
         let dir = root::folder(path);
         let watched = [dir.join(root::SLOTS[0]), dir.join(root::SLOTS[1]), path.to_path_buf()];
         let stamp = AtomicU64::new(stamp_of(&watched));
+        let activity = Arc::new(io::Activity::open(&dir));
         Arc::new_cyclic(|me| {
             inner.join(inner.uid, me.clone());
             Shared {
@@ -124,8 +132,21 @@ impl Shared {
                 wave,
                 watched,
                 stamp,
+                committing: AtomicBool::new(false),
+                activity,
             }
         })
+    }
+
+    /// Notes that a search of the index runs now, for the maintenance jobs of every process.
+    #[inline]
+    pub(crate) fn note(&self) {
+        self.activity.note();
+    }
+
+    /// When a search of the index last ran, which a maintenance job waits on.
+    pub(crate) fn activity(&self) -> Arc<io::Activity> {
+        Arc::clone(&self.activity)
     }
 
     /// Whether the files that tell of a newer generation changed since the last refresh. It only reads their metadata,
@@ -154,15 +175,52 @@ impl Shared {
         }
 
         let prev = Guard::into_inner(prev);
-        self.retired.lock().unwrap_or_else(PoisonError::into_inner).push(prev);
+        update::locked(&self.retired).push(prev);
         true
     }
 
-    /// Moves to the generation that the root names, when another process committed a newer one, or to the file at the
-    /// path when a rebuild replaced the one before the index's first commit. Returns whether it moved. Then it frees
-    /// the old generations that nothing holds.
-    pub(crate) fn refresh(&self) -> Result<bool, Error> {
+    /// Marks that this process's writer commits a generation, until the returned guard drops. Meanwhile a refresh or
+    /// an open of this process leaves the move to the writer, so none of them opens a copy of the new generation.
+    pub(crate) fn committing(&self) -> Committing<'_> {
+        self.committing.store(true, Ordering::Release);
+        Committing(self)
+    }
+
+    /// Makes `next`, the generation that this process's writer just committed, current in place of `from`, or in place
+    /// of a copy of the same generation that a refresh or an open of this process made current as the commit began.
+    /// The writer's own one has its cluster tables loaded and keeps the warm bit. Then it takes the stamp of the files
+    /// as the commit left them, so a `prepare` of this process doesn't look for a newer generation. Returns whether it
+    /// moved.
+    pub(crate) fn publish_own(&self, from: &Arc<Inner>, next: Arc<Inner>) -> bool {
+        let cur = self.current.load_full();
+        let from = match cur.is(&next.at) {
+            true => &cur,
+            false => from,
+        };
+        let moved = self.publish(from, next);
         self.stamp.store(stamp_of(&self.watched), Ordering::Relaxed);
+        moved
+    }
+
+    /// Moves to the generation that the root names, when another process committed a newer one, or to the file at the
+    /// path when a rebuild replaced the one before the index's first commit, as `follow` does. Then it frees the old
+    /// generations that nothing holds. Returns whether it moved.
+    pub(crate) fn refresh(&self) -> Result<bool, Error> {
+        let moved = self.follow()?;
+        self.reclaim();
+        Ok(moved)
+    }
+
+    /// The same, but it frees nothing. While this process's writer commits, it does nothing, since the writer then
+    /// makes the new generation current. Returns whether it moved.
+    pub(crate) fn follow(&self) -> Result<bool, Error> {
+        if self.committing.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+
+        self.stamp.store(stamp_of(&self.watched), Ordering::Relaxed);
+        // The index's first commit makes its folder, and with it the word that every process shares.
+        self.activity.map();
         let cur = self.current.load_full();
         let at = root::locate(&self.path)?;
         let newer = match (&cur.at.root, &at.root) {
@@ -179,15 +237,13 @@ impl Shared {
             };
             self.publish(&cur, Arc::new(next))
         };
-        drop(cur);
-        self.reclaim();
         Ok(moved)
     }
 
     /// Frees the generations swapped out that nothing else holds now, on the calling thread.
     pub(crate) fn reclaim(&self) {
         let freed: Vec<Arc<Inner>> = {
-            let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut retired = update::locked(&self.retired);
             let (free, keep) = std::mem::take(&mut *retired)
                 .into_iter()
                 .partition(|g| Arc::strong_count(g) == 1);
@@ -200,7 +256,16 @@ impl Shared {
     /// How many generations swapped out wait to be freed.
     #[cfg(test)]
     pub(crate) fn retired(&self) -> usize {
-        self.retired.lock().unwrap_or_else(PoisonError::into_inner).len()
+        update::locked(&self.retired).len()
+    }
+}
+
+/// A cell's mark that this process's writer commits, which it clears when it drops, whether the commit failed or not.
+pub(crate) struct Committing<'a>(&'a Shared);
+
+impl Drop for Committing<'_> {
+    fn drop(&mut self) {
+        self.0.committing.store(false, Ordering::Release);
     }
 }
 
@@ -227,9 +292,59 @@ fn stamp_of(files: &[PathBuf]) -> u64 {
 /// The cell of the index at `path` whose current generation passes `fits`, if an open handle of this process shares
 /// one.
 fn find(path: &Path, fits: impl Fn(&Inner) -> bool) -> Option<Arc<Shared>> {
-    let open = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+    let open = update::locked(&SHARED);
     let mut live = open.iter().filter_map(Weak::upgrade);
     live.find(|s| s.path == path && fits(&s.current.load()))
+}
+
+/// What the searches of a generation scanned while it had pending inserts: how many searches, the vectors of the
+/// clusters they probed, and the pending inserts of those clusters. Each search adds once, at its end.
+#[derive(Default)]
+pub(crate) struct Scanned {
+    searches: AtomicU64,
+    vectors: AtomicU64,
+    inserts: AtomicU64,
+}
+
+impl Scanned {
+    /// Adds a search that scanned `lanes`: the vectors of the clusters it read, their inserts, and the inserts of the
+    /// clusters ranked next. Only the first two count toward the excess, which tells inserts that crowd the clusters
+    /// that searches read. The inserts of the next clusters grow with every insert alike, which the pending share
+    /// bounds.
+    pub(crate) fn add(&self, lanes: [u64; 3]) {
+        if lanes[..2] != [0, 0] {
+            self.searches.fetch_add(1, Ordering::Relaxed);
+            self.vectors.fetch_add(lanes[0], Ordering::Relaxed);
+            self.inserts.fetch_add(lanes[1], Ordering::Relaxed);
+        }
+    }
+
+    /// The share more that the searches scanned than they would with every change folded in, when `dead` is the share
+    /// of the file's vectors that changes hid, and the searches that it counts.
+    pub(crate) fn excess(&self, dead: f64) -> (f64, u64) {
+        let (vectors, inserts) = (
+            self.vectors.load(Ordering::Relaxed),
+            self.inserts.load(Ordering::Relaxed),
+        );
+        let excess = inserts as f64 / vectors.max(1) as f64 + dead;
+        (excess, self.searches.load(Ordering::Relaxed))
+    }
+}
+
+/// Every pending insert that a search counted in `lanes`, those of the clusters it read and of those ranked next.
+pub(crate) fn inserts(lanes: &Cell<[u64; 3]>) -> usize {
+    let [_, read, next] = lanes.get();
+    (read + next) as usize
+}
+
+/// An insert as `encode_insert` measures it: the cluster it is nearest to, its 1-bit code and factors and its 8-bit
+/// row, and the cluster, code and factors that it gets in the next generation, when a job writes one.
+pub(crate) struct Encoded {
+    pub(crate) leaf: u32,
+    pub(crate) code: Vec<u8>,
+    pub(crate) factors: Factors,
+    pub(crate) row: Vec<u8>,
+    pub(crate) next: Option<(u32, Vec<u8>, Factors)>,
 }
 
 pub(crate) struct Inner {
@@ -254,6 +369,8 @@ pub(crate) struct Inner {
     warmth: Arc<Warmth>,
     /// The `warm_up` calls that the running warm-up hasn't seen yet, or 0 when none runs.
     warming: AtomicUsize,
+    /// What the searches of this generation scanned, for the read-cost excess that makes maintenance due.
+    scanned: Scanned,
     /// Clears the warm bit when memory runs short, from the first time the bit may be set.
     pressure: OnceLock<Pressure>,
 }
@@ -340,12 +457,12 @@ impl Inner {
         let SearchCtx {
             limits, scratch, reads, ..
         } = ctx;
-        scratch_for(scratch, self.layout.dim, self.layout.nlist, limits);
+        scratch_for(scratch, self.layout.dim, limits);
         let slot = match self.tables.get() {
             Some(tables) => self.reads(tables, ctx),
             None => {
                 let make = || Reads::ahead(self, (self.cold.wave)(), &self.layout, self.len, limits);
-                reads_for(reads, self, limits, make)
+                reads_for(reads, self, 0, limits, make)
             }
         };
         ctx.reads[slot].prepare();
@@ -370,7 +487,8 @@ impl Inner {
         let mut clock = Clock::start();
         let (tables, data) = (self.mapped_tables()?, self.in_place());
         ctx.trace.tables = clock.lap();
-        let view = self.view(tables);
+        let delta = self.changes.load();
+        let view = self.view_with(tables, &delta);
         let SearchCtx {
             limits,
             scratch,
@@ -378,17 +496,19 @@ impl Inner {
             trace,
             ..
         } = ctx;
-        let s = scratch_for(scratch, view.dim, view.lists.len(), limits);
+        let s = scratch_for(scratch, view.dim, limits);
         trace.buffers = clock.lap();
         prepare_query(&view, query, s)?;
-        scan_in_place(&view, data.blocks, params, s);
-        let delta = self.changes.read();
-        let seen = self.scan_delta(&delta, &view, s);
+        let lanes = Cell::new([0; 3]);
+        scan_in_place(&view, data.blocks, params, s, self.pending(&delta, &lanes));
+        self.scanned.add(lanes.get());
+        (trace.inserts_scanned, trace.generation) = (inserts(&lanes), self.at.generation);
+        let seen = delta.seen();
         // The route and the scan in place count as the scan.
         trace.scan = clock.lap();
         trace.scanned = s.routes.iter().map(|r| view.lists[r.id as usize].count).sum();
         let row = |id: u32| self.row_of(&delta, id, |id| data.rows.row(id));
-        let live = |id: u32, row: &[u8]| self.is_live(&delta, id, row, seen);
+        let live = |id: u32, _: &[u8]| delta.visible(id, seen);
         let (offset, rescored) = (&s.offset, &mut s.rescored);
         rerank_live(
             s.candidates.as_slice(),
@@ -445,51 +565,21 @@ impl Inner {
         format::read_trailer(&bytes, &self.layout).map(Some)
     }
 
-    /// Scans the inserted vectors for the query in `s`, as one more cluster, with internal ids from the file's count.
-    /// A code measured from its cluster's center adds the query's squared distance to that center, which the scan
-    /// measures once per cluster that holds inserts. Returns what it saw, so the rescore can tell which rows were
-    /// visible then.
-    pub(crate) fn scan_delta(&self, delta: &Delta, view: &View, s: &mut Scratch) -> Seen {
-        if delta.len() == 0 {
-            return delta.seen();
-        }
+    /// The pending inserts of `delta` that a search scans with the clusters it probes and those ranked next, or `None`
+    /// when there are none. The scan counts the vectors and the inserts of the clusters it probes, then the inserts of
+    /// those ranked next, in `lanes`.
+    pub(crate) fn pending<'a>(&self, delta: &'a Delta, lanes: &'a Cell<[u64; 3]>) -> Option<Pending<'a>> {
+        (delta.len() > 0).then(|| Pending {
+            delta,
+            seen: delta.seen(),
+            first: self.layout.count as u32,
+            lanes,
+        })
+    }
 
-        let first = self.layout.count as u32;
-
-        match view.anchor {
-            Anchor::Mean => {
-                let (lut, candidates, survivors) = (&s.lut, &mut s.candidates, &mut s.survivors);
-                scan_list(
-                    view.tier,
-                    delta.blocks(),
-                    delta.len(),
-                    first,
-                    lut,
-                    candidates,
-                    survivors,
-                );
-            }
-            Anchor::Cluster => {
-                let (q32, inserted) = (&s.q32, &mut s.inserted);
-                inserted.clear();
-                let t2_of = |&leaf: &u32| view.centers.distance2(view.tier, leaf, q32) as f32;
-                inserted.extend(delta.clusters().iter().map(t2_of));
-                let t2 = |i: usize| inserted[delta.place(i)];
-                let (lut, candidates, survivors) = (&s.lut, &mut s.candidates, &mut s.survivors);
-                scan_each(
-                    view.tier,
-                    delta.blocks(),
-                    delta.len(),
-                    first,
-                    lut,
-                    t2,
-                    candidates,
-                    survivors,
-                );
-            }
-        }
-
-        delta.seen()
+    /// What the searches of this generation scanned.
+    pub(crate) fn scanned(&self) -> &Scanned {
+        &self.scanned
     }
 
     /// The row of internal id `id`, from the file through `in_file` or from the inserted vectors.
@@ -500,14 +590,10 @@ impl Inner {
         }
     }
 
-    /// Whether the candidate with internal id `id` and row `row` was visible when `seen` was taken.
-    pub(crate) fn is_live(&self, delta: &Delta, id: u32, row: &[u8], seen: Seen) -> bool {
-        let seq = (id as usize).checked_sub(self.layout.count).map_or(0, |i| delta.seq(i));
-        delta.hides_nothing() || delta.is_live(sq8::id(row, self.layout.dim), seq, seen)
-    }
-
-    /// Writes the `nprobe` clusters nearest the query into `out`, nearest first, keeping only those within `reach`. It
-    /// starts a new trace, which a fetch and the search of what it fetched then add to.
+    /// Writes the `nprobe` clusters nearest the query into `out`, nearest first, keeping only those within `reach`.
+    /// When the index has pending inserts, `ctx` keeps the clusters ranked after those, up to the `PENDING_LISTS`
+    /// nearest, whose inserts a search of what is fetched scans too. It starts a new trace, which a fetch and the
+    /// search of what it fetched then add to.
     pub(crate) fn route(
         &self,
         query: &[f32],
@@ -520,11 +606,25 @@ impl Inner {
         let mut clock = Clock::start();
         let tables = self.tables()?;
         ctx.trace.tables = clock.lap();
-        scratch_for(&mut ctx.scratch, self.layout.dim, tables.lists.len(), &ctx.limits);
+        scratch_for(&mut ctx.scratch, self.layout.dim, &ctx.limits);
         ctx.trace.buffers = clock.lap();
-        run_route(&self.view(tables), query, nprobe, reach, ctx, out)?;
+        let deep = depth(nprobe, self.changes.load().len() > 0);
+        run_route(&self.view(tables), query, nprobe, reach, deep, ctx, out)?;
+        ctx.next_of = Some((self.cell(), self.uid()));
         ctx.trace.route = clock.lap();
         Ok(())
+    }
+
+    /// The cluster nearest `vector` among `centers`, the centers of another generation of the index, eg. the next one
+    /// while a job writes it. Every generation has the same mean and rotation, so the vector routes as it would there.
+    pub(crate) fn route_among(&self, vector: &[f32], centers: Centers, ctx: &mut SearchCtx) -> Result<u32, Error> {
+        let view = View {
+            centers,
+            ..self.view(self.tables()?)
+        };
+        let mut leaves = Vec::with_capacity(1);
+        run_route(&view, vector, 1, None, 1, ctx, &mut leaves)?;
+        Ok(leaves.first().copied().unwrap_or(0))
     }
 
     /// Starts reading `leaves` in one wave, through `ctx`'s reads of this index, which the first fetch makes. Returns
@@ -571,9 +671,15 @@ impl Inner {
     /// The slot in `ctx` of its reads of this index, made the first time, with every arena, and planned again for this
     /// generation when they were planned for another.
     pub(crate) fn reads(self: &Arc<Inner>, tables: &Tables, ctx: &mut SearchCtx) -> usize {
+        self.reads_of(tables, ctx, 0)
+    }
+
+    /// The same, for the index's copy `copy` in a set of collections that names it more than once, which has reads of
+    /// its own.
+    pub(crate) fn reads_of(self: &Arc<Inner>, tables: &Tables, ctx: &mut SearchCtx, copy: usize) -> usize {
         let SearchCtx { limits, reads, .. } = ctx;
         let make = || Reads::new(self, (self.cold.wave)(), &self.layout, self.len, tables, limits);
-        let slot = reads_for(reads, self, limits, make);
+        let slot = reads_for(reads, self, copy, limits, make);
         reads[slot].size(&self.cold.file, tables, limits);
         slot
     }
@@ -595,7 +701,8 @@ impl Inner {
             ..Trace::default()
         };
         let slot = self.reads(tables, ctx);
-        let (view, data) = (self.view(tables), self.in_place());
+        let delta = self.changes.load();
+        let (view, data) = (self.view_with(tables, &delta), self.in_place());
         let SearchCtx {
             limits,
             scratch,
@@ -604,11 +711,14 @@ impl Inner {
             trace,
             ..
         } = ctx;
-        let s = scratch_for(scratch, view.dim, view.lists.len(), limits);
+        let s = scratch_for(scratch, view.dim, limits);
         trace.buffers = clock.lap();
         prepare_query(&view, query, s)?;
-        scan_in_place(&view, data.blocks, params, s);
-        let seen = self.scan_delta(&self.changes.read(), &view, s);
+        let lanes = Cell::new([0; 3]);
+        scan_in_place(&view, data.blocks, params, s, self.pending(&delta, &lanes));
+        self.scanned.add(lanes.get());
+        (trace.inserts_scanned, trace.generation) = (inserts(&lanes), self.at.generation);
+        let seen = delta.seen();
         // The route and the scan in place count as the scan.
         trace.scan = clock.lap();
         trace.scanned = s.routes.iter().map(|r| view.lists[r.id as usize].count).sum();
@@ -618,10 +728,8 @@ impl Inner {
         trace.rows = clock.lap();
         (trace.row_bytes, trace.row_ranges) = r.row_traffic();
         (trace.cache_hits, trace.read_path) = (r.hits(), r.read_path());
-        // The row wave runs without the lock, so a writer never waits for a read.
-        let delta = self.changes.read();
         let row = |id: u32| self.row_of(&delta, id, |id| r.row(id));
-        let live = |id: u32, row: &[u8]| self.is_live(&delta, id, row, seen);
+        let live = |id: u32, _: &[u8]| delta.visible(id, seen);
         let (offset, rescored) = (&s.offset, &mut s.rescored);
         rerank_live(
             s.candidates.as_slice(),
@@ -681,14 +789,16 @@ impl Inner {
 
     /// Encodes `vector` with the id `id` for an insert. Returns the cluster it is nearest to, its 1-bit code and
     /// factors, and its 8-bit row. With the cluster anchor the code is measured from that cluster's center as it
-    /// decodes, the same center the file's vectors are measured from. A vector that doesn't fit the index fails with
-    /// `InvalidInput`.
+    /// decodes, the same center the file's vectors are measured from. With `next`, the centers of the generation that
+    /// a job writes, it also routes and encodes the vector there, sharing the rotation, unless it doesn't fit there. A
+    /// vector that doesn't fit the index fails with `InvalidInput`.
     pub(crate) fn encode_insert(
         &self,
         id: u64,
         vector: &[f32],
         ctx: &mut SearchCtx,
-    ) -> Result<(u32, Vec<u8>, Factors, Vec<u8>), Error> {
+        next: Option<Centers>,
+    ) -> Result<Encoded, Error> {
         let (dim, count) = (self.layout.dim, self.layout.count);
 
         if vector.len() != dim {
@@ -699,7 +809,7 @@ impl Inner {
             return Err(invalid("a vector has a value that isn't finite"));
         }
 
-        if count + self.changes.read().len() >= u32::MAX as usize - BLOCK {
+        if count + self.changes.load().len() >= u32::MAX as usize - BLOCK {
             return Err(invalid("the index is full, so compact it first"));
         }
 
@@ -735,17 +845,36 @@ impl Inner {
         };
         let mut row = vec![0u8; sq8::row_bytes(dim)];
         sq8::write_row(&o, &self.mean, id, &mut row);
-        let fits = |x: f32| f64::from(x) <= LIMIT;
+        let fits = |f: &Factors| f64::from(f.f_add.abs()) <= LIMIT && f.f_rescale.is_finite() && f.f_err.is_finite();
 
-        if !(fits(factors.f_add.abs())
-            && factors.f_rescale.is_finite()
-            && factors.f_err.is_finite()
-            && fits(sq8::norm2(&row, dim)))
-        {
+        if !(fits(&factors) && f64::from(sq8::norm2(&row, dim)) <= LIMIT) {
             return Err(invalid("a vector is too far from the mean to encode"));
         }
 
-        Ok((leaf, code, factors, row))
+        let next = match next {
+            None => None,
+            Some(centers) => {
+                let list = self.route_among(&o, centers, ctx)?;
+                let (mut code, mut center) = (code.clone(), vec![0f32; dim]);
+                let factors = match self.layout.anchor {
+                    Anchor::Mean => factors,
+                    Anchor::Cluster => {
+                        let (codes, f) = centers.center(list);
+                        sq4::decode(codes, f, &mut center);
+                        encoder.again_from(&center, &mut code)
+                    }
+                };
+                fits(&factors).then_some((list, code, factors))
+            }
+        };
+
+        Ok(Encoded {
+            leaf,
+            code,
+            factors,
+            row,
+            next,
+        })
     }
 
     /// Scores the fetched clusters for `query` and starts reading the rows of the best `n`, using the reads in `slot`.
@@ -758,16 +887,17 @@ impl Inner {
         };
         self.check(query, &params, &ctx.limits)?;
 
-        let view = self.view(self.tables()?);
+        let delta = self.changes.load();
+        let view = self.view_with(self.tables()?, &delta);
         let SearchCtx {
             limits, scratch, reads, ..
         } = ctx;
-        let s = scratch_for(scratch, view.dim, view.lists.len(), limits);
+        let s = scratch_for(scratch, view.dim, limits);
         prepare_query(&view, query, s)?;
         s.candidates.reset(n);
         let r = &mut reads[slot];
-        r.scan(&self.cold.file, &view, s)?;
-        self.scan_delta(&self.changes.read(), &view, s);
+        // A guess at the query scans what the search will scan again, so it counts nothing.
+        r.scan(&self.cold.file, &view, s, self.pending(&delta, &Cell::new([0; 3])))?;
         r.prefetch(&self.cold.file, s.candidates.as_slice())
     }
 
@@ -783,32 +913,55 @@ impl Inner {
         self.check(query, params, &ctx.limits)?;
 
         let mut clock = Clock::start();
-        let view = self.view(self.tables()?);
+        let delta = self.changes.load();
+        let view = self.view_with(self.tables()?, &delta);
         let SearchCtx {
             limits,
             scratch,
             reads,
             hits,
             trace,
+            next,
+            next_of,
             ..
         } = ctx;
-        let s = scratch_for(scratch, view.dim, view.lists.len(), limits);
+        let s = scratch_for(scratch, view.dim, limits);
         trace.buffers += clock.lap();
         prepare_query(&view, query, s)?;
         s.candidates.reset(params.rerank.max(params.k));
         let r = &mut reads[slot];
-        r.scan(&self.cold.file, &view, s)?;
-        let seen = self.scan_delta(&self.changes.read(), &view, s);
+        let lanes = Cell::new([0; 3]);
+        let pending = self.pending(&delta, &lanes);
+        r.scan(&self.cold.file, &view, s, pending)?;
+
+        // The inserts of the clusters that the last route of this generation ranked next, unless they were fetched.
+        if let Some(p) = pending
+            && *next_of == Some((self.cell(), self.uid()))
+        {
+            let fetched = r.probed();
+            let leaves = next.iter().copied().filter(|l| fetched.binary_search(l).is_err());
+            scan_next(
+                &view,
+                leaves,
+                &mut s.lut,
+                &s.q32,
+                p,
+                &mut s.candidates,
+                &mut s.survivors,
+            );
+        }
+
+        self.scanned.add(lanes.get());
+        (trace.inserts_scanned, trace.generation) = (inserts(&lanes), self.at.generation);
+        let seen = delta.seen();
         let scanning = clock.lap();
         (trace.wave, trace.scan) = (r.waited(), scanning.saturating_sub(r.waited()));
         r.read_rows(&self.cold.file, s.candidates.as_slice(), false)?;
         trace.rows = clock.lap();
         (trace.row_bytes, trace.row_ranges) = r.row_traffic();
         (trace.cache_hits, trace.read_path) = (r.hits(), r.read_path());
-        // The row wave runs without the lock, so a writer never waits for a read.
-        let delta = self.changes.read();
         let row = |id: u32| self.row_of(&delta, id, |id| r.row(id));
-        let live = |id: u32, row: &[u8]| self.is_live(&delta, id, row, seen);
+        let live = |id: u32, _: &[u8]| delta.visible(id, seen);
         let (offset, rescored) = (&s.offset, &mut s.rescored);
         rerank_live(
             s.candidates.as_slice(),
@@ -879,8 +1032,10 @@ impl Inner {
         (self.cold.wave)().page()
     }
 
+    /// What a search reads of this index without its changes.
     pub(crate) fn view<'a>(&'a self, tables: &'a Tables) -> View<'a> {
         View {
+            hides: Hides::NONE,
             dim: self.layout.dim,
             metric: self.layout.metric,
             anchor: self.layout.anchor,
@@ -894,6 +1049,33 @@ impl Inner {
             lists: &tables.lists,
             tier: self.tier,
         }
+    }
+
+    /// The same, skipping the rows that `delta` hid.
+    pub(crate) fn view_with<'a>(&'a self, tables: &'a Tables, delta: &'a Delta) -> View<'a> {
+        View {
+            hides: Hides::of(delta),
+            ..self.view(tables)
+        }
+    }
+
+    /// Whether the system holds each of the rows section's pages in memory, by the file's page size.
+    pub(crate) fn resident_rows(&self) -> Vec<bool> {
+        let (rows, page) = (self.in_place().rows.bytes, self.layout.page_size);
+        let held = io::resident(rows);
+        // The system's pages may be smaller or larger than the file's, and need not start where the section does.
+        let (system, lead) = (io::page_size(), rows.as_ptr() as usize % io::page_size());
+        let on = |byte: usize| (lead + byte) / system;
+        (0..rows.len().div_ceil(page))
+            .map(|p| (on(p * page)..=on(((p + 1) * page).min(rows.len()) - 1)).any(|s| held.get(s) == Some(&true)))
+            .collect()
+    }
+
+    /// Touches a byte of each page of the codes section's map, so a scan in place of them takes no page fault for a
+    /// page that the system holds in memory.
+    pub(crate) fn prefault_codes(&self) {
+        let codes = self.in_place().blocks;
+        codes.iter().step_by(4096).for_each(|b| _ = std::hint::black_box(*b));
     }
 
     pub(crate) fn in_place(&self) -> InPlace<'_> {
@@ -1023,7 +1205,7 @@ impl Opening {
             uid,
             cell: AtomicU64::new(uid),
             owner: OnceLock::new(),
-            changes: update::changes_for(path, &layout, &at.log, at.version())?,
+            changes: update::changes_for(path, &layout, &at.data, &at.log, at.version())?,
             path: path.to_path_buf(),
             at,
             cold,
@@ -1036,6 +1218,7 @@ impl Opening {
             tier: Tier::best(),
             warmth: Arc::default(),
             warming: AtomicUsize::new(0),
+            scanned: Scanned::default(),
             pressure: OnceLock::new(),
         })
     }

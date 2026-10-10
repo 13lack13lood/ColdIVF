@@ -156,6 +156,38 @@ fn the_same_file_twice_gives_every_hit_twice() {
 }
 
 #[test]
+fn both_copies_of_a_file_named_twice_move_with_its_writer_s_commits() {
+    let (_, paths, data) = files("twice-commit", Metric::L2, 1, 600, 128);
+    let mut writer = crate::Writer::open(&paths[0]).unwrap();
+    writer.compact().unwrap();
+    let set = Collections::open(&[&paths[0], &paths[0]]).unwrap();
+    let q = &data[0].data[..128];
+    let sp = SearchParams {
+        k: 20,
+        nprobe: 12,
+        rerank: 200,
+        reach: None,
+    };
+    let (mut c, mut out) = (ctx(), Vec::new());
+    let mut found = |id: u64| {
+        set.search(q, &sp, &mut c, &mut out).unwrap();
+        let mut copies: Vec<usize> = out.iter().filter(|(_, h)| h.id == id).map(|(f, _)| *f).collect();
+        copies.sort_unstable();
+        copies
+    };
+    writer.insert(700_000, q).unwrap();
+    assert_eq!(found(700_000), [0, 1]);
+    writer.compact().unwrap();
+    writer.insert(700_001, q).unwrap();
+    writer.delete(700_000).unwrap();
+    assert_eq!(found(700_001), [0, 1]);
+    assert_eq!(found(700_000), [] as [usize; 0]);
+    // Both copies share one cell, and each has reads of its own.
+    assert!(Arc::ptr_eq(&set.indexes[0].shared, &set.indexes[1].shared));
+    assert_eq!(c.reads.len(), 2);
+}
+
+#[test]
 fn warm_and_cold_collections_search_alike() {
     let dim = 128;
     let (_, paths, _) = files("warm", Metric::L2, 2, 500, 128);

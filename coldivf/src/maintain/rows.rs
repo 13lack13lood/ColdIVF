@@ -8,6 +8,7 @@ use rayon::ThreadPool;
 use rayon::prelude::*;
 
 use crate::build::kmeans::Rows;
+use crate::build::rewrite::Gate;
 use crate::format::Part;
 use crate::index::Inner;
 use crate::io;
@@ -55,15 +56,18 @@ impl Rows for Held<'_> {
 /// memory between reads. Its row i is vector `ids[i]`, and `ids` is in increasing order. It counts the bytes it reads.
 pub(crate) struct Streamed<'a> {
     old: &'a Inner,
+    gate: &'a dyn Gate,
     delta: &'a Delta,
     ids: &'a [u32],
     pub(crate) read: Cell<u64>,
 }
 
 impl<'a> Streamed<'a> {
-    pub(crate) fn new(old: &'a Inner, delta: &'a Delta, ids: &'a [u32]) -> Streamed<'a> {
+    /// The vectors `ids`, whose reads of the old file wait for `gate`.
+    pub(crate) fn new(old: &'a Inner, gate: &'a dyn Gate, delta: &'a Delta, ids: &'a [u32]) -> Streamed<'a> {
         Streamed {
             old,
+            gate,
             delta,
             ids,
             read: Cell::new(0),
@@ -84,7 +88,7 @@ impl Rows for Streamed<'_> {
         let rb = sq8::row_bytes(self.dim());
         let vectors: Vec<u32> = ids.iter().map(|&i| self.ids[i as usize]).collect();
         let mut rows = Vec::new();
-        let read = read_rows(self.old, self.delta, &vectors, &mut rows)?;
+        let read = read_rows(self.old, self.gate, self.delta, &vectors, &mut rows)?;
         self.read.set(self.read.get() + read);
         decode_all(rows.chunks_exact(rb), self.old.mean(), out, pool)
     }
@@ -116,8 +120,15 @@ fn decode_all<'r>(
 
 /// Reads the 8-bit rows of the vectors `ids`, in increasing order, into `out`, one after another. A vector id below the
 /// old file's count is a file row's internal id, and one above it is the file's count plus an insert's place. It reads
-/// the old file through the cold handle, in runs of whole pages of at most `READ` bytes. Returns the bytes it read.
-pub(crate) fn read_rows(old: &Inner, delta: &Delta, ids: &[u32], out: &mut Vec<u8>) -> Result<u64, Error> {
+/// the old file through the cold handle, in runs of whole pages of at most `READ` bytes, each once `gate` lets it.
+/// Returns the bytes it read.
+pub(crate) fn read_rows(
+    old: &Inner,
+    gate: &dyn Gate,
+    delta: &Delta,
+    ids: &[u32],
+    out: &mut Vec<u8>,
+) -> Result<u64, Error> {
     let layout = old.layout();
     let (rb, page_size, count) = (sq8::row_bytes(layout.dim), layout.page_size, layout.count);
     let per_page = page_size / rb;
@@ -140,6 +151,7 @@ pub(crate) fn read_rows(old: &Inner, delta: &Delta, ids: &[u32], out: &mut Vec<u
             j += 1;
         }
         buf.resize((last + 1 - first) * page_size, 0);
+        gate.read(buf.len())?;
         io::read_at(old.cold_file(), &mut buf, section + first * page_size)?;
         read += buf.len() as u64;
         for (k, &v) in ids[i..j].iter().enumerate() {
@@ -163,6 +175,7 @@ pub(crate) fn read_rows(old: &Inner, delta: &Delta, ids: &[u32], out: &mut Vec<u
 /// `ids`, so the sums are the same for any number of threads. Returns the sums and the bytes read.
 pub(crate) fn sums(
     old: &Inner,
+    gate: &dyn Gate,
     delta: &Delta,
     ids: &[u32],
     group: &[u32],
@@ -175,7 +188,7 @@ pub(crate) fn sums(
     let (mut rows, mut decoded, mut read) = (Vec::new(), Vec::new(), 0u64);
 
     for (ids, group) in ids.chunks(SUMS).zip(group.chunks(SUMS)) {
-        read += read_rows(old, delta, ids, &mut rows)?;
+        read += read_rows(old, gate, delta, ids, &mut rows)?;
         decoded.resize(ids.len() * dim, 0.0);
         decode_all(rows.chunks_exact(rb), mean, &mut decoded, pool)?;
         for (o, &g) in decoded.chunks_exact(dim).zip(group) {

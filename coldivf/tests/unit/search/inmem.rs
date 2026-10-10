@@ -708,7 +708,7 @@ fn a_reach_reads_only_the_clusters_within_it() {
             };
             // The same search with exactly the clusters in reach.
             index.route(q, 20, None, &mut a, &mut routes).unwrap();
-            let s = crate::search::scratch_for(&mut a.scratch, dim, nlist, &a.limits);
+            let s = crate::search::scratch_for(&mut a.scratch, dim, &a.limits);
             let count = crate::search::route::within_reach(&s.routes, Some(reach));
             let fixed = SearchParams {
                 nprobe: count,

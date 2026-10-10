@@ -6,7 +6,7 @@ use super::*;
 use crate::quantization::SplitMix64;
 use crate::quantization::testutil::{Rows, TempFile, clustered, data_of, dist2, gaussian, params, temp_file};
 use crate::update::log_path;
-use crate::{BuildParams, Builder, Index, LeafId, LeafOrder, MajorParams, MinorParams, SearchParams, Writer};
+use crate::{BuildParams, Builder, Index, LeafId, LeafOrder, MajorParams, MinorParams, SearchParams, Throttle, Writer};
 
 pub(crate) const DIM: usize = 128;
 
@@ -90,7 +90,7 @@ pub(crate) fn churn(writer: &mut Writer, rows: &Rows, seed: u64) {
 /// The ids that the writer's file and its changes hold now, sorted.
 pub(crate) fn visible_ids(writer: &Writer) -> Vec<u64> {
     let inner = &writer.index.inner();
-    let delta = inner.changes().read();
+    let delta = inner.changes().load();
     let (live, _) = Live::of(inner, &delta, delta.seen()).unwrap();
     let (layout, data) = (inner.layout(), inner.in_place());
     let rows = (0..layout.count as u32).filter(|&r| live.rows[r as usize]);
@@ -145,7 +145,7 @@ fn every_run_keeps_each_visible_vector_once_and_no_hidden_one() {
         assert_eq!((report.kind, report.count), (kind, want.len()), "{kind:?}");
         assert_eq!(report.copied + report.reencoded, want.len(), "{kind:?}");
         assert_eq!(
-            writer.index.inner().changes().read().len(),
+            writer.index.inner().changes().load().len(),
             0,
             "{kind:?}: inserts were left in the log"
         );
@@ -289,20 +289,16 @@ fn changes_after_the_snapshot_move_to_the_new_file_s_log() {
         let mut writer = Writer::open(&path).unwrap();
         writer.insert(50_000, row(1)).unwrap();
         writer.delete(2).unwrap();
-        let (next, file) = writer.root.next().unwrap();
-        let (snapshot, report) = run(&writer.index.inner(), &file, &next.data, &eager(), RunKind::Major).unwrap();
-        assert_eq!(report.count, 3000);
+        let mut job = writer.begin(&eager(), RunKind::Major).unwrap();
+        let done = job.run(&Throttle::none()).unwrap();
+        assert_eq!(done.report.count, 3000);
 
         // These land after the snapshot, while the run's new file waits.
         let late: Vec<f32> = row(3).iter().map(|&x| x + 0.3).collect();
         writer.insert(60_000, &late).unwrap();
         writer.delete(4).unwrap();
         writer.delete(50_000).unwrap();
-        let old = writer.index.inner().layout().clone();
-        let (new, log) = commit(&mut writer.root, next, &writer.path, &old, &snapshot, &mut writer.log).unwrap();
-        let current = writer.index.shared.load_full();
-        assert!(writer.index.shared.publish(&current, new));
-        writer.log = log;
+        writer.finish_compact(done).unwrap();
         let check = |index: &Index, when: &str| {
             assert_eq!(
                 everything(index, &late)[0],
@@ -907,6 +903,6 @@ fn a_writer_keeps_one_routing_scratch_whatever_runs_do_to_the_cluster_count() {
     let mut leaves = Vec::new();
     let inner = writer.index.inner();
     inner.route(v, 1, None, &mut fresh, &mut leaves).unwrap();
-    let delta = inner.changes().read();
+    let delta = inner.changes().load();
     assert_eq!(delta.leaf(delta.len() - 1), leaves[0]);
 }

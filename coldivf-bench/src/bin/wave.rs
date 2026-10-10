@@ -4,8 +4,12 @@
 //! trial, since a new mapping can make another process read the file's first pages back. Right before the timer it
 //! checks the trial's own pages, and it leaves out any trial that would start with one of them cached.
 //!
-//! wave [--file data/wave-1g.bin] [--size-mb 1024] [--trials 200] [--ranges 64] [--page 16384]
+//! wave [--file data/wave-1g.bin] [--size-mb 1024] [--trials 200] [--ranges 64] [--page 16384] [--rounds 1]
 //!      [--results results/wave.jsonl]
+//!
+//! With `--rounds N` a trial reads N waves one after another, each of `--ranges` other random pages, as a search of a
+//! graph does, whose next reads depend on what the last ones held. The trial's time is all N waves, and `round_p50_us`
+//! and `round_p99_us` are over the waves of every trial.
 
 use std::path::{Path, PathBuf};
 
@@ -17,34 +21,37 @@ fn main() {
     let file = PathBuf::from(args.str("file").unwrap_or("data/wave-1g.bin"));
     let size = args.get::<usize>("size-mb", 1024) << 20;
     let (trials, ranges, page) = (args.get("trials", 200), args.get("ranges", 64), args.get("page", 16384));
+    let rounds = args.get("rounds", 1usize);
     let results = args.str("results").unwrap_or("results/wave.jsonl");
 
-    if page == 0 || size < page * ranges {
-        fail("the file must hold at least --ranges pages of --page bytes");
+    if page == 0 || rounds == 0 || size < page * ranges * rounds {
+        fail("--rounds must be at least 1, and the file must hold --rounds times --ranges pages of --page bytes");
     }
 
     make(&file, size);
     interactive();
-    let (times, dropped) = run(&file, size, trials, ranges, page);
-    let mut sorted = times.clone();
-    sorted.sort_by(f64::total_cmp);
+    let (times, dropped) = run(&file, size, trials, ranges, rounds, page);
+    let (totals, laps) = spread(&times);
     eprintln!(
-        "wave: {ranges} x {page} B, {} trials ({dropped} left out for starting with cached pages): p50 {:.0} us, p99 \
-         {:.0} us",
-        sorted.len(),
-        percentile(&sorted, 50.0),
-        percentile(&sorted, 99.0)
+        "wave: {rounds} x {ranges} x {page} B, {} trials ({dropped} left out for starting with cached pages): p50 \
+         {:.0} us, p99 {:.0} us",
+        totals.len(),
+        percentile(&totals, 50.0),
+        percentile(&totals, 99.0)
     );
     let line = state(provenance(Json::new()))
         .str("file", &file.display().to_string())
         .int("size", size as u64)
         .int("ranges", ranges as u64)
         .int("page", page as u64)
-        .int("trials", sorted.len() as u64)
+        .int("rounds", rounds as u64)
+        .int("trials", totals.len() as u64)
         .int("dropped", dropped as u64)
-        .num("p50_us", percentile(&sorted, 50.0))
-        .num("p99_us", percentile(&sorted, 99.0))
-        .num("mean_us", sorted.iter().sum::<f64>() / sorted.len().max(1) as f64)
+        .num("p50_us", percentile(&totals, 50.0))
+        .num("p99_us", percentile(&totals, 99.0))
+        .num("mean_us", totals.iter().sum::<f64>() / totals.len().max(1) as f64)
+        .num("round_p50_us", percentile(&laps, 50.0))
+        .num("round_p99_us", percentile(&laps, 99.0))
         .line();
     append(Path::new(results), &line).unwrap_or_else(|e| fail(&format!("writing {results}: {e}")));
 }
@@ -76,9 +83,10 @@ fn make(path: &Path, size: usize) {
         .unwrap_or_else(|e| fail(&format!("sizing: {e}")));
 }
 
-/// Times `trials` waves, and returns their times and how many trials it left out for starting with cached pages.
+/// Times `trials` trials of `rounds` waves of `ranges` pages each, and returns each trial's wave times in
+/// microseconds and how many trials it left out for starting with cached pages.
 #[cfg(target_os = "macos")]
-fn run(path: &Path, size: usize, trials: usize, ranges: usize, page: usize) -> (Vec<f64>, usize) {
+fn run(path: &Path, size: usize, trials: usize, ranges: usize, rounds: usize, page: usize) -> (Vec<Vec<f64>>, usize) {
     use std::os::fd::AsRawFd;
     use std::time::{Duration, Instant};
 
@@ -96,44 +104,83 @@ fn run(path: &Path, size: usize, trials: usize, ranges: usize, page: usize) -> (
     make_cold(&[&map], Duration::from_millis(500)).unwrap_or_else(|e| fail(&format!("evicting: {e}")));
     let (mut state, mut times, mut dropped) = (7u64, Vec::with_capacity(trials), 0);
     let mut buf = vec![0u8; ranges * page];
-    let pages = size / page;
 
     for _ in 0..trials {
-        let mut offsets: Vec<usize> = Vec::with_capacity(ranges);
-        while offsets.len() < ranges {
-            let p = (next(&mut state) % pages as u64) as usize * page;
-            if !offsets.contains(&p) {
-                offsets.push(p);
-            }
-        }
-        offsets.sort_unstable();
+        let waves = offsets(&mut state, size / page, ranges, rounds, page);
         make_cold(&[&map], Duration::ZERO).unwrap_or_else(|e| fail(&format!("evicting: {e}")));
-        let cached: usize = offsets.iter().map(|&at| map.resident(at..at + page).unwrap_or(1)).sum();
+        let cached: usize = waves
+            .iter()
+            .flatten()
+            .map(|&at| map.resident(at..at + page).unwrap_or(1))
+            .sum();
         if cached > 0 {
             dropped += 1;
             continue;
         }
-        let start = Instant::now();
-        for &at in &offsets {
-            let ra = libc::radvisory {
-                ra_offset: at as libc::off_t,
-                ra_count: page as libc::c_int,
-            };
-            // SAFETY: `ra` outlives the call, and F_RDADVISE only reads it.
-            unsafe { libc::fcntl(fd, libc::F_RDADVISE, &ra as *const libc::radvisory) };
+        let mut laps = Vec::with_capacity(rounds);
+        for wave in &waves {
+            let start = Instant::now();
+            for &at in wave {
+                let ra = libc::radvisory {
+                    ra_offset: at as libc::off_t,
+                    ra_count: page as libc::c_int,
+                };
+                // SAFETY: `ra` outlives the call, and F_RDADVISE only reads it.
+                unsafe { libc::fcntl(fd, libc::F_RDADVISE, &ra as *const libc::radvisory) };
+            }
+            for (slot, &at) in buf.chunks_exact_mut(page).zip(wave) {
+                std::os::unix::fs::FileExt::read_exact_at(&file, slot, at as u64)
+                    .unwrap_or_else(|e| fail(&format!("reading: {e}")));
+            }
+            laps.push(start.elapsed().as_secs_f64() * 1e6);
         }
-        for (slot, &at) in buf.chunks_exact_mut(page).zip(&offsets) {
-            std::os::unix::fs::FileExt::read_exact_at(&file, slot, at as u64)
-                .unwrap_or_else(|e| fail(&format!("reading: {e}")));
-        }
-        times.push(start.elapsed().as_secs_f64() * 1e6);
+        times.push(laps);
     }
 
     (times, dropped)
 }
 
+/// The byte offsets of one trial's `rounds` waves of `ranges` pages of `page` bytes each, drawn from the `pages` pages
+/// of the file with `state`. No page comes twice in a trial, and each wave's pages are in increasing order, as a
+/// backend reads them.
+#[cfg(any(target_os = "macos", test))]
+fn offsets(state: &mut u64, pages: usize, ranges: usize, rounds: usize, page: usize) -> Vec<Vec<usize>> {
+    let mut seen = std::collections::HashSet::with_capacity(ranges * rounds);
+    let mut waves = Vec::with_capacity(rounds);
+
+    for _ in 0..rounds {
+        let mut wave = Vec::with_capacity(ranges);
+
+        while wave.len() < ranges {
+            let p = (next(state) % pages as u64) as usize;
+
+            if seen.insert(p) {
+                wave.push(p * page);
+            }
+        }
+
+        wave.sort_unstable();
+        waves.push(wave);
+    }
+
+    waves
+}
+
+/// Each trial's time, the sum of its waves' times, and every wave's time, both in increasing order, from `times`, each
+/// trial's wave times.
+fn spread(times: &[Vec<f64>]) -> (Vec<f64>, Vec<f64>) {
+    let sorted = |mut values: Vec<f64>| {
+        values.sort_by(f64::total_cmp);
+        values
+    };
+    (
+        sorted(times.iter().map(|t| t.iter().sum()).collect()),
+        sorted(times.iter().flatten().copied().collect()),
+    )
+}
+
 #[cfg(not(target_os = "macos"))]
-fn run(_: &Path, _: usize, _: usize, _: usize, _: usize) -> (Vec<f64>, usize) {
+fn run(_: &Path, _: usize, _: usize, _: usize, _: usize, _: usize) -> (Vec<Vec<f64>>, usize) {
     fail("the wave check is written for macOS")
 }
 
@@ -145,3 +192,7 @@ fn next(state: &mut u64) -> u64 {
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/bin/wave.rs"]
+mod tests;

@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use super::*;
 use crate::quantization::rabitq::Factors;
 use crate::quantization::testutil::{params, written};
-use crate::update::Delta;
+use crate::update::Applier;
 
 const DIM: usize = 128;
 
@@ -86,6 +86,30 @@ fn records_round_trip_in_both_versions() {
 }
 
 #[test]
+fn a_version_2_record_says_its_hint_is_a_lookup_and_one_without_the_mark_still_decodes() {
+    let v = version();
+
+    for (i, record) in records_from(10, v).into_iter().enumerate() {
+        let seq = 10 + i as u64;
+        assert!(looked_up(&record, v), "record {i}");
+        let mut legacy = record.clone();
+        legacy[0] &= !LOOKED_UP;
+        assert!(!looked_up(&legacy, v), "record {i}");
+        assert_eq!(
+            decode(&legacy, v, DIM, 4, seq).unwrap(),
+            decode(&record, v, DIM, 4, seq).unwrap()
+        );
+    }
+
+    // Version 1 records carry no hint, so none is a lookup.
+    assert!(
+        records_from(1, Version::One)
+            .iter()
+            .all(|r| !looked_up(r, Version::One))
+    );
+}
+
+#[test]
 fn a_version_2_record_must_fit_its_place_and_its_file() {
     let v = version();
     let records = records_from(10, v);
@@ -125,32 +149,70 @@ fn only_a_damaged_last_frame_is_torn_in_a_version_2_log() {
             Some(*at)
         })
         .collect();
-    assert_eq!(super::records(&whole, v).unwrap().0.len(), 3);
+    assert_eq!(super::records(&whole, v, DIM).unwrap().0.len(), 3);
 
     // A last frame cut short, or damaged, or zeros that a power cut left after the records, are torn writes.
     let cut = &whole[..ends[2] - 5];
     assert_eq!(
-        super::records(cut, v).unwrap(),
+        super::records(cut, v, DIM).unwrap(),
         (records[..2].iter().map(|r| &r[..]).collect(), ends[1])
     );
     let mut last = whole.clone();
     last[ends[1] + 8 + 3] ^= 1;
-    assert_eq!(super::records(&last, v).unwrap().1, ends[1]);
+    assert_eq!(super::records(&last, v, DIM).unwrap().1, ends[1]);
     let mut zeros = whole.clone();
     zeros.extend([0u8; 100]);
-    assert_eq!(super::records(&zeros, v).unwrap().1, ends[2]);
+    assert_eq!(super::records(&zeros, v, DIM).unwrap().1, ends[2]);
 
     // A damaged frame with a whole one after it is damage, not a torn write, in a version 2 log only.
     let mut middle = whole.clone();
     middle[ends[0] + 8 + 3] ^= 1;
-    assert_eq!(super::records(&middle, v).unwrap_err().kind(), ErrorKind::InvalidData);
+    assert_eq!(
+        super::records(&middle, v, DIM).unwrap_err().kind(),
+        ErrorKind::InvalidData
+    );
     let mut old = framed(&records_from(10, Version::One));
     let first = 8 + records_from(10, Version::One)[0].len();
     old[first + 8] ^= 1;
     assert_eq!(
-        super::records(&old, Version::One).unwrap(),
+        super::records(&old, Version::One, DIM).unwrap(),
         (vec![&records_from(10, Version::One)[0][..]], first)
     );
+}
+
+#[test]
+fn a_damaged_length_in_a_version_2_log_is_damage_unless_no_whole_frame_comes_after_it() {
+    let v = version();
+    let records: Vec<Vec<u8>> = [records_from(10, v), records_from(13, v)].concat();
+    let whole = framed(&records);
+    let ends: Vec<usize> = records
+        .iter()
+        .scan(0, |at, r| {
+            *at += 8 + r.len();
+            Some(*at)
+        })
+        .collect();
+    let first = |n: usize| records[..n].iter().map(|r| &r[..]).collect::<Vec<&[u8]>>();
+
+    // A flipped bit in the length of the second frame, or of the last one, hides where the frame ends. Whole frames
+    // after it make it damage, and none make it a torn last write.
+    for (frame, start) in [(1, ends[0]), (5, ends[4])] {
+        let mut bytes = whole.clone();
+        bytes[start + 1] ^= 1;
+        let read = super::records(&bytes, v, DIM);
+        match frame {
+            5 => assert_eq!(read.unwrap(), (first(5), ends[4])),
+            _ => assert_eq!(read.unwrap_err().kind(), ErrorKind::InvalidData),
+        }
+    }
+
+    // A power cut that kept later pages but lost earlier ones leaves zeros from inside a frame, whose length is whole,
+    // into a later one, then whole frames. The records after the zeros were never synced, so the log ends before them.
+    let mut lost = whole.clone();
+    lost[ends[0] + 8..ends[3] + 4].fill(0);
+    assert_eq!(super::records(&lost, v, DIM).unwrap(), (first(1), ends[0]));
+    lost[ends[0]..ends[0] + 8].fill(0);
+    assert_eq!(super::records(&lost, v, DIM).unwrap(), (first(1), ends[0]));
 }
 
 #[test]
@@ -168,9 +230,9 @@ fn a_whole_record_that_does_not_fit_fails_a_version_2_log_and_ends_a_version_1_l
             Version::Two { .. } => records[1][1] += 1,
         }
         let bytes = framed(&records);
-        let mut delta = Delta::new(layout, v);
-        let applied = delta.apply_all(&bytes, 0);
-        let first = 8 + records[0].len();
+        let mut a = Applier::new(layout, v, &inner.located().data);
+        let applied = a.replay(&bytes, 0);
+        let (first, delta) = (8 + records[0].len(), a.snapshot());
         match v {
             Version::One => assert!(applied.is_ok() && delta.log_len() == first && delta.len() == 1),
             Version::Two { .. } => {

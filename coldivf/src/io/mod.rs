@@ -590,6 +590,294 @@ pub(crate) fn remove(path: &Path) -> Result<(), Error> {
     }
 }
 
+/// A monotonic time in nanoseconds that every process of the machine shares, so one process can tell how long ago
+/// another searched. It costs no system call. On Linux it reads the clock that the system keeps to within a few
+/// milliseconds. The one that macOS keeps so may be as old as the calling thread's last switch, which a busy search
+/// loop leaves far behind, so there it reads the exact one.
+pub(crate) fn now_ns() -> u64 {
+    #[cfg(unix)]
+    {
+        #[cfg(target_os = "macos")]
+        let clock = libc::CLOCK_UPTIME_RAW;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let clock = libc::CLOCK_MONOTONIC_COARSE;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+        let clock = libc::CLOCK_MONOTONIC;
+        let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: clock_gettime only writes one timespec, through a pointer to a local that outlives the call.
+        if unsafe { libc::clock_gettime(clock, &mut t) } == 0 {
+            return t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64;
+        }
+    }
+
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+}
+
+/// When a search of an index last ran, in `now_ns` time, as one 64-bit word in the small file `name.d/activity` that
+/// every process with the index open maps, so a maintenance job of any of them sees every process's searches. Until
+/// the file can be made and mapped, eg. before the index has its folder, or where the folder can't be written, the
+/// word is this process's alone, and a search tries to map it again at most once a second.
+pub(crate) struct Activity {
+    dir: std::path::PathBuf,
+    file: std::path::PathBuf,
+    map: std::sync::OnceLock<memmap2::MmapMut>,
+    local: AtomicU64,
+    tried: AtomicU64,
+}
+
+impl Activity {
+    /// The word of the index whose folder is `dir`.
+    pub(crate) fn open(dir: &Path) -> Activity {
+        let activity = Activity {
+            dir: dir.to_path_buf(),
+            file: dir.join("activity"),
+            map: std::sync::OnceLock::new(),
+            local: AtomicU64::new(0),
+            tried: AtomicU64::new(0),
+        };
+        activity.map();
+        activity
+    }
+
+    /// Maps the word, making its file 8 zero bytes long when the folder has none, unless it is mapped already or there
+    /// is no folder yet. Returns whether every process shares the word now. It allocates nothing for paths of up to a
+    /// few hundred bytes.
+    pub(crate) fn map(&self) -> bool {
+        let open = || -> Result<memmap2::MmapMut, Error> {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&self.file)?;
+            if file.metadata()?.len() < 8 {
+                file.set_len(8)?;
+            }
+            // SAFETY: the file only ever holds the word, which every process changes through atomic operations alone,
+            // and no process cuts it short.
+            unsafe { memmap2::MmapMut::map_mut(&file) }
+        };
+
+        if self.map.get().is_none()
+            && self.dir.is_dir()
+            && let Ok(map) = open()
+            && map.len() >= 8
+        {
+            let _ = self.map.set(map);
+        }
+
+        self.map.get().is_some()
+    }
+
+    /// The shared word, once it is mapped.
+    fn mapped(&self) -> Option<&AtomicU64> {
+        self.map.get().map(|map| {
+            // SAFETY: the map is at least 8 bytes long and starts on a page, so the word is aligned, and it lives as
+            // long as `self`. Every access to it is atomic, here and in every other process.
+            unsafe { AtomicU64::from_ptr(map.as_ptr() as *mut u64) }
+        })
+    }
+
+    /// Notes that a search runs now. It stores the time only when the word is over 1 ms old, so it costs one atomic
+    /// load almost always.
+    #[inline]
+    pub(crate) fn note(&self) {
+        let now = now_ns();
+        let word = match self.mapped() {
+            Some(word) => word,
+            None => {
+                if now.saturating_sub(self.tried.load(Ordering::Relaxed)) > 1_000_000_000 {
+                    self.tried.store(now, Ordering::Relaxed);
+                    self.map();
+                }
+                self.mapped().unwrap_or(&self.local)
+            }
+        };
+
+        if now.saturating_sub(word.load(Ordering::Relaxed)) > 1_000_000 {
+            word.store(now, Ordering::Relaxed);
+        }
+    }
+
+    /// Stores `at` as when a search last ran, in the shared word once it is mapped, eg. a time to come for a test that
+    /// holds a job back as long as it likes.
+    #[cfg(test)]
+    pub(crate) fn set(&self, at: u64) {
+        let word = self.mapped().unwrap_or(&self.local);
+        word.store(at, Ordering::Relaxed);
+        self.local
+            .store(at.min(self.local.load(Ordering::Relaxed)), Ordering::Relaxed);
+    }
+
+    /// When a search last ran, in `now_ns` time, in any process that shares the word, or in this one before it did.
+    pub(crate) fn last(&self) -> u64 {
+        let shared = self.mapped().map_or(0, |w| w.load(Ordering::Relaxed));
+        shared.max(self.local.load(Ordering::Relaxed))
+    }
+}
+
+/// Makes the writes to `file`, the file at `path`, reach the drive before any later write does, which ends a burst of
+/// writes as cheaply as the system allows. On macOS that is `F_BARRIERFSYNC`, and elsewhere a plain sync of the data.
+pub(crate) fn barrier_sync(file: &File, path: &Path) -> Result<(), Error> {
+    #[cfg(test)]
+    watch::see(watch::Op::Sync, path)?;
+    let _ = path;
+
+    #[cfg(target_os = "macos")]
+    {
+        if macos::barrier_sync(file)? {
+            return Ok(());
+        }
+    }
+
+    file.sync_data()
+}
+
+/// The size of the system's pages of memory, eg. 16 KiB on Apple silicon.
+pub(crate) fn page_size() -> usize {
+    #[cfg(unix)]
+    {
+        // SAFETY: sysconf takes an integer and touches no memory.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if let Ok(page) = usize::try_from(page)
+            && page > 0
+        {
+            return page;
+        }
+    }
+
+    4096
+}
+
+/// Whether the system holds each byte of `bytes`, part of a file's map, in memory, by the system's page that holds it:
+/// byte i is on page (i + `bytes` as an address mod `page_size()`) / `page_size()` of the result. Where it can't tell,
+/// eg. on Windows, the result is empty.
+pub(crate) fn resident(bytes: &[u8]) -> Vec<bool> {
+    #[cfg(unix)]
+    {
+        let page = page_size();
+        let start = bytes.as_ptr() as usize / page * page;
+        let len = bytes.as_ptr() as usize + bytes.len() - start;
+        let mut pages = vec![0 as libc::c_char; len.div_ceil(page)];
+        // SAFETY: the range starts at a page boundary and covers only pages of the map that holds `bytes`, which
+        // outlives the call, and `pages` has one byte for each of them, which is all that mincore writes.
+        let found = unsafe { libc::mincore(start as *mut libc::c_void, len, pages.as_mut_ptr().cast()) } == 0;
+        if found {
+            return pages.iter().map(|&p| p & 1 == 1).collect();
+        }
+    }
+
+    let _ = bytes;
+    Vec::new()
+}
+
+/// A file mapped once, through which a timing check drops the file's pages from the system's cache before a search
+/// that must read cold. A new map of a file can make another process, eg. an endpoint-security agent on macOS, read its
+/// first pages back in a little later, and one held map sets off nothing.
+#[cfg(test)]
+pub(crate) struct Evictor {
+    map: map::Map,
+    #[cfg(target_os = "linux")]
+    file: File,
+}
+
+#[cfg(test)]
+impl Evictor {
+    pub(crate) fn open(path: &Path) -> Result<Evictor, Error> {
+        let file = File::open(path)?;
+        let map = map::Map::new(&file)?;
+        Ok(Evictor {
+            map,
+            #[cfg(target_os = "linux")]
+            file,
+        })
+    }
+
+    /// Drops every page of the file from the system's cache. On macOS `msync` invalidates the map's pages, which drops
+    /// them from the cache, and on Linux `posix_fadvise` drops the pages that no map holds. Elsewhere it does nothing.
+    pub(crate) fn evict(&self) -> Result<(), Error> {
+        let bytes = self.map.bytes();
+
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: the range is the whole live map, which starts on a page, and msync reads none of its bytes.
+            let rc = unsafe { libc::msync(bytes.as_ptr() as *mut libc::c_void, bytes.len(), libc::MS_INVALIDATE) };
+            if rc != 0 {
+                return Err(Error::last_os_error());
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+
+            // SAFETY: posix_fadvise takes only integers and touches no memory.
+            let rc = unsafe { libc::posix_fadvise(self.file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+            if rc != 0 {
+                return Err(Error::from_raw_os_error(rc));
+            }
+        }
+
+        let _ = bytes;
+        Ok(())
+    }
+
+    /// The share of the file's pages that the system holds in memory, or 0 where it can't tell.
+    pub(crate) fn resident(&self) -> f64 {
+        let pages = resident(self.map.bytes());
+        pages.iter().filter(|&&p| p).count() as f64 / pages.len().max(1) as f64
+    }
+}
+
+/// Makes the writes to `file` skip the system's cache of file pages where the system allows it, eg. with `F_NOCACHE`
+/// on macOS, so a large write pushes no other file's pages out. Elsewhere it does nothing.
+pub(crate) fn uncached(file: &File) {
+    #[cfg(target_os = "macos")]
+    let _ = macos::uncache(file);
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = file;
+}
+
+/// Sets aside `len` bytes on the disk for `file` and makes it that long, so a write into it never finds the disk full.
+/// A file system that can't set space aside just grows the file.
+pub(crate) fn preallocate(file: &File, len: u64) -> Result<(), Error> {
+    #[cfg(target_os = "macos")]
+    macos::preallocate(file, len);
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: posix_fallocate takes a descriptor and two integers, and touches no memory.
+        let _ = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len as libc::off_t) };
+    }
+
+    file.set_len(len)
+}
+
+/// The bytes free for an unprivileged process on the file system that holds `dir`, or `u64::MAX` where that can't be
+/// told.
+pub(crate) fn free_bytes(dir: &Path) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+            return u64::MAX;
+        };
+        // SAFETY: statvfs only writes the struct, through a pointer to a zeroed local that outlives the call, and
+        // reads the path, a valid C string.
+        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(path.as_ptr(), &mut s) } == 0 {
+            return (s.f_bavail as u64).saturating_mul(s.f_frsize as u64);
+        }
+    }
+
+    let _ = dir;
+    u64::MAX
+}
+
 /// Marks the end of a step of a commit of the index whose folder holds `path`, so a test can take what a crash right
 /// then would leave. It does nothing outside tests.
 #[inline]

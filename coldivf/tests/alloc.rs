@@ -8,8 +8,8 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use coldivf::{
-    Anchor, BuildParams, Builder, Collections, Index, LeafOrder, Limits, MaintainParams, Metric, RunKind, SearchCtx,
-    SearchParams, VectorSource, Writer,
+    Anchor, BuildParams, Builder, Collections, Hit, Index, LeafOrder, Limits, MaintainParams, Metric, RunKind,
+    SearchCtx, SearchParams, VectorSource, Writer,
 };
 
 struct Counting;
@@ -275,6 +275,18 @@ fn main() -> ExitCode {
     };
     let mut ctx = SearchCtx::new(limits);
     _ = index.search(&queries[..dim], &sp, &mut ctx).unwrap();
+    // A search that reads fewer clusters than the index has also scans the pending inserts of the clusters ranked
+    // next, on every path, and a context warmed before any insert has room for them.
+    let few = SearchParams { nprobe: 8, ..sp };
+    let one = Collections::open(&[&file.0]).unwrap();
+    let (mut fewer, mut leaves, mut out) = (SearchCtx::new(limits), Vec::with_capacity(8), Vec::with_capacity(10));
+    let every_path = |ctx: &mut SearchCtx, q: &[f32], leaves: &mut Vec<u32>, out: &mut Vec<(usize, Hit)>| {
+        _ = index.search(q, &few, ctx).unwrap();
+        index.route(q, 8, None, ctx, leaves).unwrap();
+        _ = index.fetch(leaves, ctx).unwrap().search(q, 10, 60).unwrap();
+        one.search(q, &few, ctx, out).unwrap();
+    };
+    every_path(&mut fewer, &queries[..dim], &mut leaves, &mut out);
 
     for (i, row) in rows.data.chunks_exact(dim).step_by(n / 40).enumerate() {
         writer.insert(100_000 + i as u64, row).unwrap();
@@ -282,6 +294,11 @@ fn main() -> ExitCode {
         let allocations = count(|| _ = index.search(q, &sp, &mut ctx).unwrap());
         if allocations > 0 {
             eprintln!("alloc: the search after insert {i} made {allocations} allocations");
+            failed = true;
+        }
+        let allocations = count(|| every_path(&mut fewer, q, &mut leaves, &mut out));
+        if allocations > 0 {
+            eprintln!("alloc: the searches of 8 clusters after insert {i} made {allocations} allocations");
             failed = true;
         }
     }
@@ -303,13 +320,14 @@ fn main() -> ExitCode {
         }
     }
 
-    // A warm index scans in place and reads only rows, which must not allocate either, with or without a reach.
+    // A warm index scans in place and reads only rows, which must not allocate either, with or without a reach, and
+    // when it reads fewer clusters than it has.
     index.set_warm(true);
 
-    for reach in [None, Some(0.2)] {
+    for (nprobe, reach) in [(40, None), (40, Some(0.2)), (8, None)] {
         let sp = SearchParams {
             k: 10,
-            nprobe: 40,
+            nprobe,
             rerank: 60,
             reach,
         };
@@ -318,7 +336,7 @@ fn main() -> ExitCode {
         for q in queries.chunks_exact(dim) {
             let allocations = count(|| _ = index.search(q, &sp, &mut ctx).unwrap());
             if allocations > 0 {
-                eprintln!("alloc: a warm search made {allocations} allocations with reach {reach:?}");
+                eprintln!("alloc: a warm search made {allocations} allocations at nprobe {nprobe}, reach {reach:?}");
                 failed = true;
             }
         }
@@ -428,6 +446,15 @@ fn across_commits(state: &mut u64) -> bool {
 
     if (allocations, frees) != (0, 0) {
         eprintln!("alloc: a fetch from before a commit made {allocations} allocations and {frees} frees");
+        failed = true;
+    }
+
+    // A prepare after a commit of this process's writer opens nothing and frees nothing, not even the generation that
+    // the fetch held, which the writer frees. On Linux it sets up the new file's io_uring ring instead.
+    let after = counts(|| index.prepare(&mut ctx).unwrap());
+
+    if !linux && after != (0, 0) {
+        eprintln!("alloc: a prepare after a commit of this process's writer made {after:?} (allocations, frees)");
         failed = true;
     }
 

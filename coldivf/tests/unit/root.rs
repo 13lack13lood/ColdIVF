@@ -4,7 +4,9 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::ErrorKind;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use super::*;
 use crate::index::Inner;
@@ -13,8 +15,8 @@ use crate::maintain::Live;
 use crate::maintain::tests::{DIM, build_params, churn, settings};
 use crate::quantization::SplitMix64;
 use crate::quantization::sq8;
-use crate::quantization::testutil::{clustered, scratch_dir};
-use crate::{Anchor, Builder, Index, Metric, RunKind, Writer};
+use crate::quantization::testutil::{Rows, clustered, scratch_dir};
+use crate::{Anchor, Builder, Index, Metric, RunKind, Throttle, ThrottleParams, Writer};
 
 /// A folder of a test's own, by the name that the file system gives it, so it matches the paths of the index's files.
 /// Dropping it removes it.
@@ -51,7 +53,7 @@ fn built(scratch: &Folder) -> crate::quantization::testutil::Rows {
 /// The ids that the index at `path` holds now, sorted, as a reader that opens it sees them.
 fn ids_at(path: &Path) -> Result<Vec<u64>, Error> {
     let inner = Inner::open(path)?;
-    let delta = inner.changes().read();
+    let delta = inner.changes().load();
     let (live, _) = Live::of(&inner, &delta, delta.seen())?;
     let (layout, data) = (inner.layout(), inner.in_place());
     let rows = (0..layout.count as u32).filter(|&r| live.rows[r as usize]);
@@ -59,6 +61,35 @@ fn ids_at(path: &Path) -> Result<Vec<u64>, Error> {
     ids.extend(live.inserts.iter().map(|&i| sq8::id(delta.row(i as usize), layout.dim)));
     ids.sort_unstable();
     Ok(ids)
+}
+
+/// The row that a search reads for each id that the index at `path` holds now, by id.
+fn rows_at(path: &Path) -> HashMap<u64, Vec<u8>> {
+    let inner = Inner::open(path).unwrap();
+    let delta = inner.changes().load();
+    let (live, _) = Live::of(&inner, &delta, delta.seen()).unwrap();
+    let (layout, data) = (inner.layout(), inner.in_place());
+    let rows = (0..layout.count as u32).filter(|&r| live.rows[r as usize]);
+    let mut out: HashMap<u64, Vec<u8>> = rows
+        .map(|r| (sq8::id(data.rows.row(r), layout.dim), data.rows.row(r).to_vec()))
+        .collect();
+    out.extend(live.inserts.iter().map(|&i| {
+        let row = delta.row(i as usize);
+        (sq8::id(row, layout.dim), row.to_vec())
+    }));
+    out
+}
+
+/// A throttle that waits for no search, records a mark after every window and keeps no space free.
+fn eager_throttle() -> Throttle {
+    Throttle::new(ThrottleParams {
+        quiet: Duration::ZERO,
+        spacing: Duration::ZERO,
+        burst_bytes: 64 << 10,
+        resume_bytes: 1,
+        reserve_bytes: 0,
+        ..ThrottleParams::default()
+    })
 }
 
 /// The files of the index at `path` in its folder, by name.
@@ -164,12 +195,23 @@ type Images = Arc<Mutex<Vec<(String, PathBuf)>>>;
 /// Watches `scratch` while `f` runs and takes two images of it before every file operation: the files as they are,
 /// which a crash of the process leaves, and what a power cut would leave. The images go in a folder of their own.
 fn imaged(scratch: &Folder, images: &Folder, f: impl FnOnce()) -> Vec<(String, PathBuf)> {
+    imaged_counting(scratch, images, &Arc::default(), f)
+}
+
+/// The same, counting the operations in `ops`, so `f` can tell which images come after a step of its own. The images
+/// before operation k are in the folders `k-crash` and `k-cut`.
+fn imaged_counting(
+    scratch: &Folder,
+    images: &Folder,
+    ops: &Arc<AtomicUsize>,
+    f: impl FnOnce(),
+) -> Vec<(String, PathBuf)> {
     let taken: Images = Arc::default();
     let durable = Arc::new(Mutex::new(Durable::now(&scratch.0)));
     let (from, to, list) = (scratch.0.clone(), images.0.clone(), Arc::clone(&taken));
-    let mut count = 0;
+    let ops = Arc::clone(ops);
     let guard = watch::set(&scratch.0, move |op, path| {
-        count += 1;
+        let count = ops.fetch_add(1, Ordering::SeqCst) + 1;
         let what = format!("{op:?} {}", path.file_name().unwrap_or_default().to_string_lossy());
         // A panic here would poison the watch for every other test, so it becomes an image that fails the check.
         let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -239,6 +281,96 @@ fn a_crash_or_a_power_cut_at_any_step_of_a_commit_loses_no_synced_change() {
         assert_eq!(writer.index.inner().located().generation, round + 1);
         check_images(&taken, &want);
         assert!(ids_at(&scratch.index()).unwrap() == want);
+    }
+}
+
+#[test]
+fn a_crash_or_a_power_cut_at_any_step_of_a_job_loses_no_synced_change_and_no_insert_made_during_it() {
+    let (scratch, images) = (Folder::new("crash-job"), Folder::new("crash-job-images"));
+    let rows = built(&scratch);
+    let mut writer = Writer::open(&scratch.index()).unwrap();
+    writer.compact().unwrap();
+    churn(&mut writer, &rows, 57);
+    writer.sync().unwrap();
+    let base = ids_at(&scratch.index()).unwrap();
+    let throttle = Throttle::new(ThrottleParams {
+        quiet: Duration::ZERO,
+        spacing: Duration::ZERO,
+        burst_bytes: 64 << 10,
+        resume_bytes: 1,
+        reserve_bytes: 0,
+        ..ThrottleParams::default()
+    });
+    // Each insert during the job, with the operations done once its record was written, and once it was synced.
+    let (ops, mut inserted) = (Arc::new(AtomicUsize::new(0)), Vec::new());
+
+    let taken = imaged_counting(&scratch, &images, &ops, || {
+        let mut insert = |writer: &mut Writer, i: usize| {
+            let v: Vec<f32> = rows.data[i * DIM..(i + 1) * DIM].iter().map(|&x| x + 0.2).collect();
+            writer.insert(5_000_000 + i as u64, &v).unwrap();
+            let written = ops.load(Ordering::SeqCst);
+            writer.sync().unwrap();
+            inserted.push((5_000_000 + i as u64, written, ops.load(Ordering::SeqCst)));
+        };
+        // Inserts before the plan and after it, while the job writes in many small bursts and windows.
+        let mut job = writer.begin(&settings(), RunKind::Fold).unwrap();
+        job.window = 16 << 10;
+        (0..3).for_each(|i| insert(&mut writer, i));
+        let done = job.run(&throttle).unwrap();
+        (3..6).for_each(|i| insert(&mut writer, i));
+        writer.finish_compact(done).unwrap();
+    });
+    assert!(taken.len() > 40, "the job made only {} images", taken.len());
+
+    // Image k holds every insert whose record was written before operation k, for a crash, or synced before it, for a
+    // power cut. A writer's open keeps only the current generation and a job it can go on with.
+    for (what, dir) in &taken {
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        let (k, kind) = name.split_once('-').unwrap();
+        let k: usize = k.parse().unwrap();
+        let mut want = base.clone();
+        let done = |&(_, written, synced): &(u64, usize, usize)| k > if kind == "crash" { written } else { synced };
+        want.extend(inserted.iter().filter(|x| done(x)).map(|x| x.0));
+        want.sort_unstable();
+        let path = dir.join("x.coldivf");
+        let ids = ids_at(&path).unwrap_or_else(|e| panic!("{what}: the index doesn't open: {e}"));
+        assert!(ids == want, "{what}: the index holds other vectors");
+        let mut writer = Writer::open(&path).unwrap_or_else(|e| panic!("{what}: a writer doesn't open: {e}"));
+        let (at, kept) = (
+            writer.index.inner().located().clone(),
+            crate::maintain::job::kept(&writer.root),
+        );
+        let left: Vec<String> = generation_files(&folder(&path))
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| at.root.as_ref().is_none_or(|r| *name != r.data && *name != r.log) && !kept.contains(name))
+            .collect();
+        assert!(left.is_empty(), "{what}: the writer left {left:?}");
+        assert!(
+            ids_at(&path).unwrap() == want,
+            "{what}: the writer's open changed the vectors"
+        );
+
+        // A job that the image lets the next one go on with writes a whole file from where it got.
+        if !kept.is_empty() {
+            let mut job = writer.begin_compact(&settings()).unwrap().unwrap();
+            assert!(job.resumes(), "{what}: the next job started over");
+            job.window = 16 << 10;
+            let done = job.run(&throttle).unwrap();
+            writer.finish_compact(done).unwrap();
+            writer
+                .index
+                .verify()
+                .unwrap_or_else(|e| panic!("{what}: the job that went on wrote a damaged file: {e}"));
+            assert!(
+                ids_at(&path).unwrap() == want,
+                "{what}: the job that went on lost vectors"
+            );
+        }
+
+        drop(writer);
+        fs::remove_dir_all(dir).unwrap();
     }
 }
 
@@ -483,6 +615,7 @@ fn a_writer_s_open_deletes_what_no_slot_names_and_nothing_else() {
         "g7-00000000000000ab.data",
         "g7-00000000000000ab.log",
         "g1-0123456789abcdef.log",
+        "g3-00000000000000cd.resume",
     ];
     let kept = ["notes.txt", "g7-short.data", "g7-00000000000000ab.data.bak"];
 
@@ -492,7 +625,7 @@ fn a_writer_s_open_deletes_what_no_slot_names_and_nothing_else() {
 
     drop(Writer::open(&path).unwrap());
     let mut want: HashSet<OsString> = kept.iter().map(OsString::from).collect();
-    want.extend([SLOTS[0], SLOTS[1]].map(OsString::from));
+    want.extend([SLOTS[0], SLOTS[1], "activity", "runs"].map(OsString::from));
     want.extend([at.data, at.log].map(|p| p.file_name().unwrap().to_os_string()));
     assert_eq!(names_in(&dir), want);
 }
@@ -611,4 +744,258 @@ fn a_link_to_an_index_still_leads_to_it_after_its_first_commit() {
     writer = Writer::open(&link).unwrap();
     writer.insert(60_000, &rows.data[..DIM]).unwrap();
     assert!(ids_at(&scratch.index()).unwrap().contains(&60_000));
+}
+
+#[test]
+fn a_job_that_goes_on_after_a_power_cut_never_reuses_what_it_wrote_from_changes_that_the_cut_dropped() {
+    for upsert in [false, true] {
+        let name = format!("cut-resume-{upsert}");
+        let (scratch, images) = (Folder::new(&name), Folder::new(&format!("{name}-images")));
+        let rows = built(&scratch);
+        let mut writer = Writer::open(&scratch.index()).unwrap();
+        writer.compact().unwrap();
+        churn(&mut writer, &rows, 61);
+        writer.sync().unwrap();
+        let near =
+            |i: usize, by: f32| -> Vec<f32> { rows.data[i * DIM..(i + 1) * DIM].iter().map(|&x| x + by).collect() };
+        let throttle = eager_throttle();
+        // Changes that the app never syncs before the job's snapshot takes them: new ids, or new vectors for ids 0 to
+        // 39.
+        let first = |i: usize| if upsert { i as u64 } else { 5_000_000 + i as u64 };
+        let taken = imaged(&scratch, &images, || {
+            for i in 0..40 {
+                writer.insert(first(i), &near(i, 0.2)).unwrap();
+            }
+            let mut job = writer.begin(&settings(), RunKind::Fold).unwrap();
+            job.window = 16 << 10;
+            let done = job.run(&throttle).unwrap();
+            writer.finish_compact(done).unwrap();
+        });
+        drop(writer);
+        // A power cut once the job wrote its file and recorded where it got, just before the commit makes its log.
+        let (what, dir) = taken
+            .iter()
+            .find(|(what, _)| what.starts_with("power cut before Create") && what.ends_with(".log"))
+            .unwrap();
+        let path = dir.join("x.coldivf");
+        let mut writer = Writer::open(&path).unwrap();
+        assert!(
+            !crate::maintain::job::kept(&writer.root).is_empty(),
+            "{what}: no job to go on with"
+        );
+
+        // After the restart the app makes other changes of the same shape and syncs them: other ids for the same
+        // vectors, or the same ids with other vectors.
+        let second = |i: usize| if upsert { i as u64 } else { 6_000_000 + i as u64 };
+
+        for i in 0..40 {
+            writer
+                .insert(second(i), &near(i, if upsert { 0.21 } else { 0.2 }))
+                .unwrap();
+        }
+
+        writer.sync().unwrap();
+        let want = rows_at(&path);
+        let mut job = writer.begin_compact(&settings()).unwrap().unwrap();
+        assert!(job.resumes(), "{what}: the job started over");
+        job.window = 16 << 10;
+        let done = job.run(&throttle).unwrap();
+        writer.finish_compact(done).unwrap();
+        assert!(
+            rows_at(&path) == want,
+            "{what}, upsert {upsert}: the commit holds other vectors"
+        );
+    }
+}
+
+#[test]
+fn a_resume_file_from_before_the_first_commit_names_its_data_file_so_a_rebuild_starts_the_job_over() {
+    let (scratch, images) = (Folder::new("legacy-resume"), Folder::new("legacy-resume-images"));
+    let (rows, _) = clustered(&mut SplitMix64::new(41), 1500, DIM, 15, 0.6);
+    let builder = Builder::new(build_params(Metric::L2, Anchor::Cluster));
+    let clusters = builder.cluster(&rows, &scratch.index()).unwrap();
+    builder.build_with_clusters(&rows, &clusters, &scratch.index()).unwrap();
+    let throttle = eager_throttle();
+    let mut writer = Writer::open(&scratch.index()).unwrap();
+    let taken = imaged(&scratch, &images, || {
+        let mut job = writer.begin(&settings(), RunKind::Fold).unwrap();
+        job.window = 16 << 10;
+        let done = job.run(&throttle).unwrap();
+        writer.finish_compact(done).unwrap();
+    });
+    drop(writer);
+    // The process dies once the job wrote its file, before the commit.
+    let (what, dir) = taken
+        .iter()
+        .find(|(what, _)| what.starts_with("crash before Create") && what.ends_with(".log"))
+        .unwrap();
+
+    // Left alone, the next job goes on with the file it left.
+    let alone = Folder::new("legacy-resume-alone");
+    copy_files(dir, &alone.0);
+    let mut writer = Writer::open(&alone.index()).unwrap();
+    let mut job = writer.begin_compact(&settings()).unwrap().unwrap();
+    assert!(job.resumes(), "{what}: the job started over");
+    job.window = 16 << 10;
+    let done = job.run(&throttle).unwrap();
+    writer.finish_compact(done).unwrap();
+    assert_eq!(ids_at(&alone.index()).unwrap(), (0..1500).collect::<Vec<u64>>());
+
+    // The app builds the index again from other vectors with the same clustering, eg. after a new embedding run, so
+    // the next job starts over and folds the new file's rows.
+    let path = dir.join("x.coldivf");
+    let mut rng = SplitMix64::new(7);
+    let moved = Rows {
+        dim: DIM,
+        data: rows.data.iter().map(|&x| x + 0.2 * rng.normal() as f32).collect(),
+    };
+    builder.build_with_clusters(&moved, &clusters, &path).unwrap();
+    let want = rows_at(&path);
+    let mut writer = Writer::open(&path).unwrap();
+    assert!(crate::maintain::job::kept(&writer.root).is_empty(), "{what}");
+    let mut job = writer.begin(&settings(), RunKind::Fold).unwrap();
+    assert!(
+        !job.resumes(),
+        "{what}: the job went on with the file before the rebuild"
+    );
+    job.window = 16 << 10;
+    let done = job.run(&throttle).unwrap();
+    writer.finish_compact(done).unwrap();
+    assert!(
+        rows_at(&path) == want,
+        "{what}: the commit holds other vectors than the rebuild"
+    );
+}
+
+#[test]
+fn a_rebuild_identical_to_the_generation_before_takes_none_of_its_changes() {
+    let scratch = Folder::new("rebuild-same");
+    let rows = built(&scratch);
+    let path = scratch.index();
+    let mut writer = Writer::open(&path).unwrap();
+    writer.compact().unwrap();
+    drop(writer);
+    let build = || {
+        Builder::new(build_params(Metric::L2, Anchor::Cluster))
+            .build(&rows, &path)
+            .unwrap()
+    };
+    build();
+    let before = locate(&path).unwrap();
+    // A reader keeps the generation open while a writer adds a vector and goes.
+    let reader = Index::open(&path).unwrap();
+    let mut writer = Writer::open(&path).unwrap();
+    writer.insert(60_000, &rows.data[..DIM]).unwrap();
+    writer.sync().unwrap();
+    drop(writer);
+    build();
+    let after = locate(&path).unwrap();
+    let check = |at: &Located| at.root.as_ref().unwrap().check;
+    assert_eq!(
+        (after.generation, check(&after)),
+        (before.generation + 1, check(&before))
+    );
+
+    // The rebuild holds the built vectors alone, for a new open and for the reader once it moves, and a writer opens.
+    assert_eq!(ids_at(&path).unwrap(), (0..1500).collect::<Vec<u64>>());
+    assert!(reader.refresh().unwrap());
+    assert_eq!(reader.inner().changes().load().len(), 0);
+    drop(Writer::open(&path).unwrap());
+}
+
+#[test]
+fn a_damaged_length_in_the_middle_of_a_generation_s_log_fails_every_open_and_cuts_nothing_off() {
+    let scratch = Folder::new("damaged-length");
+    let rows = built(&scratch);
+    let path = scratch.index();
+    let mut writer = Writer::open(&path).unwrap();
+    writer.compact().unwrap();
+
+    for i in 0..3 {
+        writer
+            .insert(70_000 + i as u64, &rows.data[i * DIM..(i + 1) * DIM])
+            .unwrap();
+    }
+
+    writer.sync().unwrap();
+    let at = writer.index.inner().located().clone();
+    drop(writer);
+    let mut log = fs::read(&at.log).unwrap();
+    let frame = (log.len() - log::HEADER_2_BYTES) / 3;
+    // A flipped bit in the length of the second of the three synced records.
+    log[log::HEADER_2_BYTES + frame + 1] ^= 1;
+    fs::write(&at.log, &log).unwrap();
+    assert_eq!(ids_at(&path).unwrap_err().kind(), ErrorKind::InvalidData);
+    assert_eq!(
+        Writer::open(&path).map(|_| ()).unwrap_err().kind(),
+        ErrorKind::InvalidData
+    );
+    assert_eq!(fs::read(&at.log).unwrap(), log);
+}
+
+/// An index in `scratch` whose generation 2 is current with changes in its log, and whose generation 1's files are
+/// still in its folder, as a power cut that undid their deletes leaves them. Returns generation 1 and the ids that the
+/// index holds.
+fn older_files_kept(scratch: &Folder) -> (Located, Vec<u64>) {
+    let rows = built(scratch);
+    let path = scratch.index();
+    let mut writer = Writer::open(&path).unwrap();
+    writer.compact().unwrap();
+    churn(&mut writer, &rows, 63);
+    writer.sync().unwrap();
+    let g1 = locate(&path).unwrap();
+    let kept: Vec<(PathBuf, Vec<u8>)> = [&g1.data, &g1.log]
+        .iter()
+        .map(|p| (p.to_path_buf(), fs::read(p).unwrap()))
+        .collect();
+    writer.compact().unwrap();
+    churn(&mut writer, &rows, 64);
+    writer.sync().unwrap();
+    let want = ids_at(&path).unwrap();
+    drop(writer);
+
+    for (p, bytes) in &kept {
+        fs::write(p, bytes).unwrap();
+    }
+
+    (g1, want)
+}
+
+#[test]
+fn a_damaged_newer_slot_with_the_older_generation_s_files_still_there_leaves_the_newer_one_current() {
+    let scratch = Folder::new("rot-older-kept");
+    let (g1, want) = older_files_kept(&scratch);
+    let path = scratch.index();
+    // A flipped bit breaks slot 0, which names generation 2.
+    let slot = folder(&path).join(SLOTS[0]);
+    let mut bytes = fs::read(&slot).unwrap();
+    bytes[30] ^= 1;
+    fs::write(&slot, &bytes).unwrap();
+    assert_eq!(locate(&path).unwrap().generation, 2);
+    assert!(ids_at(&path).unwrap() == want);
+
+    // A writer's open makes the slot again and deletes generation 1's files.
+    drop(Writer::open(&path).unwrap());
+    assert_eq!(format::read_root(&fs::read(&slot).unwrap()).unwrap().generation, 2);
+    assert!(ids_at(&path).unwrap() == want);
+    assert!(!g1.data.exists() && !g1.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_slot_that_can_t_be_read_fails_every_open_instead_of_going_back_a_generation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = Folder::new("unreadable-slot");
+    let (_, want) = older_files_kept(&scratch);
+    let path = scratch.index();
+    let slot = folder(&path).join(SLOTS[0]);
+    fs::set_permissions(&slot, fs::Permissions::from_mode(0o200)).unwrap();
+    let located = locate(&path).map(|at| at.generation);
+    let (opened, written) = (Index::open(&path).map(|_| ()), Writer::open(&path).map(|_| ()));
+    fs::set_permissions(&slot, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(located.unwrap_err().kind(), ErrorKind::PermissionDenied);
+    assert!(opened.is_err() && written.is_err());
+    assert_eq!(locate(&path).unwrap().generation, 2);
+    assert!(ids_at(&path).unwrap() == want);
 }

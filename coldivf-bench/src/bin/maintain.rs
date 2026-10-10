@@ -1482,6 +1482,7 @@ impl Ran {
             bytes_written: n("bytes_written")?,
             cpu: Duration::from_nanos(n("cpu_ns")?),
             wall: Duration::from_nanos(n("wall_ns")?),
+            indicator: None,
         };
         let cost = Cost {
             wall_ns: n("cost_wall_ns")?,

@@ -94,6 +94,33 @@ fn per_vector_and_block_paths_agree_bit_for_bit() {
     }
 }
 
+#[test]
+fn a_code_s_sum_from_the_query_s_bit_planes_is_its_sum() {
+    let mut rng = SplitMix64::new(6);
+
+    for dim in [64, 200, 768] {
+        let cb = code_bytes(padded_dim(dim));
+        let rows = gaussian(&mut rng, 40, dim, |_| 1.0);
+        let mu = mean(&rows, dim);
+        let rotation = Rotation::new(dim, 12);
+        let (codes, _) = encode_all(&rotation, &mu, &rows);
+        let mut query = prepare(&rotation, &mu, &gaussian(&mut rng, 1, dim, |_| 1.0));
+        // A query prepared again, for another vector, makes its planes again.
+        query.make_planes();
+        let (mut y, mut tmp) = (vec![0f32; dim], vec![0f32; dim]);
+        let t = rotate_offset(&rotation, &gaussian(&mut rng, 1, dim, |_| 1.0), &mu, &mut y, &mut tmp);
+        let before = query.qu.clone();
+        query.prepare(&y, t);
+        assert_ne!(query.qu, before);
+        query.make_planes();
+        let random: Vec<u8> = (0..cb).map(|_| rng.next_u64() as u8).collect();
+
+        for code in codes.chunks_exact(cb).chain([&random[..], &vec![0xff; cb][..]]) {
+            assert_eq!(plane_sum(code, &query.planes), code_sum(code, &query.qu), "dim {dim}");
+        }
+    }
+}
+
 /// Checks est against the exact distance on Gaussian data with standard deviation `sigma(k)` on axis k.
 fn check_error(dim: usize, sigma: impl Fn(usize) -> f64, name: &str) {
     let mut rng = SplitMix64::new(5);
