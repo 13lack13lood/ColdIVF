@@ -1196,11 +1196,21 @@ def draw_cold_matched(data: dict, chart: dict, t: dict, path: Path) -> None:
     page.save(path)
 
 
+# The warm chart's other systems by family: inverted files draw solid, graphs dashed, and systems with one setting as
+# a lone marker. Each curve takes the next color of the palette, so no two curves share one. "ink" is the page's text
+# color, black on a light page and white on a dark one.
+FAMILIES = {
+    "ivf": ("faiss-ivf", "faiss-fastscan", "lancedb", "paimon", "rabitq-ivf"),
+    "graph": ("faiss-hnsw", "usearch", "qdrant-edge", "astervec", "diskann", "rabitq-hnsw", "symphonyqg"),
+}
+PALETTE = ("#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+           "#b15928", "ink")
+LONE_MARKERS = ("s", "D", "^", "v", "P")
+
+
 def draw_warm_recall(data: dict, chart: dict, t: dict, path: Path) -> None:
     m = _mpl()
     curves = chart["curves"]
-    cols, panel_w, panel_h, gap_x, gap_y, left = 4, 164.0, 124.0, 14.0, 40.0, 58.0
-    rows = math.ceil((len(curves) + 1) / cols)
     points = [p for c in curves for p in c["points"]]
     calls = [p["overhead_us"] for c in curves if c["system"] != "coldivf" for p in c["points"]
              if p.get("overhead_us")]
@@ -1215,66 +1225,52 @@ def draw_warm_recall(data: dict, chart: dict, t: dict, path: Path) -> None:
     if busy:
         foot.append(busy)
 
+    plot_w, plot_h, left = 470.0, 360.0, 58.0
     page = Page(t, f"{chart['title']} at {millions(chart['n'])} vectors (preliminary)", [
         f"First {millions(chart['n'])} rows of {chart['dataset']} ({DATASETS.get(chart['dataset'], '')}). Smoke grids "
         f"at 1 thread over {fmt_range([p['queries'] for p in points])} queries, "
         f"{fmt_range([p['passes'] for p in points])} timed passes each, with every index read into memory first. "
-        "Each panel is one system in orange against ColdIVF in blue, with the rest in gray. Log scale."
-    ], 20 + rows * (panel_h + gap_y) - gap_y + 34, [" ".join(foot)])
+        "Each dot is one setting of a system, at its p50 latency and its recall. Up and to the left is better. "
+        "Solid lines are inverted-file indexes, dashed lines graphs, and lone markers systems with one setting. "
+        "Log scale."
+    ], 20 + plot_h + 34, [" ".join(foot)])
     lo, hi = _log_limits([p["p50_us"] for p in points])
-    ours = next((c for c in curves if c["system"] == "coldivf"), None)
+    ax = page.axes(left, page.top + 20, plot_w, plot_h)
+    ax.set_xscale("log")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(0.55, 1.02)
+    _log_ticks(ax, lo, hi, fmt=lambda v: f"{v / 1000:,g}")
+    ax.yaxis.set_major_locator(m.FixedLocator([0.6, 0.7, 0.8, 0.9, 1.0]))
+    _grid(ax, t, "both")
+    ax.set_ylabel("Recall@10", labelpad=4)
+    ax.set_xlabel("p50 latency per query (ms), log scale", labelpad=6)
+    handles, used, lone = [], 0, 0
 
-    def curve(ax, c, color, width, size, z):
+    for c in curves:
         x = [p["p50_us"] for p in c["points"]]
         y = [p["recall10"] for p in c["points"]]
-        ax.plot(x, y, color=color, linewidth=width, zorder=z, marker="o" if size else None, markersize=size,
-                markeredgecolor=t["surface"], markeredgewidth=1.2 if size else 0)
 
-    def box(i: int):
-        r, k = divmod(i, cols)
-        return left + k * (panel_w + gap_x), page.top + 20 + r * (panel_h + gap_y)
-
-    for i, c in enumerate(curves):
-        x0, y0 = box(i)
-        ax = page.axes(x0, y0, panel_w, panel_h)
-        ax.set_xscale("log")
-        ax.set_xlim(lo, hi)
-        ax.set_ylim(0.55, 1.02)
-        _log_ticks(ax, lo, hi, fmt=lambda v: f"{v / 1000:,g}")
-        ax.yaxis.set_major_locator(m.FixedLocator([0.6, 0.7, 0.8, 0.9, 1.0]))
-        _grid(ax, t, "both")
-
-        if i % cols:
-            ax.tick_params(labelleft=False)
+        if c["system"] == "coldivf":
+            line = ax.plot(x, y, color=t["coldivf"], linewidth=2.8, marker="o", markersize=7, zorder=5,
+                           markeredgecolor=t["surface"], markeredgewidth=1.2, label="ColdIVF")[0]
+        elif len(c["points"]) == 1:
+            line = ax.plot(x, y, linestyle="none", marker=LONE_MARKERS[lone % len(LONE_MARKERS)], markersize=7,
+                           color=t["rest"], markeredgecolor=t["surface"], markeredgewidth=0.8, zorder=4,
+                           label=c["label"])[0]
+            lone += 1
         else:
-            ax.set_ylabel("Recall@10", labelpad=4)
+            family = next((f for f, names in FAMILIES.items() if c["system"] in names), "graph")
+            color = PALETTE[used % len(PALETTE)]
+            color = t["ink"] if color == "ink" else color
+            used += 1
+            line = ax.plot(x, y, color=color, linewidth=1.5, linestyle="-" if family == "ivf" else (0, (4, 2)),
+                           marker="o", markersize=4, markeredgecolor=t["surface"], markeredgewidth=0.6, zorder=3,
+                           label=c["label"])[0]
 
-        if i + cols < len(curves):
-            ax.tick_params(labelbottom=False)
+        handles.append(line)
 
-        for o in curves:
-            if o is not c and o is not ours:
-                curve(ax, o, t["context"], 1.0, 2.5 if len(o["points"]) == 1 else 0, 1)
-
-        if c is not ours:
-            curve(ax, c, t["focus"], 2.0, 6, 4)
-
-        if ours:
-            curve(ax, ours, t["coldivf"], 2.0, 6, 3)
-
-        ax.text(0, 1.05, c["label"], transform=ax.transAxes, size=9.5, weight="bold", color=t["ink"], va="bottom")
-        ax.text(0.97, 0.04, c["knob"], transform=ax.transAxes, size=7.5, color=t["ink2"], va="bottom", ha="right")
-
-    x0, y0 = box(len(curves))
-    key = page.axes(x0, y0, panel_w, panel_h)
-    key.axis("off")
-    dot = {"linewidth": 2, "marker": "o", "markersize": 6, "markeredgecolor": t["surface"]}
-    handles = [m.Line2D([], [], color=t["coldivf"], label="ColdIVF", **dot),
-               m.Line2D([], [], color=t["focus"], label="The panel's system", **dot),
-               m.Line2D([], [], color=t["context"], linewidth=1, label="Every other system")]
-    key.legend(handles=handles, loc="upper left", handlelength=2.2, labelspacing=0.9, borderaxespad=0.6)
-    middle = left + (cols * panel_w + (cols - 1) * gap_x) / 2
-    page.text(middle, page.bottom - 6, "p50 latency per query (ms), log scale", size=9, color=t["ink2"], ha="center")
+    page.fig.legend(handles=handles, loc="upper left", ncol=1, handlelength=2.6, labelspacing=0.55, borderaxespad=0,
+                    borderpad=0, fontsize=8.5, bbox_to_anchor=page.anchor(left + plot_w + 18, page.top + 20))
     page.save(path)
 
 
