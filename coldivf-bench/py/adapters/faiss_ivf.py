@@ -19,7 +19,8 @@ A build is split, so it holds little beyond the index. It trains the SQ8 rows an
 rows. It fills the rows with a single add over the mapped base, which sizes them once, and adds to the IVF in chunks of
 100K rows, each rotated on its own. Then it joins the two as an IndexRefine. At 10M rows that peaks at ~10 GB. With
 --clusters the coarse centroids come from the shared partition, turned by the same rotation, and every row goes to its
-cluster there instead of k-means.
+cluster there instead of k-means. The FastScan setup is then filled as the plain one and copied into FastScan blocks,
+since faiss's FastScan add can only place rows by their nearest centroid.
 
 A true-cold trial (C0) times read_index and the first search. The disk-resident steady state (C1) copies the coarse
 quantizer into memory before READY and keeps it there, and drops the coarse table's cached pages, which its searches no
@@ -193,6 +194,19 @@ class Handle:
     fresh: dict = field(default_factory=dict)
 
 
+def fastscan_of(ivf: Any, rotation: Any) -> tuple[Any, Any]:
+    """A FastScan copy of the plain IVF RaBitQ index `ivf` behind `rotation`, with the same lists, its codes regrouped
+    into blocks of 32. faiss 1.15.1's FastScan add_core stores codes outside those blocks, so a FastScan index filled
+    on given lists through it searches as noise, and crashes once a call holds ~3.4 MB of codes. The copy points at
+    the plain index's coarse quantizer and rotation, so the plain index must outlive it."""
+    import faiss
+
+    fast = faiss.IndexIVFRaBitQFastScan(ivf)
+    top = faiss.IndexPreTransform(rotation, fast)
+    top.ntotal = fast.ntotal
+    return top, fast
+
+
 def add_assigned(ivf: Any, rotated: np.ndarray, lists: np.ndarray, start: int) -> None:
     """Adds rotated rows to their given lists, with ids from `start`. faiss.contrib's add_preassigned frees a
     temporary ids array before faiss reads it, so the arrays stay named here until add_core returns."""
@@ -257,7 +271,11 @@ class FaissIVF(FaissAdapter):
         nlist = spec.lists(ctx.rows, shared.clusters if shared else None)
         factory = factory_string(ctx.dim, nlist, int(spec.bits), self.quantizer, int(spec.quantizer_m),
                                  self.layout == "fastscan")
-        index = faiss.index_factory(ctx.dim, factory, metric_type(metric))
+        # On given lists the FastScan layout is filled as the plain one, then copied into FastScan blocks.
+        convert = self.layout == "fastscan" and shared is not None
+        built = factory_string(ctx.dim, nlist, int(spec.bits), self.quantizer, int(spec.quantizer_m), False) \
+            if convert else factory
+        index = faiss.index_factory(ctx.dim, built, metric_type(metric))
         rotation = faiss.downcast_VectorTransform(index.chain.at(0))
         rotation.init(ctx.seed)
         ivf = faiss.downcast_index(faiss.extract_index_ivf(index))
@@ -285,6 +303,11 @@ class FaissIVF(FaissAdapter):
         del sample
         empty = faiss.serialize_index(index) if self.layout == "ondisk" else None
         self.add(index, ivf, rotation, rows, int(spec.chunk_rows), shared)
+        plain = None
+
+        if convert:
+            plain = index
+            index, ivf = fastscan_of(ivf, rotation)
 
         if rows_index is not None:
             # One add over the whole mapped base sizes the rows once, where adds in chunks would regrow them.
@@ -292,6 +315,7 @@ class FaissIVF(FaissAdapter):
 
         t2 = time.perf_counter()
         names = self.write(ctx.out, index, rows_index, empty)
+        del plain
         parts = parts_record(ctx.out, names, loaded=self.layout == "fastscan")
 
         for p in parts:
@@ -321,7 +345,7 @@ class FaissIVF(FaissAdapter):
                 "factory": factory, "nlist": nlist, "code_size": int(ivf.code_size), "refine_bytes": refine_bytes,
                 "list_bytes": ctx.rows * (int(ivf.code_size) + 8), "train_rows": trained_rows,
                 "train_seconds": t1 - t0, "clusters_imported": record["clusters"], "layout": self.layout,
-                "quantizer": self.quantizer, "faiss_metric": metric,
+                "quantizer": self.quantizer, "faiss_metric": metric, "filled_as": built,
             },
         }
 

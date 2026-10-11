@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -267,6 +268,53 @@ class FilesTest(unittest.TestCase):
             loaded = {str(Path(f["path"]).relative_to(root)) for f in files if f["ranges"][0].get("loaded")}
             self.assertEqual(loaded, {name for name, kind in layout.items() if kind == "routing"})
             self.assertEqual({(f["bytes"], len(f["ranges"]), f["ranges"][0]["length"]) for f in files}, {(100, 1, 100)})
+
+
+class WarmUpTest(unittest.TestCase):
+    """Which files a warm run reads before its first setting."""
+
+    LAYOUT = ("meta.json", "t.lance/_versions/1.manifest", "t.lance/_indices/a1/index.idx",
+              "t.lance/_indices/a1/auxiliary.idx", "t.lance/data/0101.lance", "t.lance/_transactions/0-b2.txn")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+        for name in self.LAYOUT:
+            (self.root / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / name).write_bytes(b"x" * 100)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def read(self, mode: str) -> dict[str, list]:
+        calls = {}
+
+        def record(path, skip, *rest):
+            calls[str(Path(path).relative_to(self.root))] = list(skip)
+            return 0
+
+        ctx = ServeContext(index=self.root, dataset=None, rows=10, k=10, metric="cosine", threads=1, variant="",
+                           mode=mode)
+
+        with mock.patch.object(lancedb, "read_except", record), mock.patch("adapters.base.read_except", record):
+            lancedb.LanceDB().warm_up(None, ctx)
+
+        return calls
+
+    def test_index_mode_reads_the_index_files_and_leaves_the_table(self):
+        calls = self.read("index")
+        self.assertEqual(set(calls), {"t.lance/_indices/a1/index.idx", "t.lance/_indices/a1/auxiliary.idx"})
+        # index.idx is routing data that Lance copies into its cache, so its range is skipped.
+        self.assertEqual(calls["t.lance/_indices/a1/index.idx"], [(0, 100)])
+        self.assertEqual(calls["t.lance/_indices/a1/auxiliary.idx"], [])
+
+    def test_whole_mode_reads_every_file(self):
+        self.assertEqual(set(self.read("whole")), set(self.LAYOUT))
+
+    def test_other_modes_are_unsupported(self):
+        with self.assertRaises(Unsupported):
+            self.read("t1")
 
 
 if __name__ == "__main__":

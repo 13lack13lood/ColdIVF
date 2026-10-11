@@ -12,7 +12,7 @@ import numpy as np
 
 from tests import helpers
 from adapters import coldivf
-from adapters.base import ServeContext, Unsupported
+from adapters.base import BuildContext, ServeContext, Unsupported
 import data
 
 # The first query line and a later one of a real `cold --one` run, trimmed to the fields the adapter reads.
@@ -130,6 +130,98 @@ class FlagsTest(unittest.TestCase):
 
         with self.assertRaises(Unsupported):
             coldivf.flags({"nprobes": 3}, coldivf.SEARCH_FLAGS, "search setting")
+
+
+# A stand-in for build_index. It writes its arguments to $FAKE_BUILD_LOG and a results line to its --results file. Its
+# comment holds the name of the option that saves the clusters, which shows the adapter a build_index that takes it.
+FAKE_BUILD = """#!{python}
+# export-clusters
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_BUILD_LOG"], "a") as log:
+    log.write(json.dumps(args) + "\\n")
+with open(args[args.index("--results") + 1], "a") as f:
+    f.write(json.dumps({{"seconds": 3.0, "cpu_seconds": 5.0, "threads": 4, "seed": 1, "peak_footprint": 10,
+                        "disk_read": 0, "disk_written": 0, "cluster_seconds": 1.0, "encode_seconds": 2.0,
+                        "export_seconds": 0.5, "nlist": 10, "nparents": 2}}) + "\\n")
+"""
+
+
+class BuildCommandTest(unittest.TestCase):
+    """The adapter's build, run against a stand-in for build_index."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.ds = helpers.make_dataset(self.root / "data", n=200, nq=20)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.write_binary(FAKE_BUILD)
+        self.log = self.root / "log.jsonl"
+        self.env = mock.patch.dict(os.environ, {"FAKE_BUILD_LOG": str(self.log)})
+        self.env.start()
+        self.bins = mock.patch.object(coldivf, "BIN", self.bin)
+        self.bins.start()
+        self.out = self.root / "index" / "tl640-n200-s1"
+        self.out.mkdir(parents=True)
+
+    def tearDown(self):
+        self.bins.stop()
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def write_binary(self, text: str) -> None:
+        binary = self.bin / "build_index"
+        binary.write_text(text.format(python=sys.executable))
+        binary.chmod(0o755)
+
+    def ctx(self, config: dict, out: Path | None = None) -> BuildContext:
+        return BuildContext(config=config, data_path=self.ds.base_path, rows=200, out=out or self.out, clusters=None,
+                            threads=4, seed=1, metric="cosine", variant="", dataset=self.ds)
+
+    def args(self) -> list[str]:
+        return json.loads(self.log.read_text().splitlines()[-1])
+
+    def test_export_clusters_saves_the_partition_beside_the_index_folder(self):
+        fields = coldivf.ColdIVF().run_build(self.ctx({"clustering": "two-level", "export_clusters": True}))
+        args, stem = self.args(), self.root / "index" / "tl640-n200-s1.clusters" / "partition"
+        self.assertEqual(args[args.index("--export-clusters") + 1], str(stem))
+        self.assertEqual(args[args.index("--clustering") + 1], "two-level")
+        self.assertNotIn("true", args)
+        self.assertTrue(stem.parent.is_dir())
+        self.assertEqual(list(self.out.iterdir()), [])
+        self.assertEqual(fields["extra"]["export_clusters"], str(stem))
+        self.assertEqual((fields["cluster_seconds"], fields["encode_seconds"]), (1.0, 2.0))
+        self.assertEqual((fields["extra"]["export_seconds"], fields["extra"]["nlist"]), (0.5, 10))
+
+    def test_a_dummy_of_the_same_config_saves_its_own_partition(self):
+        dummy = self.root / "index" / "tl640-n200-s1-dummy50"
+        dummy.mkdir()
+        coldivf.ColdIVF().run_build(self.ctx({"export_clusters": True}, out=dummy))
+        args = self.args()
+        self.assertEqual(args[args.index("--export-clusters") + 1],
+                         str(self.root / "index" / "tl640-n200-s1-dummy50.clusters" / "partition"))
+
+    def test_a_build_without_export_clusters_saves_none(self):
+        for config in ({}, {"export_clusters": False}):
+            fields = coldivf.ColdIVF().run_build(self.ctx(dict(config, vectors_per_list=20)))
+            args = self.args()
+            self.assertNotIn("--export-clusters", args)
+            self.assertEqual(args[args.index("--vectors-per-list") + 1], "20")
+            self.assertIsNone(fields["extra"]["export_clusters"])
+
+        self.assertFalse((self.root / "index" / "tl640-n200-s1.clusters").exists())
+
+    def test_export_clusters_must_be_a_flag_the_binary_takes(self):
+        with self.assertRaises(ValueError):
+            coldivf.ColdIVF().run_build(self.ctx({"export_clusters": "data/x"}))
+
+        self.write_binary(FAKE_BUILD.replace("# export-clusters", "# an older build_index"))
+
+        with self.assertRaises(Unsupported):
+            coldivf.ColdIVF().run_build(self.ctx({"export_clusters": True}))
+
+        self.assertFalse(self.log.exists())
 
 
 class TrialTest(unittest.TestCase):
@@ -279,6 +371,63 @@ class ColdCommandTest(unittest.TestCase):
         (self.bin / "cold").write_text("#!/bin/sh\nexit 2\n")
         with self.assertRaises(RuntimeError):
             coldivf.ColdIVF().cold_setup(self.ctx("c0"))
+
+
+class WarmRunTest(unittest.TestCase):
+    """The adapter's warm runs against a stand-in for the warm binary, which writes one result line per run. Its
+    comment holds the text that shows the adapter a warm binary with passes, threads and modes."""
+
+    FAKE_WARM = """#!{python}
+# --mode t1
+import json, sys
+args = sys.argv[1:]
+with open(args[args.index("--results") + 1], "a") as f:
+    f.write(json.dumps({{"p50_us": 400.0, "p90_us": 450.0, "p99_us": 500.0, "mean_us": 410.0, "queries": 10,
+                         "recall": 0.9, "recall10": 0.9, "ties": True, "passes": 3}}) + "\\n")
+"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.ds = helpers.make_dataset(self.root / "data", n=200, nq=20)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        warm = self.bin / "warm"
+        warm.write_text(self.FAKE_WARM.format(python=sys.executable))
+        warm.chmod(0o755)
+        self.bins = mock.patch.object(coldivf, "BIN", self.bin)
+        self.bins.start()
+        (self.root / "index").mkdir()
+        write_index(self.root / "index" / "i.coldivf", [4096, 12288, 16384])
+
+    def tearDown(self):
+        self.bins.stop()
+        self.tmp.cleanup()
+
+    def run_grid(self, counts: list[dict]) -> list[dict]:
+        """The fields of a two-setting warm run while the machine's counters read `counts`, two per setting."""
+        ctx = ServeContext(index=self.root / "index", dataset=self.ds, rows=200, k=10, metric="cosine", threads=1,
+                           variant="", split="test")
+        grid = [{"nprobe": 8, "rerank": 20}, {"nprobe": 16, "rerank": 20}]
+
+        with mock.patch.object(coldivf.rusage, "vm_counts", side_effect=counts):
+            out = list(coldivf.ColdIVF().warm_run(ctx, grid, np.arange(1, 20, 2), self.root / "ids", 3, 0, 1.0, 1))
+
+        return [r["fields"] for r in out]
+
+    def test_swap_ins_and_compressions_during_each_run_are_reported(self):
+        quiet, swapped = {"swapins": 10, "compressions": 50}, {"swapins": 13, "compressions": 50}
+        compressed = {"swapins": 13, "compressions": 57}
+        first, second = self.run_grid([quiet, swapped, swapped, compressed])
+        self.assertEqual((first["swapins_delta"], first["compressions_delta"]), (3, 0))
+        self.assertEqual((second["swapins_delta"], second["compressions_delta"]), (0, 7))
+        self.assertEqual(first["extra"]["vm_window"], "the warm binary's whole run, its warm-up included")
+
+    def test_a_quiet_machine_moves_no_counter(self):
+        still = {"swapins": 10, "compressions": 50}
+        for fields in self.run_grid([still] * 4):
+            self.assertEqual((fields["swapins_delta"], fields["compressions_delta"]), (0, 0))
+            self.assertEqual((fields["p50_us"], fields["recall10"]), (400.0, 0.9))
 
 
 class WarmFieldsTest(unittest.TestCase):

@@ -1,0 +1,504 @@
+# A second partition for faiss's inverted file (IVF) index in the 10M head-to-head of bench-10m.toml: faiss's own
+# k-means at 2,560 vectors per list, 3,906 lists, the coarsest size of the shared grid of 160, 640 and 2,560 per list.
+# The faiss setups in bench-10m.toml search ColdIVF's partition at 640 per list. An open with on-disk lists copies its
+# coarse table of 15,687 centroids, 48 MB, into memory, and one with batched reads reads that table ahead, and lists 4
+# times as long make the table 4 times smaller. This file builds and times the two setups that were fastest cold at
+# 640, batched reads and on-disk lists, by the steps of bench-10m.toml, with a cell of ColdIVF through its Python module
+# at its 0.95 point in each group. It writes to the bench-10m phase, so its lines sit beside the head-to-head's, and its
+# builds, grids and cells go into bench-10m.toml once they are timed, so its report holds them.
+#
+# Run from coldivf-bench/py, with V and G the variant and group of one setup, and D its dummy:
+#   driver.py ../suites/bench-10m-faiss2560.toml --systems faiss-ivf:shipped --only build --gate warn
+#   driver.py ../suites/bench-10m-faiss2560.toml --systems faiss-ivf:batched --only warm --gate warn
+#   pick.py screen ../suites/bench-10m-faiss2560.toml --system faiss-ivf --variant V --config vpl2560-rq1 --group G
+#     --dummy D --write
+#   driver.py ../suites/bench-10m-faiss2560.toml --systems faiss-ivf:V --groups G --only cold,refs
+#   pick.py verdict ../suites/bench-10m-faiss2560.toml --system faiss-ivf --variant V --config vpl2560-rq1 --warm
+#     --write
+#   driver.py ../suites/bench-10m-faiss2560.toml --groups G --only warm,cold,refs
+# and the same for the on-disk setup, which builds a file of its own. The cold stages enforce the timing gate, which
+# reads the job gate's lock folder from $COLDIVF_BENCH_LOCKS.
+
+phase = "bench-10m"
+dataset = "cohere10m-768-cosine"
+n = 10000000
+index_root = "data/bench.noindex/bench-10m"
+truth = "data/cohere10m-768-cosine-10000000.gt.ibin"
+seed = 1
+k = 10
+max_attempts = 3
+
+[gate]
+mode = "enforce"
+max_wait_s = 7200
+
+[refs]
+mode = "on"
+coldivf_index = "data/cohere-50k.coldivf"
+coldivf_dataset = "cohere-768-cosine"
+coldivf_n = 50000
+coldivf_params = { nprobe = 32, rerank = 39 }
+
+# ColdIVF through its Python module, at its 0.95 point in each group, so each batch holds a ColdIVF cell.
+[[system]]
+name = "coldivf"
+variant = "python"
+adapter = "coldivf_py"
+python = "${COLDIVF_BENCH_VENVS}/venv-coldivf/bin/python3"
+
+  # ColdIVF's 0.95 point in each group of this file, so each batch holds a ColdIVF cell.
+  [[system.build]]
+  config_id = "tl640-vs-faiss-ivf-2560"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-faiss-ivf-2560"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  [[system.build]]
+  config_id = "tl640-vs-faiss-ivf-ondisk-2560"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-faiss-ivf-ondisk-2560"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+
+# faiss IVF over 1-bit RaBitQ codes with SQ8 rows to rescore, in one mapped file, as faiss ships it, which the batched
+# setup below searches. Its own trials don't run here.
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+variant = "shipped"
+
+  [[system.build]]
+  config_id = "vpl2560-rq1"
+  config = { vectors_per_list = 2560, bits = 1 }
+  threads = 10
+  disk_gb = 10
+  timeout_s = 10800
+
+  # The dummy the batched setup's cold cells search first.
+  [[system.build]]
+  config_id = "dummy2560-rq1"
+  config = { vectors_per_list = 2560, bits = 1 }
+  n = 50000
+  threads = 10
+  disk_gb = 1
+  timeout_s = 1800
+
+# faiss IVF as shipped, with the probed lists and then the candidates' rows read ahead in two batched waves. faiss has
+# no such setup. It only shows what batched reads gain.
+#   cell flags: --variant batched --config vpl2560-rq1 --group faiss-ivf-2560
+#               --dummy data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+variant = "batched"
+
+  [[system.build]]
+  config_id = "vpl2560-rq1"
+  index = "data/bench.noindex/bench-10m/faiss-ivf-shipped/vpl2560-rq1-n10000000-s1"
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "tune"
+  grid = { nprobe = [12, 16, 24, 32, 48, 64, 96, 128, 192, 256], k_factor = [2, 4, 8, 16], qb = [4] }
+  passes = 3
+  warmup = 1000
+  timeout_s = 7200
+
+  # 0.90 screen 1 of 3: recall@10 0.9180, warm p50 2639 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 4, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.90 screen 2 of 3: recall@10 0.9232, warm p50 2718 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 8, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.90 screen 3 of 3: recall@10 0.9242, warm p50 2866 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 16, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.95 screen 1 of 3: recall@10 0.9550, warm p50 5028 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 8, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.95 screen 2 of 3: recall@10 0.9562, warm p50 5190 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 16, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.95 screen 3 of 3: recall@10 0.9550, warm p50 6424 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 64, k_factor = 4, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.99 screen 1 of 1: recall@10 0.9906, warm p50 25522 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 256, k_factor = 16, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9550, warm p50 5028 us, C0 p50 22.30 ms in 30 tune trials. It gets 300 trials, as one of ColdIVF's closest rivals.
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 8, qb = 4 }
+  split = "test"
+  trials = 300
+  group = "faiss-ivf-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.95 the cheaper point below it: recall@10 0.9468, warm p50 4972 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 4, qb = 4 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 8, qb = 4 },
+    { nprobe = 48, k_factor = 4, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 8, qb = 4 },
+    { nprobe = 48, k_factor = 4, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 8, qb = 4 },
+    { nprobe = 48, k_factor = 4, qb = 4 },
+  ]
+
+  # 0.90 verdict, the cheapest of 3 whose C0 median interval overlaps the fastest's, {"k_factor": 8, "nprobe": 24, "qb": 4} at 18.26 ms: recall@10 0.9180, warm p50 2639 us, C0 p50 18.44 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 4, qb = 4 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.99 verdict, the fastest cold of 1: recall@10 0.9906, warm p50 25522 us, C0 p50 61.64 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 256, k_factor = 16, qb = 4 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 24, k_factor = 4, qb = 4 },
+    { nprobe = 256, k_factor = 16, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 24, k_factor = 4, qb = 4 },
+    { nprobe = 256, k_factor = 16, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 24, k_factor = 4, qb = 4 },
+    { nprobe = 256, k_factor = 16, qb = 4 },
+  ]
+
+  # The fresh-clone control: 30 trials at the 0.95 verdict setting, each on a new APFS clone of the index
+  # that no cache has seen.
+  [[system.build]]
+  config_id = "vpl2560-rq1-clone"
+  index = "data/bench.noindex/bench-10m/faiss-ivf-shipped/vpl2560-rq1-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "vpl2560-rq1-clone"
+  params = { nprobe = 48, k_factor = 8, qb = 4 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+  fresh_clone = true
+
+
+
+
+
+# faiss IVF with its lists on disk, read ahead by 32 threads, the coarse table loaded at open, and the SQ8 rows mapped.
+#   cell flags: --variant ondisk --config vpl2560-rq1 --group faiss-ivf-ondisk-2560
+#               --dummy data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+variant = "ondisk"
+
+  [[system.build]]
+  config_id = "vpl2560-rq1"
+  config = { vectors_per_list = 2560, bits = 1 }
+  threads = 10
+  disk_gb = 12
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "dummy2560-rq1"
+  config = { vectors_per_list = 2560, bits = 1 }
+  n = 50000
+  threads = 10
+  disk_gb = 1
+  timeout_s = 1800
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "tune"
+  grid.nprobe = [12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
+  grid.k_factor = [2, 4, 8, 16]
+  grid.qb = [4]
+  grid.prefetch_threads = [32]
+  passes = 3
+  warmup = 1000
+  timeout_s = 7200
+
+  # 0.90 screen 1 of 3: recall@10 0.9180, warm p50 2688 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 4, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.90 screen 2 of 3: recall@10 0.9232, warm p50 2695 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 8, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.90 screen 3 of 3: recall@10 0.9242, warm p50 2764 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 16, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.95 screen 1 of 3: recall@10 0.9550, warm p50 5036 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 8, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.95 screen 2 of 3: recall@10 0.9562, warm p50 5087 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 16, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.95 screen 3 of 3: recall@10 0.9638, warm p50 6464 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 64, k_factor = 8, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.99 screen 1 of 1: recall@10 0.9906, warm p50 24235 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 256, k_factor = 16, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9550, warm p50 5036 us, C0 p50 33.77 ms in 30 tune trials. It gets 300 trials, as one of ColdIVF's closest rivals.
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 8, qb = 4, prefetch_threads = 32 }
+  split = "test"
+  trials = 300
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.95 the cheaper point below it: recall@10 0.9468, warm p50 5028 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 4, qb = 4, prefetch_threads = 32 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 8, qb = 4, prefetch_threads = 32 },
+    { nprobe = 48, k_factor = 4, qb = 4, prefetch_threads = 32 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 8, qb = 4, prefetch_threads = 32 },
+    { nprobe = 48, k_factor = 4, qb = 4, prefetch_threads = 32 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 8, qb = 4, prefetch_threads = 32 },
+    { nprobe = 48, k_factor = 4, qb = 4, prefetch_threads = 32 },
+  ]
+
+  # 0.90 verdict, the fastest cold of 3: recall@10 0.9180, warm p50 2688 us, C0 p50 21.76 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 4, qb = 4, prefetch_threads = 32 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.99 verdict, the fastest cold of 1: recall@10 0.9906, warm p50 24235 us, C0 p50 106.19 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 256, k_factor = 16, qb = 4, prefetch_threads = 32 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 24, k_factor = 4, qb = 4, prefetch_threads = 32 },
+    { nprobe = 256, k_factor = 16, qb = 4, prefetch_threads = 32 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 24, k_factor = 4, qb = 4, prefetch_threads = 32 },
+    { nprobe = 256, k_factor = 16, qb = 4, prefetch_threads = 32 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 24, k_factor = 4, qb = 4, prefetch_threads = 32 },
+    { nprobe = 256, k_factor = 16, qb = 4, prefetch_threads = 32 },
+  ]

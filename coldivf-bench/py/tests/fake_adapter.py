@@ -7,11 +7,13 @@
 - "exec" hands its cold subcommand to a small program that speaks the wire itself.
 - "procqps" measures QPS with one process per worker.
 - "loaded" marks every file as loaded at open, though it maps them, so its cached pages show apart.
+- "swapping" reports 2 swap-ins during every warm setting, as a machine that swaps while it is timed would.
 """
 
 from __future__ import annotations
 
 import sys
+from typing import Iterator
 
 from adapters.base import ServeContext, main
 from adapters.flat import Flat
@@ -48,6 +50,13 @@ class Fake(Flat):
             self.exec_program([sys.executable, "-c", PROGRAM])
 
         super().cold_setup(ctx)
+
+    def warm_run(self, ctx: ServeContext, *args, **kwargs) -> Iterator[dict]:
+        for result in super().warm_run(ctx, *args, **kwargs):
+            if self.variant == "swapping":
+                result["fields"].update(swapins_delta=2, compressions_delta=0)
+
+            yield result
 
     def cold_trial(self, ctx: ServeContext, go: dict) -> dict:
         if self.variant == "crash":

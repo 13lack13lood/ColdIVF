@@ -11,9 +11,13 @@ the same way. The driver reads a suite file, starts one adapter process per job,
 | `rusage.py` | Process counters from macOS's `proc_pid_rusage`, the thread's quality of service (QoS) class and swap counts |
 | `evictor.py` | Page cache eviction through mappings held for a whole batch, and residency checks with `mincore` |
 | `data.py` | `.fbin` and `.ibin` memory maps, prefixes, query splits and recall with ties |
+| `charts.py` | The repo README's charts and `docs/charts/chart-data.json`, drawn with matplotlib 3.11.2 from `venv-plot` |
+| `pick.py` | Each system's cold cells from its warm grid and its screening trials, written into its section of a suite |
+| `headtohead.py` | A phase's head-to-head: each system's pick for each recall target, its warm, cold and memory numbers on the test split, and how ColdIVF compares |
 | `adapters/base.py` | The `Adapter` base class and the adapter's end of the wire |
 | `adapters/flat.py` | Exact search with numpy, the smallest complete adapter |
 | `adapters/coldivf.py` | ColdIVF through its release binaries |
+| `adapters/coldivf_py.py` | ColdIVF through its Python module, in the adapter's process as every other system runs |
 | `adapters/lancedb.py` | LanceDB through pylance's scanner, or through lancedb's query builder where pylance is missing |
 | `adapters/paimon.py` | Paimon's IVF-RQ through a timed read input, a thread pool by default |
 | `adapters/diskann.py` | DiskANN's disk index through `baselines/diskann3`, with two macOS readers |
@@ -29,11 +33,13 @@ the same way. The driver reads a suite file, starts one adapter process per job,
 
 ```
 cd coldivf-bench/py
-python driver.py ../suites/<phase>.toml [--only build,warm,cold,refs] [--systems a,b] [--gate enforce|warn|off]
-                                         [--max-attempts N] [--dry-run]
+python driver.py ../suites/<phase>.toml [--only build,warm,cold,refs] [--systems a,b:variant] [--groups g,h]
+                                         [--gate enforce|warn|off] [--max-attempts N] [--dry-run]
 python -m unittest discover -s tests -t .
 ```
 
+`--systems` names systems by name, which takes every variant of one, or as `name:variant`, which takes one variant.
+`--groups` runs only the cold cells of those groups, eg. one rival's group with the ColdIVF cells that run beside it.
 `--dry-run` prints every job and how much of it is done, and writes nothing. Run the driver with the interpreter of the
 environment its adapters need. Each system may name another interpreter in the suite, eg. for a library that needs its
 own virtual environment. The driver never starts a process in a new session, so a memory cap on the driver's process
@@ -44,6 +50,33 @@ group covers every adapter and every program an adapter runs.
 | `COLDIVF_DATA` | The folder of datasets, `<name>.base.fbin`, `<name>.query.fbin` and `<name>.gt.ibin`. Default `data/datasets` |
 | `COLDIVF_BIN` | The folder of ColdIVF's release binaries. Default `target/mine/release` |
 | `COLDIVF_BENCH_LOCKS` | The folder where the machine's job gate keeps its lock files, read by the timing gate unless the suite's `[gate]` names it as `locks` |
+
+Each system's cold cells come from its own results, by one rule for every system. For each recall target, eg. 0.90,
+0.95 and 0.99, the cheapest settings are those with the lowest warm p50 at 1 thread whose recall@10 on the tune split
+reaches it, a tie going to fewer bytes scanned. `pick.py screen` writes true-cold (C0) cells for the 3 cheapest, 30
+trials each on the tune split. Once they have run, `pick.py verdict` writes, for each target, cells on the test split
+for the screened setting with the lowest C0 p50, and for the cheaper setting just below the target, so a report can
+interpolate latency to exactly the target. A target no setting reaches becomes a comment naming the best recall found.
+Both print the cells, or with `--write` put them at the end of the system's section of the suite and check that it
+still loads.
+
+```
+python pick.py screen ../suites/<phase>.toml --system NAME [--variant V] --config ID [--targets 0.90,0.95,0.99]
+                      [--group G] [--threads T] [--dummy-n N | --dummy PATH] [--write]
+python pick.py verdict ../suites/<phase>.toml --system NAME [--variant V] --config ID [--trials 100] [--warm] [--write]
+```
+
+`headtohead.py` then reads a phase's results by the same rule. For each build and target it takes the pick, and
+reports on the test split its recall@10, warm p50 and queries per second, its C0 times, and its memory, the process
+plus the pages of the index's own files in the page cache. A cold trial's memory is the footprint its open and first
+query add plus the index pages they bring in, and ranges a system copies into its own memory count once. Each row also
+gets its ratios to ColdIVF's, by default its Python module's: the ratio of C0 p50s, the median of per-query ratios over
+the test queries both cells timed with a 95% bootstrap interval, and the ratio of C0 p50s at exactly the target where
+both have cells around it.
+
+```
+python headtohead.py [--suite ../suites/bench-10m.toml] [--reference coldivf:python] [--md OUT.md] [--json OUT.json]
+```
 
 Ground truth for a prefix of n rows is `data/<name>-<n>.gt.ibin`, and a `.gt.dist.fbin` beside any truth file holds its
 distances or scores. Indexes go to `data/bench.noindex/<phase>/<system>/<config_id>-n<n>-s<seed>/` unless a suite
@@ -380,12 +413,20 @@ that differ its recall can come out lower. `extra.near_ties` counts the split's 
 scores recall by ids alone. That equals recall with ties wherever the truth has no tie at that rank, so then a recall
 field is filled only when no query of the split has one, and the binary's own values go under `extra`. A `warm` that
 takes `--mode t1`, passes and threads gets them from the adapter, which then fills p90 and QPS too. A warm line's
-`footprint` is the warm binary's whole process at its peak, read from its record after it exits.
+`footprint` is the warm binary's whole process at its peak, read from its record after it exits. Its swap-ins and
+compressions are the machine's over the binary's whole run, its warm-up included, since the binary doesn't say when its
+timed passes start, so the driver marks the line invalid when either moved, as it does for every other system.
 
 The binaries have no CPU time per QoS class and no cluster import, so those report unsupported or null. They time
 each search inside their own process, around the library's call, so their per-call cost is 0. The binaries ignore
 flags they don't know, so the adapter refuses a build setting its `build_index` lacks, eg. `anchor` on an older build,
 rather than build the default.
+
+A build whose config sets `export_clusters = true` also saves the partition it encodes, i.e. its clusters and their
+groups, for other systems to import as shared clusters. The files go in a folder beside the index folder,
+`<index folder>.clusters/partition.*`, so a suite's `clusters` for another system is
+`<index folder>.clusters/partition`. The index folder holds the index alone, and a dummy build of the same config saves
+its own partition beside its own folder. Build lines record the stem in `extra.export_clusters`.
 
 ## LanceDB Adapter
 
@@ -431,7 +472,9 @@ and `partitions_cached_max` and `partitions_cached`, how many partitions the cac
 after the trial.
 Each warm setting ends with analyze_plan over 8 queries of its split. The mean per role (ranking, partitions, refine and
 ids) goes in `extra.analyze`, and the index comparisons fill `dist_evals`. Shared clusters become pylance's
-`ivf_centroids`, and lancedb alone can't import them.
+`ivf_centroids`, and lancedb alone can't import them. Warm mode "index" reads only the files under the table's
+`_indices` folder before the first setting and leaves the data files to the queries, for a table too large to cache
+whole. The warm-up searches then cache the refine rows and ids of the queries they search, and no other row.
 
 ## Paimon Adapter
 

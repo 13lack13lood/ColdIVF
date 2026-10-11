@@ -1,6 +1,7 @@
 """Runs a benchmark suite through each system's adapter and appends the results.
 
-    python driver.py SUITE.toml [--only build,warm,cold] [--systems a,b] [--gate enforce|warn|off] [--dry-run]
+    python driver.py SUITE.toml [--only build,warm,cold] [--systems a,b] [--groups g,h] [--gate enforce|warn|off]
+                                [--dry-run]
 
 A batch checks the timing gate and the disk floor, runs the drift references, builds what isn't built, measures each
 system's per-call cost and runs the warm grids, then the cold trials in rounds of randomly ordered cells, runs the
@@ -823,10 +824,13 @@ class Child:
 
 class Driver:
     def __init__(self, suite: Suite, only: set[str] | None = None, systems: set[str] | None = None,
-                 gate_mode: str | None = None, dry_run: bool = False, max_attempts: int | None = None):
+                 gate_mode: str | None = None, dry_run: bool = False, max_attempts: int | None = None,
+                 groups: set[str] | None = None):
         self.suite = suite
         self.only = only or {"build", "warm", "cold", "refs"}
         self.systems = systems
+        # The cold groups this batch runs, eg. one rival's group with the ColdIVF cells that run beside it. None is all.
+        self.groups = groups
         self.dry_run = dry_run
         self.max_attempts = max_attempts or suite.max_attempts
 
@@ -856,7 +860,11 @@ class Driver:
         self.overheads: dict[str, dict] = {}
 
     def selected(self, system: System) -> bool:
-        return self.systems is None or system.name in self.systems
+        """Whether --systems names the system, by its name for every variant of it, or as name:variant for one."""
+        return self.systems is None or bool({system.name, f"{system.name}:{system.variant}"} & self.systems)
+
+    def selected_cell(self, cell: Cell) -> bool:
+        return self.selected(cell.system) and (self.groups is None or cell.group in self.groups)
 
     def log(self, msg: str) -> None:
         print(f"driver {time.strftime('%H:%M:%S')} {msg}", file=sys.stderr, flush=True)
@@ -1080,15 +1088,24 @@ class Driver:
     def plan(self) -> None:
         """Prints every job and whether it is done, without running anything."""
         for b in self.suite.builds:
+            if not self.selected(b.system):
+                continue
+
             state = "prebuilt" if b.prebuilt else ("done" if self.progress.done(self.build_key(b)) else "to do")
             print(f"build {b.system.name} {b.config_id} n={b.n} seed={b.seed}: {state} -> {b.index}")
 
         for w in self.suite.warm:
+            if not self.selected(w.system):
+                continue
+
             todo = sum(1 for s in w.settings if not self.progress.done(self.warm_key(w, s)))
             print(f"warm {w.system.name} {w.build.config_id} split={w.split} threads={w.threads}: "
                   f"{todo} of {len(w.settings)} settings to do")
 
         for c in self.suite.cells:
+            if not self.selected_cell(c):
+                continue
+
             todo = sum(1 for r in range(c.trials) if not self.progress.done(self.cold_key(c, r)))
             print(f"cold {c.label} group={c.group} params={c.params}: {todo} of {c.trials} trials to do")
 
@@ -1458,7 +1475,7 @@ class Driver:
         return out
 
     def run_cold(self) -> None:
-        cells = [c for c in self.suite.cells if self.selected(c.system)]
+        cells = [c for c in self.suite.cells if self.selected_cell(c)]
 
         for group in sorted({c.group for c in cells}):
             members = [c for c in cells if c.group == group]
@@ -1803,7 +1820,9 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Runs a benchmark suite.")
     p.add_argument("suite")
     p.add_argument("--only", default="", help="a comma-separated subset of build, warm, cold and refs")
-    p.add_argument("--systems", default="", help="a comma-separated subset of the suite's systems")
+    p.add_argument("--systems", default="",
+                   help="a comma-separated subset of the suite's systems, each a name or name:variant")
+    p.add_argument("--groups", default="", help="a comma-separated subset of the cold groups")
     p.add_argument("--gate", default=None, choices=("enforce", "warn", "off"))
     p.add_argument("--max-attempts", type=int, default=None)
     p.add_argument("--dry-run", action="store_true")
@@ -1811,8 +1830,9 @@ def main(argv: list[str] | None = None) -> int:
     suite = load_suite(args.suite)
     only = {x.strip() for x in args.only.split(",") if x.strip()} or None
     systems = {x.strip() for x in args.systems.split(",") if x.strip()} or None
+    groups = {x.strip() for x in args.groups.split(",") if x.strip()} or None
     driver = Driver(suite, only=only, systems=systems, gate_mode=args.gate, dry_run=args.dry_run,
-                    max_attempts=args.max_attempts)
+                    max_attempts=args.max_attempts, groups=groups)
     return driver.run()
 
 

@@ -511,6 +511,15 @@ variant = "loaded"
         self.assertIn("a crash on purpose", cold[0]["error"])
         self.assertEqual(sum(1 for x in cold if x["regime"] == "c0"), 3 * 2)
 
+    def test_a_warm_setting_timed_while_the_machine_swapped_is_invalid(self):
+        text = SUITE.replace("invalid_vm = []\n", "")
+        suite = driver.load_suite(write_suite(self.root, text, variant="swapping"))
+        self.assertEqual(driver.Driver(suite, only={"build", "warm"}).run(), 0)
+        warm = [x for x in self.lines() if x["kind"] == "warm"]
+        self.assertEqual([x["status"] for x in warm], ["invalid"] * 2)
+        self.assertTrue(all(x["error"] == "swapins 2 during the timed passes" for x in warm), warm[0]["error"])
+        self.assertTrue(all(x["swapins_delta"] == 2 and x["recall10"] is not None for x in warm))
+
     def test_unsupported_regime_writes_one_line(self):
         self.batch("noc1", only={"build", "cold"})
         c1 = [x for x in self.lines() if x["kind"] == "cold" and x["regime"] == "c1"]
@@ -538,6 +547,37 @@ variant = "loaded"
         self.assertIn("cold fake:flat:c0 group=main", out.getvalue())
         self.assertIn("3 of 3 trials to do", out.getvalue())
         self.assertFalse((self.root / "results" / "test" / "fake.jsonl").exists())
+
+    def test_systems_select_a_variant_by_name_and_variant(self):
+        suite = driver.load_suite(write_suite(self.root, variant="fast"))
+        system = suite.systems[0]
+        self.assertTrue(driver.Driver(suite, systems={"fake"}).selected(system))
+        self.assertTrue(driver.Driver(suite, systems={"fake:fast"}).selected(system))
+        self.assertFalse(driver.Driver(suite, systems={"fake:slow"}).selected(system))
+        self.assertFalse(driver.Driver(suite, systems={"fake:"}).selected(system))
+        plain = driver.load_suite(write_suite(self.root))
+        self.assertTrue(driver.Driver(plain, systems={"fake:"}).selected(plain.systems[0]))
+
+    def test_groups_run_only_their_own_cells(self):
+        self.batch(only={"build", "cold"}, groups={"live"})
+        cold = [x for x in self.lines() if x["kind"] == "cold"]
+        self.assertEqual({x["regime"] for x in cold}, {"c1"})
+        self.assertEqual(sum(1 for x in cold if x["status"] == "ok"), 3)
+        suite = driver.load_suite(write_suite(self.root))
+        out = io.StringIO()
+
+        with redirect_stdout(out):
+            driver.Driver(suite, dry_run=True, groups={"main"}, systems={"other"}).run()
+
+        self.assertNotIn("cold ", out.getvalue())
+        self.assertNotIn("build ", out.getvalue())
+        out = io.StringIO()
+
+        with redirect_stdout(out):
+            driver.Driver(suite, dry_run=True, groups={"main"}).run()
+
+        self.assertIn("group=main", out.getvalue())
+        self.assertNotIn("group=live", out.getvalue())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,3457 @@
+# The head-to-head at 10M vectors on this Mac, on cohere10m-768-cosine: 10M rows of 768 dimensions with unit length,
+# searched by cosine, and 1,000 queries, 500 tune ones at even positions and 500 test ones at odd positions. Its ground
+# truth is the exact top 100 of every query with their distances, which matches the published list in every query's
+# top 10, in order.
+#
+# Every system here builds, holds and serves 10M vectors within this machine's limits. Of its 36 GB of memory (RAM), a
+# job may use 16 GB and a warm working set ~24 GB, and an index must fit the free disk beside the 30.7 GB base with 40
+# GB to spare. These don't fit, by their 1M builds scaled 10 times.
+# - qdrant-edge: warm, it needs ~39 GB, its 7.7 GB of codes in memory plus 30.7 GB of originals, more than the whole
+#   36 GB. Its shard is 40.4 GB (4.04 GB at 1M), more than the free disk held, and it takes ~112 GB of disk while it
+#   builds with its write-ahead log.
+# - DiskANN: a build in one piece holds all 30.7 GB of rows and a 2.6 GB graph in memory, over the 16 GB a job may use.
+#   A build in shards within that adds shard files to its 41.9 GB disk index (4.19 GB at 1M), more than the free disk
+#   held.
+# - SymphonyQG: ~65 GB in memory to serve (6.53 GB at 1M), and ~101 GB to build (10.1 GB at 1M).
+# - AsterVec: its bulk build holds every float32 row in memory, ~47 GB (4.73 GB at 1M).
+# - RaBitQ-Library's hierarchical navigable small world (HNSW) graph: ~7 GB of its own (0.71 GB at 1M), but its build
+#   reads float32 rows at random, so it needs the whole 30.7 GB base cached too, ~38 GB in all.
+# - usearch with 16-bit float (f16) rows: its build holds ~17.8 GB (1.78 GB at 1M), 15.4 GB of rows and the graph,
+#   over the 16 GB a job may use, though under the 36 GB of RAM. Its 8-bit integer (i8) rows fit, and run here.
+# - faiss HNSW with float32 rows, 33 GB in memory, and RaBitQ-Library's inverted file index (IVF) over raw float32
+#   rows, 30.7 GB.
+# - faiss HNSW with 4-bit RaBitQ codes and 8-bit scalar quantized (SQ8) rows: 676 bytes per vector of graph and codes
+#   plus 768 of rows, ~14.4 GB at 10M, so its build would peak near 14.7 GB, within ~1.3 GB of the 16 GB a job may use.
+#   It is left out as too close to that cap. faiss HNSW over SQ8 alone, 10.4 GB, runs here.
+# - sqlite-vec and an exact scan: every query reads all ~31 GB, so neither can be warm, and a warm query would take
+#   ~5 s.
+#
+# Disk. ColdIVF's index stays on disk for every batch. Every other system builds, runs and has its index folders
+# deleted before the next one builds, so only one other large index is on disk at a time. The faiss IVF setups, the
+# FastScan index and RaBitQ-Library build on ColdIVF's partition, saved beside its index folder, so they run no k-means
+# and compare on the same lists. LanceDB's table holds its own copy of the 30.7 GB of rows, so it runs last and alone.
+# The disk had room for it beside ColdIVF's index, so its batch has a ColdIVF cell too.
+#
+# ColdIVF's own cells and its test-split warm entries run first, from coldivf-bench/py:
+#   driver.py ../suites/bench-10m.toml --systems coldivf: --groups main --only warm,cold,refs
+# ColdIVF through its Python module, the variant set against the other systems, takes the steps below on that index,
+# with the group coldivf-python.
+# Then each other system, in order:
+#   1. driver.py ../suites/bench-10m.toml --systems NAME[:VARIANT] --only build --gate warn
+#   2. driver.py ../suites/bench-10m.toml --systems NAME[:VARIANT] --only warm --gate warn
+#   3. pick.py screen ../suites/bench-10m.toml --system NAME [--variant V] --config ID --group G [cell flags] --write,
+#      then step 1 again, which builds the dummy a cell with dummy_n searches first
+#   4. driver.py ../suites/bench-10m.toml --systems NAME[:VARIANT] --groups G --only cold,refs
+#   5. pick.py verdict ../suites/bench-10m.toml --system NAME [--variant V] --config ID --group G [cell flags] --warm
+#      --write
+#   6. driver.py ../suites/bench-10m.toml --systems coldivf,NAME[:VARIANT] --groups G --only warm,cold,refs
+#   7. Delete the system's index folders.
+# Step 3 writes cells for the 3 cheapest settings that reach recall@10 0.90, 0.95 and 0.99 on the tune split, 30
+# true-cold trials each, and step 4 times them. Step 5 writes, for each target, cells for the fastest of them cold, 100
+# test trials, and for the cheaper setting just below it, with warm entries on the test split at those settings, and
+# step 6 runs them. Raise a cell's trials to 300 for ColdIVF's three closest rivals at 0.95. A system that reaches no
+# target gets its cells by hand, at its best setting, as turbovec's are. The cell flags of each system are above its
+# section, and every group holds a ColdIVF cell at its 0.95 point, which runs beside the system's own cells in step 6.
+#
+# The tune grid only ranks settings, so it may run on a busy machine. Steps 4 and 6 and ColdIVF's batch time, so the
+# gate is enforced, which needs $COLDIVF_BENCH_LOCKS, and they run as the machine's only heavy job. So do the builds,
+# warm runs and cold cells of every system that holds more than 10 GB, with a 16 GB cap: the faiss IVF builds, FastScan,
+# RaBitQ-Library at 9 bits, Paimon at 8 bits, usearch, faiss HNSW and LanceDB.
+
+phase = "bench-10m"
+dataset = "cohere10m-768-cosine"
+n = 10000000
+index_root = "data/bench.noindex/bench-10m"
+truth = "data/cohere10m-768-cosine-10000000.gt.ibin"
+seed = 1
+k = 10
+max_attempts = 3
+
+[gate]
+mode = "enforce"
+max_wait_s = 7200
+
+[refs]
+mode = "on"
+coldivf_index = "data/cohere-50k.coldivf"
+coldivf_dataset = "cohere-768-cosine"
+coldivf_n = 50000
+coldivf_params = { nprobe = 32, rerank = 39 }
+
+# ColdIVF with two-level clustering and the cluster anchor at 640 vectors per list, 15,687 lists in 128 groups. It
+# was faster cold at 0.95 on the tune split than 160 per list. Its fastest true-cold (C0) p50 at 0.95 was 9.79 ms,
+# nprobe 192 and rerank 39, against 15.18 ms at 160 per list, nprobe 256 and rerank 100, 30 trials each. At 0.90 it
+# was 6.76 ms against 10.98 ms. The two stage suites, bench-10m-coldivf-tl160.toml and bench-10m-coldivf-tl640.toml,
+# hold both builds, grids and screens, and this build and grid are the same as the 640 stage's, so their lines count
+# here. A rebuild gives the same file. Its recall@10 tops out near 0.986, so it can't reach 0.99. Its 8-bit rows hold
+# each vector's offset from the mean with one scale per vector, set by its largest value, and this data has a few wide
+# dimensions, so most values get only ~10 of the 127 levels. Rescoring each test query's true top 100 with these rows
+# gives recall@10 0.987, against 0.994 with one scale per dimension, as faiss's SQ8 rows have, and 0.996 with the same
+# rows after a random rotation.
+[[system]]
+name = "coldivf"
+adapter = "coldivf"
+
+  [[system.build]]
+  config_id = "tl640"
+  config = { clustering = "two-level", vectors_per_list = 640, anchor = "cluster", export_clusters = true }
+  threads = 10
+  disk_gb = 31
+  timeout_s = 7200
+
+  [[system.warm]]
+  config_id = "tl640"
+  split = "tune"
+  grid = { nprobe = [32, 48, 64, 96, 128, 192, 256, 384, 512, 768], rerank = [29, 39, 64] }
+  settings = [
+    { nprobe = 96, rerank = 20 }, { nprobe = 128, rerank = 20 }, { nprobe = 192, rerank = 100 },
+    { nprobe = 256, rerank = 100 }, { nprobe = 384, rerank = 100 }, { nprobe = 512, rerank = 100 },
+    { nprobe = 768, rerank = 100 }, { nprobe = 1024, rerank = 200 }, { nprobe = 1536, rerank = 200 },
+    { nprobe = 2048, rerank = 200 },
+  ]
+  passes = 3
+  warmup = 1000
+  timeout_s = 5400
+
+  # 0.90 verdict, the fastest cold of 3: recall@10 0.9078, warm p50 415 us, C0 p50 6.76 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 64, rerank = 29 }
+  split = "test"
+  trials = 100
+  dummy_n = 200000
+
+  # 0.90 the cheaper point below it: recall@10 0.8984, warm p50 380 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 48, rerank = 39 }
+  split = "test"
+  trials = 100
+  dummy_n = 200000
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9522, warm p50 812 us, C0 p50 9.79 ms in 30 tune trials. It
+  # gets 300 trials, as the verdict cell.
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 300
+  dummy_n = 200000
+
+  # 0.95 the cheaper point below it: recall@10 0.9468, warm p50 668 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 128, rerank = 64 }
+  split = "test"
+  trials = 100
+  dummy_n = 200000
+
+  # 0.99 not reached. The best is {"nprobe": 2048, "rerank": 200}, recall@10 0.9856, warm p50 6579 us
+
+  [[system.warm]]
+  config_id = "tl640"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 64, rerank = 29 },
+    { nprobe = 48, rerank = 39 },
+    { nprobe = 192, rerank = 39 },
+    { nprobe = 128, rerank = 64 },
+  ]
+
+  [[system.warm]]
+  config_id = "tl640"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 64, rerank = 29 },
+    { nprobe = 48, rerank = 39 },
+    { nprobe = 192, rerank = 39 },
+    { nprobe = 128, rerank = 64 },
+  ]
+
+  [[system.warm]]
+  config_id = "tl640"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 64, rerank = 29 },
+    { nprobe = 48, rerank = 39 },
+    { nprobe = 192, rerank = 39 },
+    { nprobe = 128, rerank = 64 },
+  ]
+
+  # ColdIVF's 0.95 verdict point again in the group of every system it runs beside, so each of those batches holds
+  # a ColdIVF cell too. Each is the same index under another build name, since a cell's trials count by its build
+  # and settings, not by its group.
+  [[system.build]]
+  config_id = "tl640-vs-faiss-ivf"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-faiss-ivf"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  [[system.build]]
+  config_id = "tl640-vs-faiss-ivf-ondisk"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-faiss-ivf-ondisk"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf-ondisk"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  [[system.build]]
+  config_id = "tl640-vs-faiss-ivf-graph"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-faiss-ivf-graph"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf-graph"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  [[system.build]]
+  config_id = "tl640-vs-faiss-fastscan"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-faiss-fastscan"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  [[system.build]]
+  config_id = "tl640-vs-rabitq-ivf"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-rabitq-ivf"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  [[system.build]]
+  config_id = "tl640-vs-paimon"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-paimon"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "paimon"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  [[system.build]]
+  config_id = "tl640-vs-usearch"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-usearch"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "usearch"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  [[system.build]]
+  config_id = "tl640-vs-faiss-hnsw"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-faiss-hnsw"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "faiss-hnsw"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  [[system.build]]
+  config_id = "tl640-vs-turbovec"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-turbovec"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "turbovec"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  [[system.build]]
+  config_id = "tl640-vs-lancedb"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-lancedb"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "lancedb"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  # The binaries' 0.95 point in the Python batch, so ColdIVF's two ways of running time side by side.
+  [[system.build]]
+  config_id = "tl640-vs-python"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-python"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "coldivf-python"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  # The binaries' test-split warm entries again, with the machine's swap-ins and compressions counted over each
+  # warm binary's run, which the first ones didn't count.
+  [[system.build]]
+  config_id = "tl640-vmcheck"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.warm]]
+  config_id = "tl640-vmcheck"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 64, rerank = 29 },
+    { nprobe = 48, rerank = 39 },
+    { nprobe = 192, rerank = 39 },
+    { nprobe = 128, rerank = 64 },
+  ]
+
+  [[system.warm]]
+  config_id = "tl640-vmcheck"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 64, rerank = 29 },
+    { nprobe = 48, rerank = 39 },
+    { nprobe = 192, rerank = 39 },
+    { nprobe = 128, rerank = 64 },
+  ]
+
+  [[system.warm]]
+  config_id = "tl640-vmcheck"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 64, rerank = 29 },
+    { nprobe = 48, rerank = 39 },
+    { nprobe = 192, rerank = 39 },
+    { nprobe = 128, rerank = 64 },
+  ]
+
+
+
+# ColdIVF through its Python module, coldivf, in the adapter's process, as every other system runs through its binding,
+# so its times hold the module's per-call cost as theirs hold their bindings'. It searches the binaries' index above,
+# and its cold cells first search the same 200K dummy as the binaries' cells, as every other system's cells first
+# search a dummy of their own config. Its numbers are the ones set against the other systems. The entry above runs the
+# binaries, for comparing ColdIVF with itself. Build the module into venv-coldivf first with `maturin develop
+# --release` in coldivf-python.
+#   cell flags: --variant python --config tl640 --group coldivf-python
+#               --dummy data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000
+[[system]]
+name = "coldivf"
+variant = "python"
+adapter = "coldivf_py"
+python = "${COLDIVF_BENCH_VENVS}/venv-coldivf/bin/python3"
+
+  [[system.build]]
+  config_id = "tl640"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.warm]]
+  config_id = "tl640"
+  split = "tune"
+  grid = { nprobe = [32, 48, 64, 96, 128, 192, 256, 384, 512, 768], rerank = [29, 39, 64] }
+  settings = [
+    { nprobe = 96, rerank = 20 }, { nprobe = 128, rerank = 20 }, { nprobe = 192, rerank = 100 },
+    { nprobe = 256, rerank = 100 }, { nprobe = 384, rerank = 100 }, { nprobe = 512, rerank = 100 },
+    { nprobe = 768, rerank = 100 }, { nprobe = 1024, rerank = 200 }, { nprobe = 1536, rerank = 200 },
+    { nprobe = 2048, rerank = 200 },
+  ]
+  passes = 3
+  warmup = 1000
+  timeout_s = 5400
+
+  # 0.90 screen 1 of 3: recall@10 0.9078, warm p50 396 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 64, rerank = 29 }
+  split = "tune"
+  trials = 30
+  group = "coldivf-python"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  # 0.90 screen 2 of 3: recall@10 0.9036, warm p50 404 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 48, rerank = 64 }
+  split = "tune"
+  trials = 30
+  group = "coldivf-python"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  # 0.90 screen 3 of 3: recall@10 0.9152, warm p50 411 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 64, rerank = 39 }
+  split = "tune"
+  trials = 30
+  group = "coldivf-python"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  # 0.95 screen 1 of 3: recall@10 0.9522, warm p50 769 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 192, rerank = 39 }
+  split = "tune"
+  trials = 30
+  group = "coldivf-python"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  # 0.95 screen 2 of 3: recall@10 0.9604, warm p50 815 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 192, rerank = 64 }
+  split = "tune"
+  trials = 30
+  group = "coldivf-python"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  # 0.95 screen 3 of 3: recall@10 0.9634, warm p50 883 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 192, rerank = 100 }
+  split = "tune"
+  trials = 30
+  group = "coldivf-python"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  # 0.99 not reached. The best is {"nprobe": 2048, "rerank": 200}, recall@10 0.9856, warm p50 6554 us
+
+  # 0.90 verdict, the fastest cold of 3: recall@10 0.9078, warm p50 396 us, C0 p50 7.81 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 64, rerank = 29 }
+  split = "test"
+  trials = 100
+  group = "coldivf-python"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  # 0.90 the cheaper point below it: recall@10 0.8984, warm p50 366 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 48, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "coldivf-python"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9522, warm p50 769 us, C0 p50 11.07 ms in 30 tune trials. It gets 300 trials, as the verdict cell.
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 300
+  group = "coldivf-python"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  # 0.95 the cheaper point below it: recall@10 0.9468, warm p50 653 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 128, rerank = 64 }
+  split = "test"
+  trials = 100
+  group = "coldivf-python"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  # 0.99 not reached. The best is {"nprobe": 2048, "rerank": 200}, recall@10 0.9856, warm p50 6554 us
+
+  [[system.warm]]
+  config_id = "tl640"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 64, rerank = 29 },
+    { nprobe = 48, rerank = 39 },
+    { nprobe = 192, rerank = 39 },
+    { nprobe = 128, rerank = 64 },
+  ]
+
+  [[system.warm]]
+  config_id = "tl640"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 64, rerank = 29 },
+    { nprobe = 48, rerank = 39 },
+    { nprobe = 192, rerank = 39 },
+    { nprobe = 128, rerank = 64 },
+  ]
+
+  [[system.warm]]
+  config_id = "tl640"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 64, rerank = 29 },
+    { nprobe = 48, rerank = 39 },
+    { nprobe = 192, rerank = 39 },
+    { nprobe = 128, rerank = 64 },
+  ]
+
+  # The fresh-clone control: 30 trials at the 0.95 verdict setting, each on a new APFS clone of the index
+  # that no cache has seen.
+  [[system.build]]
+  config_id = "tl640-clone"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-clone"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 30
+  group = "coldivf-python"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+  fresh_clone = true
+
+  # ColdIVF's 0.95 point in each group of this file, so each batch holds a ColdIVF cell.
+  [[system.build]]
+  config_id = "tl640-vs-faiss-ivf-2560"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-faiss-ivf-2560"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  [[system.build]]
+  config_id = "tl640-vs-faiss-ivf-ondisk-2560"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-faiss-ivf-ondisk-2560"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+
+
+
+
+
+# faiss IVF over 1-bit RaBitQ codes with SQ8 rows to rescore, in one mapped file, as faiss ships it. The parallel and
+# batched setups below search the same file.
+#   cell flags: --variant shipped --config cp640-rq1 --group faiss-ivf
+#               --dummy data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+variant = "shipped"
+
+  [[system.build]]
+  config_id = "cp640-rq1"
+  config = { bits = 1 }
+  clusters = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1.clusters/partition"
+  threads = 10
+  disk_gb = 10
+  timeout_s = 10800
+
+  # The dummy the cold cells of this file search first. A dummy can't take shared clusters, so it trains its own.
+  [[system.build]]
+  config_id = "dummy640-rq1"
+  config = { vectors_per_list = 640, bits = 1 }
+  n = 50000
+  threads = 10
+  disk_gb = 1
+  timeout_s = 1800
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "tune"
+  grid = { nprobe = [48, 64, 96, 128, 192, 256, 384, 512, 768, 1024], k_factor = [2, 4, 8, 16], qb = [4] }
+  passes = 3
+  warmup = 1000
+  timeout_s = 7200
+
+  # 0.90 screen 1 of 3: recall@10 0.9090, warm p50 1871 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 4, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.90 screen 2 of 3: recall@10 0.9124, warm p50 1900 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 8, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.90 screen 3 of 3: recall@10 0.9132, warm p50 1947 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 16, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.95 screen 1 of 3: recall@10 0.9508, warm p50 3620 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 4, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.95 screen 2 of 3: recall@10 0.9556, warm p50 3656 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 8, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.95 screen 3 of 3: recall@10 0.9566, warm p50 3690 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 16, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.99 screen 1 of 3: recall@10 0.9900, warm p50 17528 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 768, k_factor = 8, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.99 screen 2 of 3: recall@10 0.9908, warm p50 17555 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 768, k_factor = 16, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.99 screen 3 of 3: recall@10 0.9916, warm p50 23106 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 1024, k_factor = 8, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9508, warm p50 3620 us, C0 p50 165.73 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 4, qb = 4 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 4, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 4, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 4, qb = 4 },
+  ]
+
+  # 0.90 verdict, the fastest cold of 3: recall@10 0.9090, warm p50 1871 us, C0 p50 130.40 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 4, qb = 4 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.99 verdict, the fastest cold of 3: recall@10 0.9900, warm p50 17528 us, C0 p50 451.25 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 768, k_factor = 8, qb = 4 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 4 },
+    { nprobe = 768, k_factor = 8, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 4 },
+    { nprobe = 768, k_factor = 8, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 4 },
+    { nprobe = 768, k_factor = 8, qb = 4 },
+  ]
+
+  [[system.build]]
+  config_id = "vpl2560-rq1"
+  config = { vectors_per_list = 2560, bits = 1 }
+  threads = 10
+  disk_gb = 10
+  timeout_s = 10800
+
+  # The dummy the batched setup's cold cells search first.
+  [[system.build]]
+  config_id = "dummy2560-rq1"
+  config = { vectors_per_list = 2560, bits = 1 }
+  n = 50000
+  threads = 10
+  disk_gb = 1
+  timeout_s = 1800
+
+
+
+
+
+# faiss IVF as shipped, with parallel_mode 1 splitting each query's lists over the cold cell's 6 threads.
+#   cell flags: --variant parallel --config cp640-rq1 --group faiss-ivf --threads 6
+#               --dummy data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+variant = "parallel"
+
+  [[system.build]]
+  config_id = "cp640-rq1"
+  index = "data/bench.noindex/bench-10m/faiss-ivf-shipped/cp640-rq1-n10000000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "tune"
+  grid = { nprobe = [48, 64, 96, 128, 192, 256, 384, 512, 768, 1024], k_factor = [2, 4, 8, 16], qb = [4] }
+  passes = 3
+  warmup = 1000
+  timeout_s = 7200
+
+  # 0.90 screen 1 of 3: recall@10 0.9090, warm p50 1880 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 4, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  threads = 6
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.90 screen 2 of 3: recall@10 0.9124, warm p50 1890 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 8, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  threads = 6
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.90 screen 3 of 3: recall@10 0.9132, warm p50 1932 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 16, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  threads = 6
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.95 screen 1 of 3: recall@10 0.9508, warm p50 3584 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 4, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  threads = 6
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.95 screen 2 of 3: recall@10 0.9556, warm p50 3618 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 8, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  threads = 6
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.95 screen 3 of 3: recall@10 0.9566, warm p50 3682 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 16, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  threads = 6
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.99 screen 1 of 3: recall@10 0.9900, warm p50 17488 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 768, k_factor = 8, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  threads = 6
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.99 screen 2 of 3: recall@10 0.9908, warm p50 17544 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 768, k_factor = 16, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  threads = 6
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.99 screen 3 of 3: recall@10 0.9924, warm p50 23127 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 1024, k_factor = 16, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  threads = 6
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9508, warm p50 3584 us, C0 p50 93.25 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 4, qb = 4 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf"
+  threads = 6
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 4, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 4, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 4, qb = 4 },
+  ]
+
+  # 0.90 verdict, the fastest cold of 3: recall@10 0.9090, warm p50 1880 us, C0 p50 84.46 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 4, qb = 4 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf"
+  threads = 6
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.99 verdict, the fastest cold of 3: recall@10 0.9900, warm p50 17488 us, C0 p50 161.58 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 768, k_factor = 8, qb = 4 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf"
+  threads = 6
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 4 },
+    { nprobe = 768, k_factor = 8, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 4 },
+    { nprobe = 768, k_factor = 8, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 4 },
+    { nprobe = 768, k_factor = 8, qb = 4 },
+  ]
+
+
+
+
+# faiss IVF as shipped, with the probed lists and then the candidates' rows read ahead in two batched waves. faiss has
+# no such setup. It only shows what batched reads gain.
+#   cell flags: --variant batched --config cp640-rq1 --group faiss-ivf
+#               --dummy data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+variant = "batched"
+
+  [[system.build]]
+  config_id = "cp640-rq1"
+  index = "data/bench.noindex/bench-10m/faiss-ivf-shipped/cp640-rq1-n10000000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "tune"
+  grid = { nprobe = [48, 64, 96, 128, 192, 256, 384, 512, 768, 1024], k_factor = [2, 4, 8, 16], qb = [4] }
+  passes = 3
+  warmup = 1000
+  timeout_s = 7200
+
+  # 0.90 screen 1 of 3: recall@10 0.9090, warm p50 2063 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 4, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.90 screen 2 of 3: recall@10 0.9124, warm p50 2170 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 8, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.90 screen 3 of 3: recall@10 0.9020, warm p50 2364 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 64, k_factor = 2, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.95 screen 1 of 3: recall@10 0.9508, warm p50 3891 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 4, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.95 screen 2 of 3: recall@10 0.9556, warm p50 4010 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 8, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.95 screen 3 of 3: recall@10 0.9566, warm p50 4235 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 16, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.99 screen 1 of 3: recall@10 0.9900, warm p50 18612 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 768, k_factor = 8, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.99 screen 2 of 3: recall@10 0.9908, warm p50 18822 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 768, k_factor = 16, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.99 screen 3 of 3: recall@10 0.9916, warm p50 24407 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 1024, k_factor = 8, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9508, warm p50 3891 us, C0 p50 32.17 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 4, qb = 4 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 4, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 4, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 4, qb = 4 },
+  ]
+
+  # 0.90 verdict, the fastest cold of 3: recall@10 0.9090, warm p50 2063 us, C0 p50 28.58 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 4, qb = 4 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  # 0.99 verdict, the fastest cold of 3: recall@10 0.9900, warm p50 18612 us, C0 p50 64.05 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 768, k_factor = 8, qb = 4 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy640-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 4 },
+    { nprobe = 768, k_factor = 8, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 4 },
+    { nprobe = 768, k_factor = 8, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 4 },
+    { nprobe = 768, k_factor = 8, qb = 4 },
+  ]
+
+  [[system.build]]
+  config_id = "vpl2560-rq1"
+  index = "data/bench.noindex/bench-10m/faiss-ivf-shipped/vpl2560-rq1-n10000000-s1"
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "tune"
+  grid = { nprobe = [12, 16, 24, 32, 48, 64, 96, 128, 192, 256], k_factor = [2, 4, 8, 16], qb = [4] }
+  passes = 3
+  warmup = 1000
+  timeout_s = 7200
+
+  # 0.90 screen 1 of 3: recall@10 0.9180, warm p50 2639 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 4, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.90 screen 2 of 3: recall@10 0.9232, warm p50 2718 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 8, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.90 screen 3 of 3: recall@10 0.9242, warm p50 2866 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 16, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.95 screen 1 of 3: recall@10 0.9550, warm p50 5028 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 8, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.95 screen 2 of 3: recall@10 0.9562, warm p50 5190 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 16, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.95 screen 3 of 3: recall@10 0.9550, warm p50 6424 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 64, k_factor = 4, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.99 screen 1 of 1: recall@10 0.9906, warm p50 25522 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 256, k_factor = 16, qb = 4 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9550, warm p50 5028 us, C0 p50 22.30 ms in 30 tune trials. It gets 300 trials, as one of ColdIVF's closest rivals.
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 8, qb = 4 }
+  split = "test"
+  trials = 300
+  group = "faiss-ivf-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.95 the cheaper point below it: recall@10 0.9468, warm p50 4972 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 4, qb = 4 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 8, qb = 4 },
+    { nprobe = 48, k_factor = 4, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 8, qb = 4 },
+    { nprobe = 48, k_factor = 4, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 8, qb = 4 },
+    { nprobe = 48, k_factor = 4, qb = 4 },
+  ]
+
+  # 0.90 verdict, the cheapest of 3 whose C0 median interval overlaps the fastest's, {"k_factor": 8, "nprobe": 24, "qb": 4} at 18.26 ms: recall@10 0.9180, warm p50 2639 us, C0 p50 18.44 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 4, qb = 4 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  # 0.99 verdict, the fastest cold of 1: recall@10 0.9906, warm p50 25522 us, C0 p50 61.64 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 256, k_factor = 16, qb = 4 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 24, k_factor = 4, qb = 4 },
+    { nprobe = 256, k_factor = 16, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 24, k_factor = 4, qb = 4 },
+    { nprobe = 256, k_factor = 16, qb = 4 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 24, k_factor = 4, qb = 4 },
+    { nprobe = 256, k_factor = 16, qb = 4 },
+  ]
+
+  # The fresh-clone control: 30 trials at the 0.95 verdict setting, each on a new APFS clone of the index
+  # that no cache has seen.
+  [[system.build]]
+  config_id = "vpl2560-rq1-clone"
+  index = "data/bench.noindex/bench-10m/faiss-ivf-shipped/vpl2560-rq1-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "vpl2560-rq1-clone"
+  params = { nprobe = 48, k_factor = 8, qb = 4 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"
+  fresh_clone = true
+
+
+
+
+
+# faiss IVF with its lists on disk, read ahead by 32 threads, the coarse table loaded at open, and the SQ8 rows mapped.
+#   cell flags: --variant ondisk --config cp640-rq1 --group faiss-ivf-ondisk
+#               --dummy data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy640-rq1-n50000-s1
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+variant = "ondisk"
+
+  [[system.build]]
+  config_id = "cp640-rq1"
+  config = { bits = 1 }
+  clusters = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1.clusters/partition"
+  threads = 10
+  disk_gb = 12
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "dummy640-rq1"
+  config = { vectors_per_list = 640, bits = 1 }
+  n = 50000
+  threads = 10
+  disk_gb = 1
+  timeout_s = 1800
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "tune"
+  grid.nprobe = [48, 64, 96, 128, 192, 256, 384, 512, 768, 1024]
+  grid.k_factor = [2, 4, 8, 16]
+  grid.qb = [4]
+  grid.prefetch_threads = [32]
+  passes = 3
+  warmup = 1000
+  timeout_s = 7200
+
+  # 0.90 screen 1 of 3: recall@10 0.9090, warm p50 2145 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 4, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy640-rq1-n50000-s1"
+
+  # 0.90 screen 2 of 3: recall@10 0.9124, warm p50 2170 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 8, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy640-rq1-n50000-s1"
+
+  # 0.90 screen 3 of 3: recall@10 0.9132, warm p50 2262 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 16, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy640-rq1-n50000-s1"
+
+  # 0.95 screen 1 of 3: recall@10 0.9508, warm p50 3913 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 4, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy640-rq1-n50000-s1"
+
+  # 0.95 screen 2 of 3: recall@10 0.9556, warm p50 3926 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 8, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy640-rq1-n50000-s1"
+
+  # 0.95 screen 3 of 3: recall@10 0.9566, warm p50 3983 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 16, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy640-rq1-n50000-s1"
+
+  # 0.99 screen 1 of 3: recall@10 0.9900, warm p50 17724 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 768, k_factor = 8, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy640-rq1-n50000-s1"
+
+  # 0.99 screen 2 of 3: recall@10 0.9908, warm p50 18069 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 768, k_factor = 16, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy640-rq1-n50000-s1"
+
+  # 0.99 screen 3 of 3: recall@10 0.9916, warm p50 23076 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 1024, k_factor = 8, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy640-rq1-n50000-s1"
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9508, warm p50 3913 us, C0 p50 34.89 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 4, qb = 4, prefetch_threads = 32 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf-ondisk"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy640-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 4, qb = 4, prefetch_threads = 32 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 4, qb = 4, prefetch_threads = 32 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 4, qb = 4, prefetch_threads = 32 },
+  ]
+
+  # 0.90 verdict, the fastest cold of 3: recall@10 0.9090, warm p50 2145 us, C0 p50 28.67 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 4, qb = 4, prefetch_threads = 32 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf-ondisk"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy640-rq1-n50000-s1"
+
+  # 0.99 verdict, the fastest cold of 3: recall@10 0.9900, warm p50 17724 us, C0 p50 87.38 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 768, k_factor = 8, qb = 4, prefetch_threads = 32 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf-ondisk"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy640-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 4, prefetch_threads = 32 },
+    { nprobe = 768, k_factor = 8, qb = 4, prefetch_threads = 32 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 4, prefetch_threads = 32 },
+    { nprobe = 768, k_factor = 8, qb = 4, prefetch_threads = 32 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 4, prefetch_threads = 32 },
+    { nprobe = 768, k_factor = 8, qb = 4, prefetch_threads = 32 },
+  ]
+
+  [[system.build]]
+  config_id = "vpl2560-rq1"
+  config = { vectors_per_list = 2560, bits = 1 }
+  threads = 10
+  disk_gb = 12
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "dummy2560-rq1"
+  config = { vectors_per_list = 2560, bits = 1 }
+  n = 50000
+  threads = 10
+  disk_gb = 1
+  timeout_s = 1800
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "tune"
+  grid.nprobe = [12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
+  grid.k_factor = [2, 4, 8, 16]
+  grid.qb = [4]
+  grid.prefetch_threads = [32]
+  passes = 3
+  warmup = 1000
+  timeout_s = 7200
+
+  # 0.90 screen 1 of 3: recall@10 0.9180, warm p50 2688 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 4, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.90 screen 2 of 3: recall@10 0.9232, warm p50 2695 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 8, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.90 screen 3 of 3: recall@10 0.9242, warm p50 2764 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 16, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.95 screen 1 of 3: recall@10 0.9550, warm p50 5036 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 8, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.95 screen 2 of 3: recall@10 0.9562, warm p50 5087 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 16, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.95 screen 3 of 3: recall@10 0.9638, warm p50 6464 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 64, k_factor = 8, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.99 screen 1 of 1: recall@10 0.9906, warm p50 24235 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 256, k_factor = 16, qb = 4, prefetch_threads = 32 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9550, warm p50 5036 us, C0 p50 33.77 ms in 30 tune trials. It gets 300 trials, as one of ColdIVF's closest rivals.
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 8, qb = 4, prefetch_threads = 32 }
+  split = "test"
+  trials = 300
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.95 the cheaper point below it: recall@10 0.9468, warm p50 5028 us
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 48, k_factor = 4, qb = 4, prefetch_threads = 32 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 8, qb = 4, prefetch_threads = 32 },
+    { nprobe = 48, k_factor = 4, qb = 4, prefetch_threads = 32 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 8, qb = 4, prefetch_threads = 32 },
+    { nprobe = 48, k_factor = 4, qb = 4, prefetch_threads = 32 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 8, qb = 4, prefetch_threads = 32 },
+    { nprobe = 48, k_factor = 4, qb = 4, prefetch_threads = 32 },
+  ]
+
+  # 0.90 verdict, the fastest cold of 3: recall@10 0.9180, warm p50 2688 us, C0 p50 21.76 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 4, qb = 4, prefetch_threads = 32 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  # 0.99 verdict, the fastest cold of 1: recall@10 0.9906, warm p50 24235 us, C0 p50 106.19 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 256, k_factor = 16, qb = 4, prefetch_threads = 32 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf-ondisk-2560"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-ondisk/dummy2560-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 24, k_factor = 4, qb = 4, prefetch_threads = 32 },
+    { nprobe = 256, k_factor = 16, qb = 4, prefetch_threads = 32 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 24, k_factor = 4, qb = 4, prefetch_threads = 32 },
+    { nprobe = 256, k_factor = 16, qb = 4, prefetch_threads = 32 },
+  ]
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 24, k_factor = 4, qb = 4, prefetch_threads = 32 },
+    { nprobe = 256, k_factor = 16, qb = 4, prefetch_threads = 32 },
+  ]
+
+
+
+
+
+# faiss IVF with an HNSW graph of the centroids as its coarse quantizer, so routing reads only the centroids it visits.
+#   cell flags: --variant graph --config cp640-rq1-hnsw32 --group faiss-ivf-graph
+#               --dummy data/bench.noindex/bench-10m/faiss-ivf-graph/dummy640-rq1-hnsw32-n50000-s1
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+variant = "graph"
+
+  [[system.build]]
+  config_id = "cp640-rq1-hnsw32"
+  config = { bits = 1 }
+  clusters = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1.clusters/partition"
+  threads = 10
+  disk_gb = 10
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "dummy640-rq1-hnsw32"
+  config = { vectors_per_list = 640, bits = 1 }
+  n = 50000
+  threads = 10
+  disk_gb = 1
+  timeout_s = 1800
+
+  [[system.warm]]
+  config_id = "cp640-rq1-hnsw32"
+  split = "tune"
+  grid.nprobe = [48, 64, 96, 128, 192, 256, 384, 512, 768, 1024]
+  grid.k_factor = [2, 4, 8, 16]
+  grid.qb = [4]
+  grid.quantizer_ef = [128]
+  passes = 3
+  warmup = 1000
+  timeout_s = 7200
+
+  # 0.90 screen 1 of 3: recall@10 0.9110, warm p50 1303 us
+  [[system.cold]]
+  config_id = "cp640-rq1-hnsw32"
+  params = { nprobe = 48, k_factor = 8, qb = 4, quantizer_ef = 128 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-graph"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-graph/dummy640-rq1-hnsw32-n50000-s1"
+
+  # 0.90 screen 2 of 3: recall@10 0.9076, warm p50 1305 us
+  [[system.cold]]
+  config_id = "cp640-rq1-hnsw32"
+  params = { nprobe = 48, k_factor = 4, qb = 4, quantizer_ef = 128 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-graph"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-graph/dummy640-rq1-hnsw32-n50000-s1"
+
+  # 0.90 screen 3 of 3: recall@10 0.9118, warm p50 1342 us
+  [[system.cold]]
+  config_id = "cp640-rq1-hnsw32"
+  params = { nprobe = 48, k_factor = 16, qb = 4, quantizer_ef = 128 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-graph"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-graph/dummy640-rq1-hnsw32-n50000-s1"
+
+  # 0.95 screen 1 of 3: recall@10 0.9540, warm p50 3005 us
+  [[system.cold]]
+  config_id = "cp640-rq1-hnsw32"
+  params = { nprobe = 128, k_factor = 8, qb = 4, quantizer_ef = 128 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-graph"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-graph/dummy640-rq1-hnsw32-n50000-s1"
+
+  # 0.95 screen 2 of 3: recall@10 0.9550, warm p50 3055 us
+  [[system.cold]]
+  config_id = "cp640-rq1-hnsw32"
+  params = { nprobe = 128, k_factor = 16, qb = 4, quantizer_ef = 128 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-graph"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-graph/dummy640-rq1-hnsw32-n50000-s1"
+
+  # 0.95 screen 3 of 3: recall@10 0.9672, warm p50 4396 us
+  [[system.cold]]
+  config_id = "cp640-rq1-hnsw32"
+  params = { nprobe = 192, k_factor = 8, qb = 4, quantizer_ef = 128 }
+  split = "tune"
+  trials = 30
+  group = "faiss-ivf-graph"
+  dummy = "data/bench.noindex/bench-10m/faiss-ivf-graph/dummy640-rq1-hnsw32-n50000-s1"
+
+  # 0.99 not reached. The best is {"k_factor": 16, "nprobe": 1024, "qb": 4, "quantizer_ef": 128}, recall@10 0.9878, warm p50 21477 us
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9540, warm p50 3005 us, C0 p50 124.92 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1-hnsw32"
+  params = { nprobe = 128, k_factor = 8, qb = 4, quantizer_ef = 128 }
+  split = "test"
+  trials = 100
+  group = "faiss-ivf-graph"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-graph/dummy640-rq1-hnsw32-n50000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-rq1-hnsw32"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 8, qb = 4, quantizer_ef = 128 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1-hnsw32"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 8, qb = 4, quantizer_ef = 128 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1-hnsw32"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 8, qb = 4, quantizer_ef = 128 },
+  ]
+
+  # 0.90 verdict, the fastest cold of 3: recall@10 0.9076, warm p50 1305 us, C0 p50 92.40 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1-hnsw32"
+  params = { nprobe = 48, k_factor = 4, qb = 4, quantizer_ef = 128 }
+  split = "test"
+  trials = 30
+  group = "faiss-ivf-graph"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-ivf-graph/dummy640-rq1-hnsw32-n50000-s1"
+
+  # 0.99 not reached. The best is {"k_factor": 16, "nprobe": 1024, "qb": 4, "quantizer_ef": 128}, recall@10 0.9878, warm p50 21477 us
+
+  [[system.warm]]
+  config_id = "cp640-rq1-hnsw32"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 4, quantizer_ef = 128 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1-hnsw32"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 4, quantizer_ef = 128 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1-hnsw32"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 4, quantizer_ef = 128 },
+  ]
+
+
+
+
+# faiss's RaBitQ FastScan with SQ8 rows to rescore. The whole index loads at open, ~9 GB at 10M, so its warm and cold
+# batches run alone under the 16 GB cap.
+#   cell flags: --variant fastscan --config cp640-rq1 --group faiss-fastscan
+#               --dummy data/bench.noindex/bench-10m/faiss-fastscan-fastscan/dummy640-rq1-n50000-s1
+[[system]]
+name = "faiss-fastscan"
+adapter = "faiss_ivf"
+variant = "fastscan"
+
+  [[system.build]]
+  config_id = "cp640-rq1"
+  config = { bits = 1 }
+  clusters = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1.clusters/partition"
+  threads = 10
+  disk_gb = 10
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "dummy640-rq1"
+  config = { vectors_per_list = 640, bits = 1 }
+  n = 50000
+  threads = 10
+  disk_gb = 1
+  timeout_s = 1800
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "tune"
+  grid = { nprobe = [48, 64, 96, 128, 192, 256, 384, 512, 768, 1024], k_factor = [2, 4, 8, 16], qb = [8] }
+  passes = 3
+  warmup = 1000
+  timeout_s = 7200
+
+  # 0.90 screen 1 of 3: recall@10 0.9090, warm p50 1287 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 4, qb = 8 }
+  split = "tune"
+  trials = 30
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/bench-10m/faiss-fastscan-fastscan/dummy640-rq1-n50000-s1"
+
+  # 0.90 screen 2 of 3: recall@10 0.9126, warm p50 1319 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 8, qb = 8 }
+  split = "tune"
+  trials = 30
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/bench-10m/faiss-fastscan-fastscan/dummy640-rq1-n50000-s1"
+
+  # 0.90 screen 3 of 3: recall@10 0.9132, warm p50 1362 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 16, qb = 8 }
+  split = "tune"
+  trials = 30
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/bench-10m/faiss-fastscan-fastscan/dummy640-rq1-n50000-s1"
+
+  # 0.95 screen 1 of 3: recall@10 0.9508, warm p50 2109 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 4, qb = 8 }
+  split = "tune"
+  trials = 30
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/bench-10m/faiss-fastscan-fastscan/dummy640-rq1-n50000-s1"
+
+  # 0.95 screen 2 of 3: recall@10 0.9558, warm p50 2146 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 8, qb = 8 }
+  split = "tune"
+  trials = 30
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/bench-10m/faiss-fastscan-fastscan/dummy640-rq1-n50000-s1"
+
+  # 0.95 screen 3 of 3: recall@10 0.9566, warm p50 2190 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 16, qb = 8 }
+  split = "tune"
+  trials = 30
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/bench-10m/faiss-fastscan-fastscan/dummy640-rq1-n50000-s1"
+
+  # 0.99 screen 1 of 3: recall@10 0.9910, warm p50 8568 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 768, k_factor = 16, qb = 8 }
+  split = "tune"
+  trials = 30
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/bench-10m/faiss-fastscan-fastscan/dummy640-rq1-n50000-s1"
+
+  # 0.99 screen 2 of 3: recall@10 0.9910, warm p50 11124 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 1024, k_factor = 8, qb = 8 }
+  split = "tune"
+  trials = 30
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/bench-10m/faiss-fastscan-fastscan/dummy640-rq1-n50000-s1"
+
+  # 0.99 screen 3 of 3: recall@10 0.9926, warm p50 11269 us
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 1024, k_factor = 16, qb = 8 }
+  split = "tune"
+  trials = 30
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/bench-10m/faiss-fastscan-fastscan/dummy640-rq1-n50000-s1"
+
+  # 0.95 verdict, the cheapest of 3 whose C0 median interval overlaps the fastest's, {"k_factor": 8, "nprobe": 128, "qb": 8} at 1650.36 ms: recall@10 0.9508, warm p50 2109 us, C0 p50 1651.97 ms in 28 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 128, k_factor = 4, qb = 8 }
+  split = "test"
+  trials = 100
+  group = "faiss-fastscan"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-fastscan-fastscan/dummy640-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 4, qb = 8 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 4, qb = 8 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, k_factor = 4, qb = 8 },
+  ]
+
+  # 0.90 verdict, the cheapest of 3 whose C0 median interval overlaps the fastest's, {"k_factor": 8, "nprobe": 48, "qb": 8} at 1653.11 ms: recall@10 0.9090, warm p50 1287 us, C0 p50 1653.83 ms in 28 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 48, k_factor = 4, qb = 8 }
+  split = "test"
+  trials = 30
+  group = "faiss-fastscan"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-fastscan-fastscan/dummy640-rq1-n50000-s1"
+
+  # 0.99 verdict, the fastest cold of 3: recall@10 0.9910, warm p50 8568 us, C0 p50 1657.16 ms in 27 tune trials
+  [[system.cold]]
+  config_id = "cp640-rq1"
+  params = { nprobe = 768, k_factor = 16, qb = 8 }
+  split = "test"
+  trials = 30
+  group = "faiss-fastscan"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/faiss-fastscan-fastscan/dummy640-rq1-n50000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 8 },
+    { nprobe = 768, k_factor = 16, qb = 8 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 8 },
+    { nprobe = 768, k_factor = 16, qb = 8 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-rq1"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48, k_factor = 4, qb = 8 },
+    { nprobe = 768, k_factor = 16, qb = 8 },
+  ]
+
+
+
+
+# RaBitQ-Library's IVF at 5 and 9 bits, with no rescoring. Each loads whole at open, ~5.4 GB and ~9.2 GB at 10M.
+#   cell flags: --config cp640-b5 --group rabitq-ivf
+#               --dummy data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b5-n50000-s1
+#   and         --config cp640-b9 --group rabitq-ivf
+#               --dummy data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b9-n50000-s1
+[[system]]
+name = "rabitq-ivf"
+adapter = "rabitq_ivf"
+
+  [[system.build]]
+  config_id = "cp640-b5"
+  config = { bits = 5 }
+  clusters = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1.clusters/partition"
+  threads = 10
+  disk_gb = 6
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "cp640-b9"
+  config = { bits = 9 }
+  clusters = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1.clusters/partition"
+  threads = 10
+  disk_gb = 10
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "dummy640-b5"
+  config = { bits = 5, vectors_per_list = 640 }
+  n = 50000
+  threads = 10
+  disk_gb = 1
+  timeout_s = 1800
+
+  [[system.build]]
+  config_id = "dummy640-b9"
+  config = { bits = 9, vectors_per_list = 640 }
+  n = 50000
+  threads = 10
+  disk_gb = 1
+  timeout_s = 1800
+
+  [[system.warm]]
+  config_id = "cp640-b5"
+  split = "tune"
+  grid = { nprobe = [32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536] }
+  passes = 3
+  warmup = 1000
+  timeout_s = 7200
+
+  [[system.warm]]
+  config_id = "cp640-b9"
+  split = "tune"
+  grid = { nprobe = [32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536] }
+  passes = 3
+  warmup = 1000
+  timeout_s = 7200
+
+  # 0.90 screen 1 of 3: recall@10 0.9006, warm p50 1673 us
+  [[system.cold]]
+  config_id = "cp640-b5"
+  params = { nprobe = 96 }
+  split = "tune"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b5-n50000-s1"
+
+  # 0.90 screen 2 of 3: recall@10 0.9156, warm p50 1986 us
+  [[system.cold]]
+  config_id = "cp640-b5"
+  params = { nprobe = 128 }
+  split = "tune"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b5-n50000-s1"
+
+  # 0.90 screen 3 of 3: recall@10 0.9346, warm p50 2586 us
+  [[system.cold]]
+  config_id = "cp640-b5"
+  params = { nprobe = 192 }
+  split = "tune"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b5-n50000-s1"
+
+  # 0.95 screen 1 of 3: recall@10 0.9564, warm p50 4422 us
+  [[system.cold]]
+  config_id = "cp640-b5"
+  params = { nprobe = 384 }
+  split = "tune"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b5-n50000-s1"
+
+  # 0.95 screen 2 of 3: recall@10 0.9648, warm p50 5656 us
+  [[system.cold]]
+  config_id = "cp640-b5"
+  params = { nprobe = 512 }
+  split = "tune"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b5-n50000-s1"
+
+  # 0.95 screen 3 of 3: recall@10 0.9724, warm p50 8014 us
+  [[system.cold]]
+  config_id = "cp640-b5"
+  params = { nprobe = 768 }
+  split = "tune"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b5-n50000-s1"
+
+  # 0.99 not reached. The best is {"nprobe": 1536}, recall@10 0.9776, warm p50 15156 us
+
+  # 0.90 screen 1 of 3: recall@10 0.9102, warm p50 1707 us
+  [[system.cold]]
+  config_id = "cp640-b9"
+  params = { nprobe = 96 }
+  split = "tune"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b9-n50000-s1"
+
+  # 0.90 screen 2 of 3: recall@10 0.9258, warm p50 1988 us
+  [[system.cold]]
+  config_id = "cp640-b9"
+  params = { nprobe = 128 }
+  split = "tune"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b9-n50000-s1"
+
+  # 0.90 screen 3 of 3: recall@10 0.9460, warm p50 2596 us
+  [[system.cold]]
+  config_id = "cp640-b9"
+  params = { nprobe = 192 }
+  split = "tune"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b9-n50000-s1"
+
+  # 0.95 screen 1 of 3: recall@10 0.9584, warm p50 3206 us
+  [[system.cold]]
+  config_id = "cp640-b9"
+  params = { nprobe = 256 }
+  split = "tune"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b9-n50000-s1"
+
+  # 0.95 screen 2 of 3: recall@10 0.9704, warm p50 4417 us
+  [[system.cold]]
+  config_id = "cp640-b9"
+  params = { nprobe = 384 }
+  split = "tune"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b9-n50000-s1"
+
+  # 0.95 screen 3 of 3: recall@10 0.9792, warm p50 5657 us
+  [[system.cold]]
+  config_id = "cp640-b9"
+  params = { nprobe = 512 }
+  split = "tune"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b9-n50000-s1"
+
+  # 0.99 screen 1 of 2: recall@10 0.9902, warm p50 10436 us
+  [[system.cold]]
+  config_id = "cp640-b9"
+  params = { nprobe = 1024 }
+  split = "tune"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b9-n50000-s1"
+
+  # 0.99 screen 2 of 2: recall@10 0.9938, warm p50 15128 us
+  [[system.cold]]
+  config_id = "cp640-b9"
+  params = { nprobe = 1536 }
+  split = "tune"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b9-n50000-s1"
+
+  # 0.95 verdict, the cheapest of 3 whose C0 median interval overlaps the fastest's, {"nprobe": 512} at 2345.75 ms: recall@10 0.9584, warm p50 3206 us, C0 p50 2350.25 ms in 14 tune trials
+  [[system.cold]]
+  config_id = "cp640-b9"
+  params = { nprobe = 256 }
+  split = "test"
+  trials = 100
+  group = "rabitq-ivf"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b9-n50000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-b9"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 256 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-b9"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 256 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-b9"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 256 },
+  ]
+
+  # 0.90 verdict, the cheapest of 3 whose C0 median interval overlaps the fastest's, {"nprobe": 128} at 2337.37 ms: recall@10 0.9102, warm p50 1707 us, C0 p50 2339.35 ms in 18 tune trials
+  [[system.cold]]
+  config_id = "cp640-b9"
+  params = { nprobe = 96 }
+  split = "test"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b9-n50000-s1"
+
+  # 0.99 verdict, the fastest cold of 2: recall@10 0.9902, warm p50 10436 us, C0 p50 2355.33 ms in 15 tune trials
+  [[system.cold]]
+  config_id = "cp640-b9"
+  params = { nprobe = 1024 }
+  split = "test"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b9-n50000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-b9"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 96 },
+    { nprobe = 1024 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-b9"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 96 },
+    { nprobe = 1024 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-b9"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 96 },
+    { nprobe = 1024 },
+  ]
+
+  # 0.95 verdict, the cheapest of 3 whose C0 median interval overlaps the fastest's, {"nprobe": 768} at 1203.03 ms: recall@10 0.9564, warm p50 4422 us, C0 p50 1204.26 ms in 25 tune trials
+  [[system.cold]]
+  config_id = "cp640-b5"
+  params = { nprobe = 384 }
+  split = "test"
+  trials = 100
+  group = "rabitq-ivf"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b5-n50000-s1"
+
+  [[system.warm]]
+  config_id = "cp640-b5"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 384 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-b5"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 384 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-b5"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 384 },
+  ]
+
+  # 0.90 verdict, the cheapest of 3 whose C0 median interval overlaps the fastest's, {"nprobe": 192} at 1205.08 ms: recall@10 0.9006, warm p50 1673 us, C0 p50 1207.79 ms in 22 tune trials
+  [[system.cold]]
+  config_id = "cp640-b5"
+  params = { nprobe = 96 }
+  split = "test"
+  trials = 30
+  group = "rabitq-ivf"
+  dummy = "/Users/harryzz/vectordb/coldivf/data/bench.noindex/bench-10m/rabitq-ivf/dummy640-b5-n50000-s1"
+
+  # 0.99 not reached. The best is {"nprobe": 1536}, recall@10 0.9776, warm p50 15156 us
+
+  [[system.warm]]
+  config_id = "cp640-b5"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 96 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-b5"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 96 },
+  ]
+
+  [[system.warm]]
+  config_id = "cp640-b5"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 96 },
+  ]
+
+
+
+
+
+# Paimon's IVF-RQ at 4 and 8 bits, with its own clusters, as many as it picks for 10M rows, and no rescoring. Its
+# trainer gets 500K evenly spaced rows, since it would otherwise keep a sample of 64 rows per cluster.
+#   cell flags: --config b4 --group paimon --dummy-n 50000, and --config b8 the same
+[[system]]
+name = "paimon"
+adapter = "paimon"
+
+  [[system.build]]
+  config_id = "b4"
+  config = { bits = 4, train_rows = 500000 }
+  threads = 10
+  disk_gb = 5
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "b8"
+  config = { bits = 8, train_rows = 500000 }
+  threads = 10
+  disk_gb = 9
+  timeout_s = 10800
+
+  [[system.warm]]
+  config_id = "b4"
+  split = "tune"
+  grid = { nprobe = [16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768] }
+  passes = 3
+  warmup = 100
+  timeout_s = 14400
+
+  [[system.warm]]
+  config_id = "b8"
+  split = "tune"
+  grid = { nprobe = [16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768] }
+  passes = 3
+  warmup = 100
+  timeout_s = 14400
+
+  # 0.90 screen 1 of 3: recall@10 0.9052, warm p50 34044 us
+  [[system.cold]]
+  config_id = "b4"
+  params = { nprobe = 48 }
+  split = "tune"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.90 screen 2 of 3: recall@10 0.9232, warm p50 45083 us
+  [[system.cold]]
+  config_id = "b4"
+  params = { nprobe = 64 }
+  split = "tune"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.90 screen 3 of 3: recall@10 0.9380, warm p50 66508 us
+  [[system.cold]]
+  config_id = "b4"
+  params = { nprobe = 96 }
+  split = "tune"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.95 screen 1 of 3: recall@10 0.9526, warm p50 130734 us
+  [[system.cold]]
+  config_id = "b4"
+  params = { nprobe = 192 }
+  split = "tune"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.95 screen 2 of 3: recall@10 0.9564, warm p50 174445 us
+  [[system.cold]]
+  config_id = "b4"
+  params = { nprobe = 256 }
+  split = "tune"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.95 screen 3 of 3: recall@10 0.9578, warm p50 260998 us
+  [[system.cold]]
+  config_id = "b4"
+  params = { nprobe = 384 }
+  split = "tune"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.99 not reached. The best is {"nprobe": 768}, recall@10 0.9590, warm p50 527833 us, warm from a line the machine's swapping made invalid
+
+  # 0.90 screen 1 of 3: recall@10 0.9022, warm p50 49861 us
+  [[system.cold]]
+  config_id = "b8"
+  params = { nprobe = 32 }
+  split = "tune"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.90 screen 2 of 3: recall@10 0.9294, warm p50 73239 us
+  [[system.cold]]
+  config_id = "b8"
+  params = { nprobe = 48 }
+  split = "tune"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.90 screen 3 of 3: recall@10 0.9490, warm p50 96277 us
+  [[system.cold]]
+  config_id = "b8"
+  params = { nprobe = 64 }
+  split = "tune"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.95 screen 1 of 3: recall@10 0.9676, warm p50 142143 us
+  [[system.cold]]
+  config_id = "b8"
+  params = { nprobe = 96 }
+  split = "tune"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.95 screen 2 of 3: recall@10 0.9778, warm p50 188105 us, warm from a line the machine's swapping made invalid
+  [[system.cold]]
+  config_id = "b8"
+  params = { nprobe = 128 }
+  split = "tune"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.95 screen 3 of 3: recall@10 0.9880, warm p50 281238 us
+  [[system.cold]]
+  config_id = "b8"
+  params = { nprobe = 192 }
+  split = "tune"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.99 screen 1 of 3: recall@10 0.9928, warm p50 375500 us, warm from a line the machine's swapping made invalid
+  [[system.cold]]
+  config_id = "b8"
+  params = { nprobe = 256 }
+  split = "tune"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.99 screen 2 of 3: recall@10 0.9960, warm p50 565826 us, warm from a line the machine's swapping made invalid
+  [[system.cold]]
+  config_id = "b8"
+  params = { nprobe = 384 }
+  split = "tune"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.99 screen 3 of 3: recall@10 0.9964, warm p50 759258 us, warm from a line the machine's swapping made invalid
+  [[system.cold]]
+  config_id = "b8"
+  params = { nprobe = 512 }
+  split = "tune"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9526, warm p50 130734 us, C0 p50 172.19 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "b4"
+  params = { nprobe = 192 }
+  split = "test"
+  trials = 100
+  group = "paimon"
+  dummy_n = 50000
+
+  [[system.warm]]
+  config_id = "b4"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 192 },
+  ]
+
+  [[system.warm]]
+  config_id = "b4"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 192 },
+  ]
+
+  [[system.warm]]
+  config_id = "b4"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 192 },
+  ]
+
+  # 0.90 verdict, the fastest cold of 3: recall@10 0.9052, warm p50 34044 us, C0 p50 49.02 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "b4"
+  params = { nprobe = 48 }
+  split = "test"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.99 not reached. The best is {"nprobe": 768}, recall@10 0.9590, warm p50 527833 us, warm from a line the machine's swapping made invalid
+
+  [[system.warm]]
+  config_id = "b4"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48 },
+  ]
+
+  [[system.warm]]
+  config_id = "b4"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48 },
+  ]
+
+  [[system.warm]]
+  config_id = "b4"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 48 },
+  ]
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9676, warm p50 142143 us, C0 p50 182.38 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "b8"
+  params = { nprobe = 96 }
+  split = "test"
+  trials = 100
+  group = "paimon"
+  dummy_n = 50000
+
+  [[system.warm]]
+  config_id = "b8"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 96 },
+  ]
+
+  [[system.warm]]
+  config_id = "b8"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 96 },
+  ]
+
+  [[system.warm]]
+  config_id = "b8"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 96 },
+  ]
+
+  # 0.90 verdict, the fastest cold of 3: recall@10 0.9022, warm p50 49861 us, C0 p50 68.52 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "b8"
+  params = { nprobe = 32 }
+  split = "test"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  # 0.99 verdict, the fastest cold of 3: recall@10 0.9928, warm p50 375500 us, C0 p50 473.02 ms in 30 tune trials, warm from a line the machine's swapping made invalid
+  [[system.cold]]
+  config_id = "b8"
+  params = { nprobe = 256 }
+  split = "test"
+  trials = 30
+  group = "paimon"
+  dummy_n = 50000
+
+  [[system.warm]]
+  config_id = "b8"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 32 },
+    { nprobe = 256 },
+  ]
+
+  [[system.warm]]
+  config_id = "b8"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 32 },
+    { nprobe = 256 },
+  ]
+
+  [[system.warm]]
+  config_id = "b8"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 32 },
+    { nprobe = 256 },
+  ]
+
+
+
+
+
+
+
+# usearch's HNSW at M 16 with i8 rows, served from its file with view(). Its i8 rows cap recall@10 near 0.84 at 1M.
+#   cell flags: --config i8-m16 --group usearch --dummy-n 50000
+[[system]]
+name = "usearch"
+adapter = "usearch_hnsw"
+
+  [[system.build]]
+  config_id = "i8-m16"
+  config = { dtype = "i8" }
+  threads = 10
+  disk_gb = 10
+  timeout_s = 14400
+
+  [[system.warm]]
+  config_id = "i8-m16"
+  split = "tune"
+  grid = { expansion_search = [16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024] }
+  passes = 3
+  warmup = 1000
+  timeout_s = 7200
+
+  # no target reached. The best tune setting, written by hand as turbovec's are: recall@10 0.8818, warm p50 4262 us
+  [[system.cold]]
+  config_id = "i8-m16"
+  params = { expansion_search = 1024 }
+  split = "test"
+  trials = 30
+  group = "usearch"
+  dummy_n = 50000
+
+  [[system.warm]]
+  config_id = "i8-m16"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { expansion_search = 1024 },
+  ]
+
+  [[system.warm]]
+  config_id = "i8-m16"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { expansion_search = 1024 },
+  ]
+
+  [[system.warm]]
+  config_id = "i8-m16"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { expansion_search = 1024 },
+  ]
+
+
+# faiss's HNSW at M 32 over SQ8 rows, efConstruction 200, opened with its rows mapped.
+#   cell flags: --config hnsw32-sq8 --group faiss-hnsw --dummy-n 50000
+[[system]]
+name = "faiss-hnsw"
+adapter = "faiss_hnsw"
+
+  [[system.build]]
+  config_id = "hnsw32-sq8"
+  config = { m = 32, storage = "sq8", ef_construction = 200 }
+  threads = 10
+  disk_gb = 11
+  timeout_s = 21600
+
+  [[system.warm]]
+  config_id = "hnsw32-sq8"
+  split = "tune"
+  grid = { ef_search = [16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024] }
+  passes = 3
+  warmup = 1000
+  timeout_s = 7200
+
+  # 0.90 screen 1 of 3: recall@10 0.9196, warm p50 346 us
+  [[system.cold]]
+  config_id = "hnsw32-sq8"
+  params = { ef_search = 48 }
+  split = "tune"
+  trials = 30
+  group = "faiss-hnsw"
+  dummy_n = 50000
+
+  # 0.90 screen 2 of 3: recall@10 0.9356, warm p50 426 us
+  [[system.cold]]
+  config_id = "hnsw32-sq8"
+  params = { ef_search = 64 }
+  split = "tune"
+  trials = 30
+  group = "faiss-hnsw"
+  dummy_n = 50000
+
+  # 0.90 screen 3 of 3: recall@10 0.9564, warm p50 622 us
+  [[system.cold]]
+  config_id = "hnsw32-sq8"
+  params = { ef_search = 96 }
+  split = "tune"
+  trials = 30
+  group = "faiss-hnsw"
+  dummy_n = 50000
+
+  # 0.95 screen 2 of 3: recall@10 0.9642, warm p50 808 us
+  [[system.cold]]
+  config_id = "hnsw32-sq8"
+  params = { ef_search = 128 }
+  split = "tune"
+  trials = 30
+  group = "faiss-hnsw"
+  dummy_n = 50000
+
+  # 0.95 screen 3 of 3: recall@10 0.9716, warm p50 1211 us
+  [[system.cold]]
+  config_id = "hnsw32-sq8"
+  params = { ef_search = 192 }
+  split = "tune"
+  trials = 30
+  group = "faiss-hnsw"
+  dummy_n = 50000
+
+  # 0.99 not reached. The best is {"ef_search": 1024}, recall@10 0.9846, warm p50 6157 us
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9564, warm p50 622 us, C0 p50 4597.79 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "hnsw32-sq8"
+  params = { ef_search = 96 }
+  split = "test"
+  trials = 100
+  group = "faiss-hnsw"
+  dummy_n = 50000
+
+  [[system.warm]]
+  config_id = "hnsw32-sq8"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { ef_search = 96 },
+  ]
+
+  [[system.warm]]
+  config_id = "hnsw32-sq8"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { ef_search = 96 },
+  ]
+
+  [[system.warm]]
+  config_id = "hnsw32-sq8"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { ef_search = 96 },
+  ]
+
+  # 0.90 verdict, the fastest cold of 3: recall@10 0.9196, warm p50 346 us, C0 p50 4414.71 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "hnsw32-sq8"
+  params = { ef_search = 48 }
+  split = "test"
+  trials = 30
+  group = "faiss-hnsw"
+  dummy_n = 50000
+
+  # 0.99 not reached. The best is {"ef_search": 1024}, recall@10 0.9846, warm p50 6157 us
+
+  [[system.warm]]
+  config_id = "hnsw32-sq8"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { ef_search = 48 },
+  ]
+
+  [[system.warm]]
+  config_id = "hnsw32-sq8"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { ef_search = 48 },
+  ]
+
+  [[system.warm]]
+  config_id = "hnsw32-sq8"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { ef_search = 48 },
+  ]
+
+
+
+
+# turbovec's flat scan of 4-bit TurboQuant codes, plain and with the library's calibration on 100K rows. It takes no
+# search setting, and at 1M its recall@10 was 0.872, so it reaches none of the targets. Its cells are written here, 30
+# trials each since it loads whole at open, ~3.9 GB at 10M.
+[[system]]
+name = "turbovec"
+adapter = "turbovec"
+
+  [[system.build]]
+  config_id = "b4"
+  config = { bits = 4 }
+  threads = 10
+  disk_gb = 4
+  timeout_s = 3600
+
+  [[system.build]]
+  config_id = "b4-cal"
+  config = { bits = 4, calibrate = 100000 }
+  threads = 10
+  disk_gb = 4
+  timeout_s = 3600
+
+  [[system.warm]]
+  config_id = "b4"
+  split = "tune"
+  settings = [{}]
+  passes = 3
+  warmup = 200
+  timeout_s = 3600
+
+  [[system.warm]]
+  config_id = "b4-cal"
+  split = "tune"
+  settings = [{}]
+  passes = 3
+  warmup = 200
+  timeout_s = 3600
+
+  [[system.cold]]
+  config_id = "b4"
+  params = {}
+  split = "test"
+  trials = 30
+  group = "turbovec"
+  dummy_n = 50000
+
+  [[system.cold]]
+  config_id = "b4-cal"
+  params = {}
+  split = "test"
+  trials = 30
+  group = "turbovec"
+  dummy_n = 50000
+
+  [[system.warm]]
+  config_id = "b4"
+  split = "test"
+  passes = 3
+  warmup = 200
+  settings = [
+    {},
+  ]
+
+  [[system.warm]]
+  config_id = "b4"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 200
+  settings = [
+    {},
+  ]
+
+  [[system.warm]]
+  config_id = "b4"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 200
+  settings = [
+    {},
+  ]
+
+  [[system.warm]]
+  config_id = "b4-cal"
+  split = "test"
+  passes = 3
+  warmup = 200
+  settings = [
+    {},
+  ]
+
+  [[system.warm]]
+  config_id = "b4-cal"
+  split = "test"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 200
+  settings = [
+    {},
+  ]
+
+  [[system.warm]]
+  config_id = "b4-cal"
+  split = "test"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 200
+  settings = [
+    {},
+  ]
+
+
+
+# LanceDB's IVF_RQ at 1 bit, with Lance's own partitions, rescored from the table's float32 rows. Its table holds a
+# copy of every row, ~32 GB in all, so it runs last and alone, beside ColdIVF's index. Warm runs in mode
+# "index", with the index files cached and the table left on disk, apart from the rows the warm-up queries rescore. Its
+# cold cells run on Lance's default pool of 10 threads.
+#   cell flags: --config rq1-default --group lancedb --threads 10 --dummy-n 50000
+[[system]]
+name = "lancedb"
+adapter = "lancedb"
+python = "${COLDIVF_BENCH_VENVS}/venv-lance13/bin/python3"
+
+  [[system.build]]
+  config_id = "rq1-default"
+  config = { index = "ivf_rq", bits = 1 }
+  threads = 10
+  disk_gb = 31
+  timeout_s = 10800
+
+  [[system.warm]]
+  config_id = "rq1-default"
+  split = "tune"
+  mode = "index"
+  grid = { nprobes = [12, 16, 24, 32, 48, 64, 96, 128, 192, 256], refine_factor = [4, 8, 16, 32] }
+  passes = 3
+  warmup = 200
+  timeout_s = 14400
+
+  # 0.90 screen 1 of 3: recall@10 0.9748, warm p50 5225 us
+  [[system.cold]]
+  config_id = "rq1-default"
+  params = { nprobes = 64, refine_factor = 8 }
+  split = "tune"
+  trials = 30
+  group = "lancedb"
+  threads = 10
+  dummy_n = 50000
+
+  # 0.90 screen 2 of 3: recall@10 0.9442, warm p50 7954 us
+  [[system.cold]]
+  config_id = "rq1-default"
+  params = { nprobes = 32, refine_factor = 16 }
+  split = "tune"
+  trials = 30
+  group = "lancedb"
+  threads = 10
+  dummy_n = 50000
+
+  # 0.90 screen 3 of 3: recall@10 0.9252, warm p50 8483 us
+  [[system.cold]]
+  config_id = "rq1-default"
+  params = { nprobes = 24, refine_factor = 32 }
+  split = "tune"
+  trials = 30
+  group = "lancedb"
+  threads = 10
+  dummy_n = 50000
+
+  # 0.95 screen 2 of 3: recall@10 0.9630, warm p50 9364 us
+  [[system.cold]]
+  config_id = "rq1-default"
+  params = { nprobes = 48, refine_factor = 8 }
+  split = "tune"
+  trials = 30
+  group = "lancedb"
+  threads = 10
+  dummy_n = 50000
+
+  # 0.95 screen 3 of 3: recall@10 0.9766, warm p50 9583 us
+  [[system.cold]]
+  config_id = "rq1-default"
+  params = { nprobes = 64, refine_factor = 16 }
+  split = "tune"
+  trials = 30
+  group = "lancedb"
+  threads = 10
+  dummy_n = 50000
+
+  # 0.99 screen 1 of 3: recall@10 0.9916, warm p50 11019 us
+  [[system.cold]]
+  config_id = "rq1-default"
+  params = { nprobes = 128, refine_factor = 16 }
+  split = "tune"
+  trials = 30
+  group = "lancedb"
+  threads = 10
+  dummy_n = 50000
+
+  # 0.99 screen 2 of 3: recall@10 0.9924, warm p50 11317 us
+  [[system.cold]]
+  config_id = "rq1-default"
+  params = { nprobes = 128, refine_factor = 32 }
+  split = "tune"
+  trials = 30
+  group = "lancedb"
+  threads = 10
+  dummy_n = 50000
+
+  # 0.99 screen 3 of 3: recall@10 0.9970, warm p50 12046 us
+  [[system.cold]]
+  config_id = "rq1-default"
+  params = { nprobes = 192, refine_factor = 16 }
+  split = "tune"
+  trials = 30
+  group = "lancedb"
+  threads = 10
+  dummy_n = 50000
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9630, warm p50 9364 us, C0 p50 29.84 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "rq1-default"
+  params = { nprobes = 48, refine_factor = 8 }
+  split = "test"
+  trials = 100
+  group = "lancedb"
+  threads = 10
+  dummy_n = 50000
+
+  [[system.warm]]
+  config_id = "rq1-default"
+  split = "test"
+  mode = "index"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobes = 48, refine_factor = 8 },
+  ]
+
+  [[system.warm]]
+  config_id = "rq1-default"
+  split = "test"
+  mode = "index"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobes = 48, refine_factor = 8 },
+  ]
+
+  [[system.warm]]
+  config_id = "rq1-default"
+  split = "test"
+  mode = "index"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobes = 48, refine_factor = 8 },
+  ]
+
+  # 0.90 verdict, the fastest cold of 3: recall@10 0.9442, warm p50 7954 us, C0 p50 28.91 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "rq1-default"
+  params = { nprobes = 32, refine_factor = 16 }
+  split = "test"
+  trials = 30
+  group = "lancedb"
+  threads = 10
+  dummy_n = 50000
+
+  # 0.99 verdict, the fastest cold of 3: recall@10 0.9916, warm p50 11019 us, C0 p50 45.92 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "rq1-default"
+  params = { nprobes = 128, refine_factor = 16 }
+  split = "test"
+  trials = 30
+  group = "lancedb"
+  threads = 10
+  dummy_n = 50000
+
+  [[system.warm]]
+  config_id = "rq1-default"
+  split = "test"
+  mode = "index"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobes = 32, refine_factor = 16 },
+    { nprobes = 128, refine_factor = 16 },
+  ]
+
+  [[system.warm]]
+  config_id = "rq1-default"
+  split = "test"
+  mode = "index"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobes = 32, refine_factor = 16 },
+    { nprobes = 128, refine_factor = 16 },
+  ]
+
+  [[system.warm]]
+  config_id = "rq1-default"
+  split = "test"
+  mode = "index"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { nprobes = 32, refine_factor = 16 },
+    { nprobes = 128, refine_factor = 16 },
+  ]

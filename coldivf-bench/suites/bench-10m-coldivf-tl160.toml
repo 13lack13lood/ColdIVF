@@ -1,0 +1,108 @@
+# One of the two ColdIVF builds for the 10M head-to-head in bench-10m.toml, two-level clustering with the cluster anchor
+# at 160 vectors per list. bench-10m-coldivf-tl640.toml holds the other, at 640. A 10M build writes a 30.7 GB copy of
+# the base while it clusters, so only one of them is on disk at a time. Each gets the same tuning budget, one build and
+# 40 warm settings on the tune split, with 10 values of nprobe at most 1.5 times apart and the settings that reach
+# recall@10 0.90 to its ceiling of ~0.986. Its true-cold (C0) cells then time the three cheapest settings by warm p50
+# that reach 0.90 and 0.95 on the tune split, 30 trials each. The build that is faster cold at 0.95 goes to
+# bench-10m.toml. Both write to the bench-10m phase, so their lines sit beside the head-to-head's.
+#
+# Run from coldivf-bench/py, one stage at a time:
+#   driver.py ../suites/bench-10m-coldivf-tl160.toml --only build --gate warn
+#   driver.py ../suites/bench-10m-coldivf-tl160.toml --only warm --gate warn
+#   driver.py ../suites/bench-10m-coldivf-tl160.toml --only cold,refs
+# The cold stage enforces the timing gate, which reads the job gate's lock folder from $COLDIVF_BENCH_LOCKS.
+
+phase = "bench-10m"
+dataset = "cohere10m-768-cosine"
+n = 10000000
+index_root = "data/bench.noindex/bench-10m"
+truth = "data/cohere10m-768-cosine-10000000.gt.ibin"
+seed = 1
+k = 10
+max_attempts = 3
+
+[gate]
+mode = "enforce"
+max_wait_s = 7200
+
+[refs]
+mode = "on"
+coldivf_index = "data/cohere-50k.coldivf"
+coldivf_dataset = "cohere-768-cosine"
+coldivf_n = 50000
+coldivf_params = { nprobe = 32, rerank = 39 }
+
+[[system]]
+name = "coldivf"
+adapter = "coldivf"
+
+  [[system.build]]
+  config_id = "tl160"
+  config = { clustering = "two-level", vectors_per_list = 160, anchor = "cluster", export_clusters = true }
+  threads = 10
+  disk_gb = 31
+  timeout_s = 7200
+
+  [[system.warm]]
+  config_id = "tl160"
+  split = "tune"
+  grid = { nprobe = [96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048], rerank = [29, 39, 64] }
+  settings = [
+    { nprobe = 192, rerank = 20 }, { nprobe = 256, rerank = 100 }, { nprobe = 384, rerank = 100 },
+    { nprobe = 512, rerank = 100 }, { nprobe = 768, rerank = 100 }, { nprobe = 1024, rerank = 100 },
+    { nprobe = 1536, rerank = 100 }, { nprobe = 2048, rerank = 200 }, { nprobe = 3072, rerank = 200 },
+    { nprobe = 4096, rerank = 200 },
+  ]
+  passes = 3
+  warmup = 1000
+  timeout_s = 5400
+
+  # 0.90 screen 1 of 3: warm recall@10 0.9032 at p50 868 us
+  [[system.cold]]
+  config_id = "tl160"
+  params = { nprobe = 96, rerank = 29 }
+  split = "tune"
+  trials = 30
+  dummy_n = 200000
+
+  # 0.90 screen 2 of 3: warm recall@10 0.9090 at p50 889 us
+  [[system.cold]]
+  config_id = "tl160"
+  params = { nprobe = 96, rerank = 39 }
+  split = "tune"
+  trials = 30
+  dummy_n = 200000
+
+  # 0.90 screen 3 of 3: warm recall@10 0.9220 at p50 941 us
+  [[system.cold]]
+  config_id = "tl160"
+  params = { nprobe = 128, rerank = 39 }
+  split = "tune"
+  trials = 30
+  dummy_n = 200000
+
+  # 0.95 screen 1 of 3: warm recall@10 0.9508 at p50 1261 us
+  [[system.cold]]
+  config_id = "tl160"
+  params = { nprobe = 256, rerank = 100 }
+  split = "tune"
+  trials = 30
+  dummy_n = 200000
+
+  # 0.95 screen 2 of 3: warm recall@10 0.9572 at p50 1303 us
+  [[system.cold]]
+  config_id = "tl160"
+  params = { nprobe = 384, rerank = 39 }
+  split = "tune"
+  trials = 30
+  dummy_n = 200000
+
+  # 0.95 screen 3 of 3: warm recall@10 0.9608 at p50 1360 us
+  [[system.cold]]
+  config_id = "tl160"
+  params = { nprobe = 384, rerank = 64 }
+  split = "tune"
+  trials = 30
+  dummy_n = 200000
+
+  # 0.99 not reached. The best is {"nprobe": 4096, "rerank": 200}, warm recall@10 0.9850 at p50 6978 us

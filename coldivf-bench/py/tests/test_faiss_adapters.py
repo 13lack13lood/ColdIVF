@@ -281,27 +281,53 @@ class AdapterTest(unittest.TestCase):
         return ServeContext(index=path, dataset=self.ds, rows=2000, k=10, metric="cosine", threads=1,
                             variant=a.variant, params=params)
 
-    def test_shared_clusters_keep_their_assignment(self):
-        import faiss
-
+    def shared_clusters(self) -> tuple[Path, np.ndarray]:
+        """12 clusters of random rows, so no row's cluster need be its nearest, as the stem of shared clusters."""
         rng = np.random.default_rng(4)
         assign = rng.integers(0, 12, 2000).astype(np.int32)
         stem = self.root / "shared"
         centroids = np.stack([np.asarray(self.ds.base[:2000])[assign == c].mean(axis=0) for c in range(12)])
         data.write_fbin(f"{stem}.centroids.fbin", centroids)
         data.write_ibin(f"{stem}.assign.ibin", assign[:, None])
-        a = self.adapter(faiss_ivf.FaissIVF, "shipped")
-        out = self.build(a, {}, "shared", clusters=stem)
-        meta = fc.read_meta(out)
-        self.assertEqual((meta["nlist"], meta["clusters"]), (12, str(stem)))
-        h = a.open(self.serve(a, out, {"nprobe": 12}), out)
+        return stem, assign
 
-        for c in range(12):
-            n = int(h.ivf.invlists.list_size(c))
-            ids = faiss.rev_swig_ptr(h.ivf.invlists.get_ids(c), n).copy() if n else np.zeros(0)
-            self.assertEqual(sorted(ids.tolist()), np.flatnonzero(assign == c).tolist())
+    def test_shared_clusters_keep_their_assignment(self):
+        import faiss
 
-        a.close(h)
+        stem, assign = self.shared_clusters()
+
+        # The FastScan layout is filled as the plain one, here in adds of 300 rows, then copied into FastScan blocks.
+        for variant, config in (("shipped", {}), ("fastscan", {"chunk_rows": 300})):
+            a = self.adapter(faiss_ivf.FaissIVF, variant)
+            out = self.build(a, config, f"shared-{variant}", clusters=stem)
+            meta = fc.read_meta(out)
+            self.assertEqual((meta["nlist"], meta["clusters"]), (12, str(stem)))
+            h = a.open(self.serve(a, out, {"nprobe": 12}), out)
+
+            for c in range(12):
+                n = int(h.ivf.invlists.list_size(c))
+                ids = faiss.rev_swig_ptr(h.ivf.invlists.get_ids(c), n).copy() if n else np.zeros(0)
+                self.assertEqual(sorted(ids.tolist()), np.flatnonzero(assign == c).tolist(), variant)
+
+            a.close(h)
+
+    def test_fastscan_on_shared_clusters_finds_what_the_plain_layout_finds(self):
+        # faiss's FastScan add_core stored codes outside the FastScan blocks, so a build on given lists found almost
+        # none of the plain layout's results. Both probe every list here and rescore the same SQ8 rows.
+        stem, _ = self.shared_clusters()
+        params = {"nprobe": 12, "k_factor": 4}
+        found = {}
+
+        for variant in ("shipped", "fastscan"):
+            a = self.adapter(faiss_ivf.FaissIVF, variant)
+            out = self.build(a, {"chunk_rows": 300}, f"agree-{variant}", clusters=stem)
+            h = a.open(self.serve(a, out, params), out)
+            found[variant] = [set(a.search(h, np.asarray(q, dtype=np.float32), 10, params).tolist())
+                              for q in self.ds.queries]
+            a.close(h)
+
+        same = sum(len(x & y) for x, y in zip(found["shipped"], found["fastscan"]))
+        self.assertGreaterEqual(same, 0.9 * 10 * len(self.ds.queries))
 
     def test_batched_search_matches_the_shipped_search(self):
         shipped = self.adapter(faiss_ivf.FaissIVF, "shipped")

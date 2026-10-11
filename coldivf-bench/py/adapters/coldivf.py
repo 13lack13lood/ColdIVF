@@ -34,6 +34,7 @@ import numpy as np
 
 from adapters.base import Adapter, BuildContext, ServeContext, Unsupported, main
 import data
+import rusage
 import schema
 
 REPO = Path(__file__).resolve().parents[3]
@@ -47,7 +48,10 @@ SEARCH_FLAGS = {"nprobe": "--nprobe", "rerank": "--rerank", "reach": "--reach"}
 
 # Build settings that only some builds of build_index take, with the text that shows a binary takes it. The binaries
 # ignore flags they don't know, so a setting a binary lacks would build the default without a word.
-NEWER_BUILD_FLAGS = {"anchor": b"--anchor must"}
+NEWER_BUILD_FLAGS = {"anchor": b"--anchor must", "export_clusters": b"export-clusters"}
+
+# The stem of the partition a build with export_clusters saves, in a folder beside its index folder.
+CLUSTERS_STEM = "partition"
 
 # The text of an error message that only a cold binary of this harness holds, one that checks each index file's vector
 # count, waits for the vector as the other systems do and reports its footprints. An older binary would search other
@@ -118,6 +122,15 @@ def flags(params: dict, table: dict[str, str], what: str) -> list[str]:
             out += [table[key], str(value).lower() if isinstance(value, bool) else str(value)]
 
     return out
+
+
+def clusters_stem(out: Path | str) -> Path:
+    """Where a build into the folder `out` saves its partition when its config sets export_clusters, as the files
+    `<stem>.centroids.fbin`, `<stem>.assign.ibin`, `<stem>.parents.fbin` and `<stem>.parent_of.ibin`, which another
+    system's build takes as its shared clusters. They go in a folder beside `out`, so the index folder holds the index
+    alone and a dummy build of the same config saves its own."""
+    out = Path(out)
+    return out.with_name(f"{out.name}.clusters") / CLUSTERS_STEM
 
 
 def _fresh(target: Path, source: Path) -> bool:
@@ -252,16 +265,28 @@ class ColdIVF(Adapter):
 
         out = ctx.out / "index.coldivf"
         binary = self.binary("build_index")
+        config = dict(ctx.config)
+        export = config.pop("export_clusters", False)
+
+        if not isinstance(export, bool):
+            raise ValueError(f"export_clusters is true or false, not {export!r}")
 
         for key, marker in NEWER_BUILD_FLAGS.items():
-            if key in ctx.config and not offers(binary, marker):
+            if ctx.config.get(key) not in (None, False) and not offers(binary, marker):
                 raise Unsupported(f"this build_index takes no {key}")
+
+        stem = clusters_stem(ctx.out) if export else None
 
         with tempfile.TemporaryDirectory(prefix="coldivf-build-") as tmp:
             results = Path(tmp) / "build.jsonl"
             cmd = [str(binary), "--dataset", ctx.dataset.name, "--n", str(ctx.rows), "--out",
                    str(out), "--threads", str(ctx.threads), "--seed", str(ctx.seed), "--results", str(results),
-                   *flags(ctx.config, BUILD_FLAGS, "build setting")]
+                   *flags(config, BUILD_FLAGS, "build setting")]
+
+            if stem is not None:
+                stem.parent.mkdir(parents=True, exist_ok=True)
+                cmd += ["--export-clusters", str(stem)]
+
             done = self.run_child(cmd, env=self.env(ctx.dataset.root), capture=False)
 
             if done.returncode != 0:
@@ -277,10 +302,14 @@ class ColdIVF(Adapter):
             "peak_footprint": line.get("peak_footprint"),
             "bytes_read": line.get("disk_read"),
             "bytes_written": line.get("disk_written"),
+            "cluster_seconds": line.get("cluster_seconds"),
+            "encode_seconds": line.get("encode_seconds"),
             "stored_vector_bytes": ctx.rows * ctx.dim,
             "exact_f32_stored": False,
             "extra": {k: line.get(k) for k in ("commit", "dirty", "built", "index_crc", "index_epoch", "input_bytes",
-                                               "clustering", "vectors_per_list", "parents", "order", "page_size")},
+                                               "clustering", "vectors_per_list", "parents", "order", "page_size",
+                                               "nlist", "nparents", "export_seconds")}
+                     | {"export_clusters": str(stem) if stem is not None else None},
         }
 
     def files(self, path: Path) -> list[dict]:
@@ -326,7 +355,11 @@ class ColdIVF(Adapter):
                 cmd = [str(self.binary("warm")), "--index", str(file), "--dataset", name, "--n", str(ctx.rows),
                        "--k", str(ctx.k), "--queries", str(len(qids)), "--results", str(results), *more,
                        *flags(params, SEARCH_FLAGS, "search setting")]
+                # The machine's swap-ins and compressions over the binary's whole run, since it doesn't say when its
+                # timed passes start. So its warm-up counts too, which only makes the check stricter.
+                vm_before = rusage.vm_counts()
                 done, used = self.run_measured(cmd, env=self.env(root))
+                vm = rusage.vm_delta(vm_before, rusage.vm_counts())
 
                 if done.returncode != 0:
                     raise RuntimeError(f"warm exited with {done.returncode}")
@@ -338,7 +371,9 @@ class ColdIVF(Adapter):
             # The binary's whole process, at its peak, which is all of the warm run's memory besides the page cache.
             footprint = used.lifetime_max_footprint or None
             fields.update(self._memory(ctx, footprint) | {"footprint": footprint})
+            fields.update(swapins_delta=vm["swapins"], compressions_delta=vm["compressions"])
             fields["extra"]["footprint_source"] = "the warm binary's whole process, at its peak"
+            fields["extra"]["vm_window"] = "the warm binary's whole run, its warm-up included"
             yield {"params": params, "fields": fields, "ids_file": None}
 
     def warm_fields(self, ctx: ServeContext, line: dict, free: dict[int, bool]) -> dict:

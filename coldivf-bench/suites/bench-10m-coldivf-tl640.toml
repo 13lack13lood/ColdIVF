@@ -1,0 +1,104 @@
+# One of the two ColdIVF builds for the 10M head-to-head in bench-10m.toml, two-level clustering with the cluster anchor
+# at 640 vectors per list. bench-10m-coldivf-tl160.toml holds the other, at 160, and says how the two are compared. A
+# list holds 4 times the vectors of one at 160, so the same recall takes about a quarter of the probes, and the grid's
+# nprobe values are lower to match.
+#
+# Run from coldivf-bench/py, one stage at a time, once the 160 build is off the disk:
+#   driver.py ../suites/bench-10m-coldivf-tl640.toml --only build --gate warn
+#   driver.py ../suites/bench-10m-coldivf-tl640.toml --only warm --gate warn
+#   driver.py ../suites/bench-10m-coldivf-tl640.toml --only cold,refs
+
+phase = "bench-10m"
+dataset = "cohere10m-768-cosine"
+n = 10000000
+index_root = "data/bench.noindex/bench-10m"
+truth = "data/cohere10m-768-cosine-10000000.gt.ibin"
+seed = 1
+k = 10
+max_attempts = 3
+
+[gate]
+mode = "enforce"
+max_wait_s = 7200
+
+[refs]
+mode = "on"
+coldivf_index = "data/cohere-50k.coldivf"
+coldivf_dataset = "cohere-768-cosine"
+coldivf_n = 50000
+coldivf_params = { nprobe = 32, rerank = 39 }
+
+[[system]]
+name = "coldivf"
+adapter = "coldivf"
+
+  [[system.build]]
+  config_id = "tl640"
+  config = { clustering = "two-level", vectors_per_list = 640, anchor = "cluster", export_clusters = true }
+  threads = 10
+  disk_gb = 31
+  timeout_s = 7200
+
+  [[system.warm]]
+  config_id = "tl640"
+  split = "tune"
+  grid = { nprobe = [32, 48, 64, 96, 128, 192, 256, 384, 512, 768], rerank = [29, 39, 64] }
+  settings = [
+    { nprobe = 96, rerank = 20 }, { nprobe = 128, rerank = 20 }, { nprobe = 192, rerank = 100 },
+    { nprobe = 256, rerank = 100 }, { nprobe = 384, rerank = 100 }, { nprobe = 512, rerank = 100 },
+    { nprobe = 768, rerank = 100 }, { nprobe = 1024, rerank = 200 }, { nprobe = 1536, rerank = 200 },
+    { nprobe = 2048, rerank = 200 },
+  ]
+  passes = 3
+  warmup = 1000
+  timeout_s = 5400
+
+  # 0.90 screen 1 of 3: warm recall@10 0.9078 at p50 415 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 64, rerank = 29 }
+  split = "tune"
+  trials = 30
+  dummy_n = 200000
+
+  # 0.90 screen 2 of 3: warm recall@10 0.9036 at p50 422 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 48, rerank = 64 }
+  split = "tune"
+  trials = 30
+  dummy_n = 200000
+
+  # 0.90 screen 3 of 3: warm recall@10 0.9152 at p50 452 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 64, rerank = 39 }
+  split = "tune"
+  trials = 30
+  dummy_n = 200000
+
+  # 0.95 screen 1 of 3: warm recall@10 0.9522 at p50 812 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 192, rerank = 39 }
+  split = "tune"
+  trials = 30
+  dummy_n = 200000
+
+  # 0.95 screen 2 of 3: warm recall@10 0.9604 at p50 873 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 192, rerank = 64 }
+  split = "tune"
+  trials = 30
+  dummy_n = 200000
+
+  # 0.95 screen 3 of 3: warm recall@10 0.9634 at p50 911 us
+  [[system.cold]]
+  config_id = "tl640"
+  params = { nprobe = 192, rerank = 100 }
+  split = "tune"
+  trials = 30
+  dummy_n = 200000
+
+  # 0.99 not reached. The best is {"nprobe": 2048, "rerank": 200}, warm recall@10 0.9856 at p50 6579 us

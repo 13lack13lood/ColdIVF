@@ -20,6 +20,11 @@ then to_lance, which opens the dataset a second time. Every line records the pat
 index's model, its centroids and metadata, loaded, so nearly every partition comes from the files again on every query.
 analyze_plan runs only in runs of its own, once per warm setting after the timed passes and in cold cells whose params
 hold {"analyze": true}.
+
+A warm run in mode "whole" reads every file first, as for every system. Mode "index" reads only the index's own files,
+under the table's _indices folder, and leaves the table's data files to the queries. It is the warm state of a table
+too large to cache whole, eg. the 30.7 GB of vectors at 10M rows. The warm-up searches then leave the refine rows and
+ids of the queries they search cached, and nothing else of the table.
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ from typing import Any, Iterator
 
 import numpy as np
 
-from adapters.base import Adapter, BuildContext, ServeContext, Unsupported, main
+from adapters.base import Adapter, BuildContext, ServeContext, Unsupported, main, read_except
 import data
 import schema
 
@@ -519,6 +524,23 @@ class LanceDB(Adapter):
             self.metas[key] = read_meta(path)
 
         return self.metas[key]
+
+    def warm_up(self, handle: Any, ctx: ServeContext) -> None:
+        """Reads every file in mode "whole", as the base class does. Mode "index" reads only the files under the
+        table's _indices folder, apart from the ranges Lance copies into its caches, and leaves the data files to the
+        queries."""
+        if ctx.mode != "index":
+            super().warm_up(handle, ctx)
+            return
+
+        root = Path(ctx.index)
+
+        for spec in self.files(root):
+            if "_indices" not in Path(spec["path"]).relative_to(root).parts:
+                continue
+
+            skip = [(int(r["offset"]), int(r["offset"]) + int(r["length"])) for r in spec["ranges"] if r.get("loaded")]
+            read_except(spec["path"], skip)
 
     def files(self, path: Path) -> list[dict]:
         """Every file of the index folder. The routing files are also "loaded", since Lance reads them into its own
