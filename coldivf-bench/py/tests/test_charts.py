@@ -378,8 +378,9 @@ class HeadToHeadChartsTest(unittest.TestCase):
                          [("ColdIVF", 410.0), ("faiss IVF", 2100.0)])
         qps = self.by_id["qps-10m"]["boards"][1]
         self.assertEqual([(r["label"], r["qps"]) for r in qps["rows"]], [("ColdIVF", 5000.0)])
-        self.assertEqual({r["label"] for r in self.by_id["warm-10m"]["boards"][2]["not_reached"]},
-                         {"ColdIVF", "faiss IVF", "turbovec"})
+        # No panel for recall@10 0.99, which ColdIVF doesn't reach, since a panel without it compares nothing.
+        self.assertEqual([b["recall10"] for b in self.by_id["warm-10m"]["boards"]], [0.90, 0.95])
+        self.assertEqual([b["recall10"] for b in self.by_id["qps-10m"]["boards"]], [0.90, 0.95])
 
     def test_memory_counts_the_process_and_the_index_pages(self):
         rows = {r["label"]: r for r in self.by_id["memory-10m"]["rows"]}

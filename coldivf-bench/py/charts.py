@@ -1080,7 +1080,10 @@ def h2h_charts(suite_path: Path, repo: Path) -> tuple[list[dict], dict]:
         rows = one_per_system(h2h_warm_rows(data["targets"][t], value), key)
         return {"recall10": t, "rows": rows, "not_reached": missing(rows)}
 
-    boards = {value: [board(t, value) for t in headtohead.TARGETS] for value in ("p50_us", "qps")}
+    # Only the targets ColdIVF reaches, since a panel without ColdIVF compares nothing the README is about (user,
+    # 2026-10-11), eg. recall@10 0.99 at 10M.
+    reached = [t for t in headtohead.TARGETS if any(r["system"] == "coldivf" for r in data["targets"][t]["rows"])]
+    boards = {value: [board(t, value) for t in reached] for value in ("p50_us", "qps")}
     common = {"dataset": dataset, "n": n, "preliminary": False, "not_reached_text": "Not reached",
               "layout": {"label_w": 100.0, "plot_w": 88.0, "value_w": 42.0}, "left_out": []}
     charts.append({
