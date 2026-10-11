@@ -59,7 +59,7 @@ NAMES = {
     "coldivf": "ColdIVF",
     "faiss-ivf": "faiss IVF RaBitQ",
     "faiss-hnsw": "faiss HNSW SQ8",
-    "usearch": "usearch HNSW i8",
+    "usearch": "usearch HNSW f16",
     "qdrant-edge": "qdrant-edge",
     "astervec": "AsterVec",
     "diskann": "DiskANN",
@@ -87,6 +87,11 @@ CELLS = {
 }
 
 CPU_STATES = {"prewarm": "prewarmed core", "idle": "idle core"}
+
+# The variant of a system that the smoke charts show, where the suite runs it more than one way. ColdIVF's python
+# variant searches through its Python module in the adapter's process, as every other system searches through its
+# binding, while its variant "" runs the release binaries, for comparing ColdIVF with itself.
+SMOKE_VARIANTS = {"coldivf": "python"}
 
 # The quiet run's jobs that time ColdIVF through its own cold binary: the job, the chart group, the read mode and the
 # row's label. The read waves are ColdIVF's own path. The rest show how its first query changes with what came before
@@ -255,11 +260,12 @@ def code_of(lines: list[dict], repo: Path | None = None) -> dict | list[dict] | 
     return records[0] if len(records) == 1 else records or None
 
 
-def smoke_pick(lines: list[dict], system: str, dataset: str, n: int) -> dict:
-    """One system's smoke lines at `dataset` and `n`: the warm settings and the C0 trials of its newest batch of each,
-    and the build of the index they searched. Older batches, lines that aren't ok and dummy builds are left out."""
+def smoke_pick(lines: list[dict], system: str, dataset: str, n: int, variant: str = "") -> dict:
+    """One system's smoke lines at `dataset` and `n` of its `variant`: the warm settings and the C0 trials of its
+    newest batch of each, and the build of the index they searched. Older batches, lines that aren't ok and dummy
+    builds are left out."""
     ok = [line for line in lines if line.get("system") == system and line.get("status") == "ok"
-          and line.get("dataset") == dataset and line.get("n") == n]
+          and line.get("dataset") == dataset and line.get("n") == n and (line.get("variant") or "") == variant]
     warm = newest_batch([line for line in ok if line.get("kind") == "warm" and line.get("threads") == 1
                          and line.get("p50_us") is not None])
     cold = largest_cell(newest_batch([line for line in ok if line.get("kind") == "cold" and line.get("regime") == "c0"
@@ -704,6 +710,9 @@ def against_coldivf(curve: dict, ours: dict) -> dict:
     points = [p for p in curve["points"] if p.get("recall10") is not None]
     calls = [p["overhead_us"] for p in points if p.get("overhead_us") is not None]
     usable = bool(calls) and max(calls) < min(p["p50_us"] for p in points)
+    # ColdIVF's own call, once it runs through its binding, comes out of its time too. Its binaries pay none.
+    mine = [p["overhead_us"] for p in ours["points"] if p.get("overhead_us")]
+    own = max(mine) if mine and max(mine) < min(p["p50_us"] for p in ours["points"]) else 0.0
     out = []
 
     for p in sorted(points, key=lambda p: p["recall10"]):
@@ -715,7 +724,8 @@ def against_coldivf(curve: dict, ours: dict) -> dict:
         call = p.get("overhead_us")
         out.append({"setting": p["setting"], "recall10": p["recall10"], "p50_us": p["p50_us"],
                     "coldivf_p50_us": base, "ratio": p["p50_us"] / base,
-                    "ratio_less_call": (p["p50_us"] - call) / base if usable and call is not None else None})
+                    "ratio_less_call": (p["p50_us"] - call) / (base - own) if usable and call is not None
+                    else None})
 
     return {"call_us": span(calls), "call_longer_than_a_search": bool(calls) and not usable, "points": out}
 
@@ -784,7 +794,7 @@ def smoke_charts(suite_path: Path, repo: Path) -> tuple[dict, dict, dict, list[s
         path = root / f"{system}.jsonl"
         lines = read_lines(path)
         everything += lines
-        pick = smoke_pick(lines, system, dataset, n)
+        pick = smoke_pick(lines, system, dataset, n, SMOKE_VARIANTS.get(system, ""))
         label = NAMES.get(system, system)
         source = rel(path, repo)
 
@@ -796,7 +806,8 @@ def smoke_charts(suite_path: Path, repo: Path) -> tuple[dict, dict, dict, list[s
             settings = [w.get("search_params") or {} for w in pick["warm"]]
             curves.append({
                 "system": system, "label": label, "dataset": dataset, "n": n, "knob": knob(settings),
-                "source": source, "machine_state": driver_state(pick["warm"]), "code": code_of(pick["warm"], repo),
+                "binding": pick["warm"][0].get("binding"), "source": source,
+                "machine_state": driver_state(pick["warm"]), "code": code_of(pick["warm"], repo),
                 "points": [{"setting": w.get("search_params") or {}, "p50_us": w["p50_us"], "p99_us": w.get("p99_us"),
                             "qps": w.get("qps"), "recall10": w.get("recall10"), "queries": w.get("queries"),
                             "passes": w.get("passes"), "overhead_us": w.get("overhead_us")} for w in pick["warm"]],
@@ -859,8 +870,7 @@ def smoke_charts(suite_path: Path, repo: Path) -> tuple[dict, dict, dict, list[s
         "unit": "microseconds",
         "notes": [f"The smoke grids run at 1 thread over {queries} queries of {dataset}'s tune split, each index "
                   "read into memory first.", busy,
-                  "The times of the Python adapters are raw, so they include the binding's per-call cost, which "
-                  "ColdIVF's binary doesn't pay. Each point's overhead_us is the median time of one call on a "
+                  binding_note(curves) + " Each point's overhead_us is the median time of one call on a "
                   "1,000-vector index, which holds that cost and a small search.",
                   "against_coldivf compares each point with ColdIVF's p50 at the same recall, linear in the log of the "
                   "latency between the two settings of ColdIVF's grid around it. ratio_less_call takes that call's "
@@ -889,8 +899,7 @@ def smoke_charts(suite_path: Path, repo: Path) -> tuple[dict, dict, dict, list[s
         "notes": ["Cold is the footprint the open and the first query add to the trial's process, the median of its "
                   "C0 trials.",
                   "Warm is at the cold setting, after reading every index file. It is the process memory the index "
-                  "adds, from footprint_since_open for Python adapters and the whole binary for ColdIVF, plus the "
-                  "index's pages in the page cache.",
+                  f"adds, {process_note(memory)}, plus the index's pages in the page cache.",
                   f"Build is the peak footprint of the build process, on {build_threads} threads.",
                   "Disk is the index's bytes over its vectors."],
         "rows": memory,
@@ -899,6 +908,29 @@ def smoke_charts(suite_path: Path, repo: Path) -> tuple[dict, dict, dict, list[s
         chart["notes"] = [note for note in chart["notes"] if note]
 
     return warm, cold, mem, missing, machine_record(everything)
+
+
+def binding_note(curves: list[dict]) -> str:
+    """How the warm times hold each binding's per-call cost, by whether ColdIVF ran through its Python module too."""
+    ours = next((c for c in curves if c["system"] == "coldivf"), {})
+
+    if ours.get("binding") == "python":
+        return ("Every system runs through its Python binding, in the adapter's process, and the times are raw, so "
+                "each holds its binding's per-call cost.")
+
+    return ("The times of the Python adapters are raw, so they include each binding's per-call cost, which ColdIVF's "
+            "binary doesn't pay.")
+
+
+def process_note(rows: list[dict]) -> str:
+    """Where the warm process memory of each system in the memory chart comes from."""
+    whole = [r["label"] for r in rows if r["warm"] and r["warm"]["process_source"] != "footprint_since_open"]
+
+    if not whole:
+        return "from each process's footprint since the open, which leaves out the interpreter"
+
+    return (f"from the footprint since the open, which leaves out the interpreter, and for {', '.join(whole)} the "
+            "whole process")
 
 
 def busy_note(states: list[dict], ours: list[bool]) -> str:
@@ -1262,8 +1294,7 @@ def draw_warm_leaderboard(data: dict, chart: dict, t: dict, path: Path) -> None:
     m = _mpl()
     boards, curves = chart["boards"], chart["curves"]
     points = [p for c in curves for p in c["points"]]
-    calls = [p["overhead_us"] for c in curves if c["system"] != "coldivf" for p in c["points"]
-             if p.get("overhead_us")]
+    calls = [p["overhead_us"] for c in curves for p in c["points"] if p.get("overhead_us")]
     busy = busy_note([c["machine_state"] for c in curves], [c["system"] == "coldivf" for c in curves])
     foot = []
 
@@ -1273,9 +1304,8 @@ def draw_warm_leaderboard(data: dict, chart: dict, t: dict, path: Path) -> None:
                     + ".")
 
     if calls:
-        foot.append(f"The times of the Python adapters are raw, so they include each binding's per-call cost, which "
-                    f"ColdIVF's binary doesn't pay. One call on a 1,000-vector index takes them {fmt_us(min(calls))} "
-                    f"to {fmt_us(max(calls))}.")
+        foot.append(f"{binding_note(curves)} One call on a 1,000-vector index takes them {fmt_us(min(calls))} to "
+                    f"{fmt_us(max(calls))}.")
 
     if busy:
         foot.append(busy)
@@ -1435,8 +1465,8 @@ def draw_memory(data: dict, chart: dict, t: dict, path: Path) -> None:
     page = Page(t, f"{chart['title']} (preliminary)", [
         f"First {millions(chart['n'])} rows of {chart['dataset']}, from the smoke runs. Cold is the median "
         f"of {fmt_range([r['cold']['trials'] for r in rows])} trials. Warm is at the cold setting, after every index "
-        "file was read. Python adapters' warm process memory leaves out the interpreter, and ColdIVF's is its whole "
-        f"warm binary. Builds ran on {fmt_range([(r['build'] or {}).get('threads') for r in rows])} threads."
+        f"file was read. Warm process memory comes {process_note(rows)}. Builds ran on "
+        f"{fmt_range([(r['build'] or {}).get('threads') for r in rows])} threads."
     ], 2 * (28 + panel_h + 30) + 6, [f"The indexes that keep every float32 row on disk: {', '.join(exact)}."]
                                      if exact else [])
     panels = [

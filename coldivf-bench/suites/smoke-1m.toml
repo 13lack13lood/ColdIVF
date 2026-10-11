@@ -40,6 +40,36 @@ adapter = "coldivf"
   params = { nprobe = 64, rerank = 39 }
   trials = 5
 
+# ColdIVF through its Python module, in the adapter's process as every other system runs, so its times hold a binding's
+# per-call cost as theirs do, and its cold cell first searches a 5K dummy of its own config, as theirs do. The entry
+# above runs the binaries, for comparing ColdIVF with itself. Build the module into venv-coldivf first with
+# `maturin develop --release` in coldivf-python.
+[[system]]
+name = "coldivf"
+variant = "python"
+adapter = "coldivf_py"
+python = "${COLDIVF_BENCH_VENVS}/venv-coldivf/bin/python3"
+
+  [[system.build]]
+  config_id = "tl160"
+  config = { clustering = "two-level", vectors_per_list = 160 }
+  threads = 4
+  disk_gb = 5
+  timeout_s = 1800
+
+  [[system.warm]]
+  config_id = "tl160"
+  grid = { nprobe = [16, 32, 64, 128, 256], rerank = [39] }
+  passes = 2
+  warmup = 200
+  timeout_s = 1800
+
+  [[system.cold]]
+  config_id = "tl160"
+  params = { nprobe = 64, rerank = 39 }
+  trials = 5
+  dummy_n = 5000
+
 [[system]]
 name = "faiss-ivf"
 adapter = "faiss_ivf"
@@ -88,26 +118,28 @@ adapter = "faiss_hnsw"
   trials = 5
   dummy_n = 5000
 
+# usearch stores f16 rows here, as the head-to-head does. Its default i8 rows cap recall@10 near 0.84 at 1M, below every
+# target the warm leaderboard ranks at.
 [[system]]
 name = "usearch"
 adapter = "usearch_hnsw"
 
   [[system.build]]
-  config_id = "default"
-  config = {}
+  config_id = "f16-m16"
+  config = { dtype = "f16" }
   threads = 4
-  disk_gb = 2
+  disk_gb = 3
   timeout_s = 2700
 
   [[system.warm]]
-  config_id = "default"
+  config_id = "f16-m16"
   grid = { expansion_search = [16, 32, 64, 128, 256] }
   passes = 2
   warmup = 200
   timeout_s = 1800
 
   [[system.cold]]
-  config_id = "default"
+  config_id = "f16-m16"
   params = { expansion_search = 64 }
   trials = 5
   dummy_n = 5000

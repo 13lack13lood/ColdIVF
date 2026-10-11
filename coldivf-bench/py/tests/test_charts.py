@@ -71,7 +71,9 @@ class ChartsTest(unittest.TestCase):
         self.suite.write_text(f'phase = "smoke"\ndataset = "{DATASET}"\nn = {N}\n\n[[system]]\nname = "coldivf"\n\n'
                               '[[system]]\nname = "lancedb"\n')
         old, new = ("b1", "2026-10-09T10:00:00Z"), ("b2", "2026-10-10T10:00:00Z")
-        write(self.repo / "results/bench/smoke/coldivf.jsonl", [
+        # The smoke charts show ColdIVF's python variant, so the binaries' newest lines are left out.
+        binaries = ("b9", "2026-10-11T10:00:00Z")
+        python = [
             driver_line("build", "coldivf", *old, index="old", seconds=1.0, index_bytes=2000, peak_footprint=50),
             warm("coldivf", *old, {"nprobe": 8}, 90.0, 0.7, index_identity={"checksum": "old"}),
             cold("coldivf", *old, {"nprobe": 16}, 1000.0, index_identity={"checksum": "old"}),
@@ -82,7 +84,10 @@ class ChartsTest(unittest.TestCase):
             *(cold("coldivf", *new, {"nprobe": 16}, t) for t in (7000.0, 5000.0, 6000.0)),
             cold("coldivf", *new, {"nprobe": 16}, 100.0, status="rejected"),
             cold("coldivf", *new, {"nprobe": 16}, 200.0, regime="c1"),
-        ])
+        ]
+        write(self.repo / "results/bench/smoke/coldivf.jsonl", [
+            *(dict(line, variant="python", binding="python") for line in python),
+            warm("coldivf", *binaries, {"nprobe": 16}, 50.0, 0.95), cold("coldivf", *binaries, {"nprobe": 16}, 900.0)])
         write(self.repo / "results/bench/smoke/lancedb.jsonl", [
             driver_line("build", "lancedb", "b3", "2026-10-09T12:00:00Z", seconds=1.0, index_bytes=3000,
                         peak_footprint=90, exact_f32_stored=True),
@@ -146,7 +151,8 @@ class ChartsTest(unittest.TestCase):
 
     def test_a_smoke_pick_takes_the_newest_batch_and_the_build_it_searched(self):
         lines = charts.read_lines(self.repo / "results/bench/smoke/coldivf.jsonl")
-        pick = charts.smoke_pick(lines, "coldivf", DATASET, N)
+        self.assertEqual([w["p50_us"] for w in charts.smoke_pick(lines, "coldivf", DATASET, N)["warm"]], [50.0])
+        pick = charts.smoke_pick(lines, "coldivf", DATASET, N, "python")
         self.assertEqual([w["p50_us"] for w in pick["warm"]], [150.0, 250.0])
         self.assertEqual(sorted(c["total_us"] for c in pick["cold"]), [5000.0, 6000.0, 7000.0])
         self.assertEqual(pick["build"]["index_bytes"], 1000)
