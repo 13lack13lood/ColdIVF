@@ -340,5 +340,93 @@ class ChartsTest(unittest.TestCase):
         self.assertNotIn("<dc:date>", light)
 
 
+class HeadToHeadChartsTest(unittest.TestCase):
+    """The 10M charts on the small phase of the head-to-head report's tests."""
+
+    def setUp(self):
+        from tests import test_headtohead
+
+        self.phase = test_headtohead.CollectTest("test_markdown_and_json")
+        self.phase.setUp()
+        self.root = self.phase.root
+        self.charts, self.machine = charts.h2h_charts(self.root / "suite.toml", self.root)
+        self.by_id = {c["id"]: c for c in self.charts}
+
+    def tearDown(self):
+        self.phase.tearDown()
+
+    def test_each_chart_is_there_and_final(self):
+        self.assertEqual(list(self.by_id), ["cold-10m-95", "cold-10m-90", "warm-10m", "qps-10m", "memory-10m"])
+        self.assertFalse(any(c["preliminary"] for c in self.charts))
+
+    def test_a_cold_chart_ranks_each_systems_pick_against_coldivf(self):
+        rows = self.by_id["cold-10m-95"]["rows"]
+        self.assertEqual([(r["label"], r["group"]) for r in rows],
+                         [("ColdIVF", "coldivf"), ("faiss IVF as shipped, 640 per list", "system")])
+        ours, theirs = rows
+        self.assertEqual((ours["p50_ratio"], ours["trials"], ours["queries"]), (1.0, 4, 4))
+        self.assertAlmostEqual(theirs["p50_ratio"], 34_000.0 / 10_004.0)
+        self.assertEqual(theirs["paired_ratio"]["queries"], 3)
+        self.assertEqual((theirs["setting_text"], charts.fmt_setting(theirs)), ("nprobe 48, k_factor 4",) * 2)
+        self.assertEqual(theirs["source"], "results/t/faiss-ivf.jsonl")
+        self.assertIn("| faiss IVF as shipped, 640 per list | nprobe 48, k_factor 4 | 0.950 | 4 (4) | 34.0 ms |",
+                      charts.h2h_table({"charts": self.charts}, "cold-10m-95"))
+
+    def test_warm_panels_rank_by_p50_and_by_queries_per_second(self):
+        p50 = self.by_id["warm-10m"]["boards"][1]
+        self.assertEqual([(r["label"], r["p50_us"]) for r in p50["rows"]],
+                         [("ColdIVF", 410.0), ("faiss IVF", 2100.0)])
+        qps = self.by_id["qps-10m"]["boards"][1]
+        self.assertEqual([(r["label"], r["qps"]) for r in qps["rows"]], [("ColdIVF", 5000.0)])
+        self.assertEqual({r["label"] for r in self.by_id["warm-10m"]["boards"][2]["not_reached"]},
+                         {"ColdIVF", "faiss IVF", "turbovec"})
+
+    def test_memory_counts_the_process_and_the_index_pages(self):
+        rows = {r["label"]: r for r in self.by_id["memory-10m"]["rows"]}
+        self.assertEqual(set(rows), {"ColdIVF", "faiss IVF", "turbovec"})
+        self.assertEqual(rows["ColdIVF"]["cold"]["total"], 48_000_000)
+        self.assertEqual(rows["ColdIVF"]["warm"]["resident_file_bytes"], 9_000_000_000)
+        self.assertEqual(rows["faiss IVF"]["cold"]["total"], 63_000_000)
+        self.assertEqual(rows["turbovec"]["target_recall10"], None)
+
+    def test_coldivf_shows_once_through_its_module_and_its_binaries_stay_in_the_report(self):
+        from tests import test_headtohead as h
+
+        binaries = [h.warm("coldivf", "", "tl", h.OURS, 0.955, 380.0),
+                    h.warm("coldivf", "", "tl", h.OURS, 0.952, 390.0, split="test")]
+
+        with open(self.root / "results" / "t" / "coldivf.jsonl", "a") as f:
+            f.write("".join(json.dumps(x) + "\n" for x in binaries))
+
+        made, _ = charts.h2h_charts(self.root / "suite.toml", self.root)
+        rows = [r["label"] for r in next(c for c in made if c["id"] == "cold-10m-95")["rows"]]
+        self.assertEqual(rows, ["ColdIVF", "faiss IVF as shipped, 640 per list"])
+        board = next(c for c in made if c["id"] == "warm-10m")["boards"]
+        self.assertNotIn("ColdIVF binaries", [r["label"] for b in board for r in b["rows"] + b["not_reached"]])
+        report = h.headtohead.collect(h.driver.load_suite(self.root / "suite.toml"),
+                                      h.headtohead.Results(self.root / "results" / "t"))
+        self.assertIn("ColdIVF, binaries", [r["label"] for r in report["targets"][0.95]["rows"]])
+
+    def test_one_row_per_system_keeps_the_fastest_and_coldivfs_module(self):
+        rows = [{"system": "coldivf", "variant": "", "p50_us": 9.0},
+                {"system": "faiss-ivf", "variant": "a", "p50_us": 30.0},
+                {"system": "coldivf", "variant": "python", "p50_us": 10.0},
+                {"system": "faiss-ivf", "variant": "b", "p50_us": 20.0},
+                {"system": "lancedb", "variant": "", "p50_us": 25.0}]
+        kept = charts.one_per_system(rows, lambda r: r["p50_us"])
+        self.assertEqual([(r["system"], r["variant"]) for r in kept],
+                         [("coldivf", "python"), ("faiss-ivf", "b"), ("lancedb", "")])
+        # Without a row of the module, ColdIVF's binaries keep theirs.
+        self.assertEqual(charts.one_per_system(rows[:2], lambda r: r["p50_us"]), rows[:2])
+
+    def test_chart_data_puts_the_10m_charts_first(self):
+        smoke = self.root / "smoke.toml"
+        smoke.write_text(f'phase = "smoke"\ndataset = "{DATASET}"\nn = {N}\n')
+        data = charts.chart_data(smoke, self.root / "no-quiet-run", self.root, self.root / "suite.toml")
+        self.assertEqual([c["id"] for c in data["charts"][:5]],
+                         ["cold-10m-95", "cold-10m-90", "warm-10m", "qps-10m", "memory-10m"])
+        self.assertEqual(data["h2h_suite"], "suite.toml")
+
+
 if __name__ == "__main__":
     unittest.main()

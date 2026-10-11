@@ -1,19 +1,22 @@
 """Charts of ColdIVF against the other systems for the README, and the numbers behind them.
 
-    python charts.py [--suite SUITE.toml] [--quiet DIR] [--out DIR] [--repo DIR] [--data-only]
+    python charts.py [--suite SUITE.toml] [--quiet DIR] [--h2h SUITE.toml] [--out DIR] [--repo DIR] [--data-only]
 
-Two runs feed them. The smoke runs of a suite, results/bench/smoke for suites/smoke-1m.toml, hold every system's
-build, warm grid and true-cold (C0) trials at the suite's dataset and prefix. The quiet-window run in results/quiet2
-holds ColdIVF's own cold trials, the head-to-head through the driver at matched recall, the lazy-map control, the
-AiSAQ-style model of a graph that keeps its codes on disk, and ColdIVF's warm grid and queries per second (QPS).
-charts.py picks the lines each chart plots and writes chart-data.json, which holds every plotted number and every number
-the README's text cites. Each comes with its source file, dataset, setting, trial count, machine state and the code
-that measured it. It then draws each chart as scalable vector graphics (SVG), once for a light page and once for a dark
-one, and prints the README's table of headline numbers.
+Three runs feed them. The head-to-head at 10M vectors, results/bench/bench-10m for suites/bench-10m.toml, holds each
+system's build, tune grid, true-cold (C0) screen and its picks for each recall target timed on the test split, which
+headtohead.py reads. The smoke runs of a suite, results/bench/smoke for suites/smoke-1m.toml, hold every system's build,
+warm grid and C0 trials at the suite's dataset and prefix. The quiet-window run in results/quiet2 holds ColdIVF's own
+cold trials, the head-to-head through the driver at matched recall at 1M, the lazy-map control, the AiSAQ-style model
+of a graph that keeps its codes on disk, and ColdIVF's warm grid and queries per second (QPS). charts.py picks the
+lines each chart plots and writes chart-data.json, which holds every plotted number and every number the README's text
+cites. Each comes with its source file, dataset, setting, trial count, machine state and the code that measured it. It
+then draws each chart as scalable vector graphics (SVG), once for a light page and once for a dark one, and prints the
+README's tables of headline numbers.
 
-The picks need only the standard library. The drawing needs matplotlib, and MATPLOTLIB below is the version that drew
-the committed charts. It draws into a scratch folder and moves the files into place once every chart is drawn, so a
-drawing that fails changes nothing. --data-only writes only chart-data.json.
+The 1M picks need only the standard library, and the 10M ones numpy too, through the driver. The drawing needs
+matplotlib, and MATPLOTLIB below is the version that drew the committed charts. It draws into a scratch folder and
+moves the files into place once every chart is drawn, so a drawing that fails changes nothing. --data-only writes only
+chart-data.json.
 """
 
 from __future__ import annotations
@@ -910,6 +913,228 @@ def smoke_charts(suite_path: Path, repo: Path) -> tuple[dict, dict, dict, list[s
     return warm, cold, mem, missing, machine_record(everything)
 
 
+# The head-to-head suite, relative to the repo, whose results the 10M charts read, and the targets the cold charts show.
+H2H_SUITE = Path("coldivf-bench") / "suites" / "bench-10m.toml"
+H2H_COLD = (0.95, 0.90)
+
+# A short name for each of the head-to-head's systems, for charts whose labels have little room.
+SHORT = {
+    "ColdIVF": "ColdIVF", "ColdIVF, binaries": "ColdIVF binaries",
+    "faiss IVF as shipped, 640 per list": "faiss IVF", "faiss IVF, parallel, 640 per list": "faiss parallel",
+    "faiss IVF, batched reads, 640 per list": "faiss batched",
+    "faiss IVF, on-disk lists, 640 per list": "faiss on-disk",
+    "faiss IVF, HNSW quantizer, 640 per list": "faiss graph route",
+    "faiss IVF, batched reads, 2,560 per list": "faiss batched 2560",
+    "faiss IVF, on-disk lists, 2,560 per list": "faiss on-disk 2560",
+    "faiss FastScan + SQ8": "faiss FastScan", "faiss HNSW32-SQ8": "faiss HNSW SQ8", "LanceDB IVF_RQ": "LanceDB IVF_RQ",
+    "Paimon 4-bit": "Paimon 4-bit", "Paimon 8-bit": "Paimon 8-bit", "RaBitQ-Library IVF 5-bit": "RaBitQ IVF 5-bit",
+    "RaBitQ-Library IVF 9-bit": "RaBitQ IVF 9-bit", "usearch HNSW i8": "usearch HNSW i8",
+    "turbovec 4-bit": "turbovec", "turbovec 4-bit, calibrated": "turbovec calibrated",
+}
+
+
+# The name of each system of the head-to-head, for a chart that shows it whatever configuration its row is.
+SYSTEM_NAMES = {
+    "coldivf": "ColdIVF", "faiss-ivf": "faiss IVF", "faiss-fastscan": "faiss FastScan", "faiss-hnsw": "faiss HNSW SQ8",
+    "lancedb": "LanceDB IVF_RQ", "paimon": "Paimon", "rabitq-ivf": "RaBitQ IVF", "turbovec": "turbovec",
+    "usearch": "usearch HNSW i8",
+}
+
+
+def one_per_system(rows: list[dict], key) -> list[dict]:
+    """One row per system, in the order of `rows`, so that a chart compares each system once. ColdIVF's is its Python
+    module's, which runs as every other system runs through its binding, or its binaries' when the module has no row.
+    Every other system's is the configuration with the lowest `key`."""
+    module = any(r["system"] == "coldivf" and r.get("variant") == "python" for r in rows)
+    best = {}
+
+    for r in rows:
+        if r["system"] == "coldivf" and module and r.get("variant") != "python":
+            continue
+
+        if r["system"] not in best or key(r) < key(best[r["system"]]):
+            best[r["system"]] = r
+
+    kept = {id(r) for r in best.values()}
+    return [r for r in rows if id(r) in kept]
+
+
+def h2h_cold_row(r: dict, folder: Path, repo: Path) -> dict:
+    """One system's row of a 10M cold chart, in the shape of the matched chart's rows."""
+    trials, against = r["_trials"], r.get("against") or {}
+    first = trials[0] if trials else {}
+    return {
+        "label": r["label"], "short": SHORT.get(r["label"], r["label"]),
+        "group": "coldivf" if r["system"] == "coldivf" else "system", "harness": "driver", "system": r["system"],
+        "variant": r["variant"], "config_id": r["config_id"], "setting": r["setting"], "dataset": first.get("dataset"),
+        "n": first.get("n"), "regime": "c0", "cpu_state": first.get("cpu_state"), "threads": first.get("threads"),
+        "setting_text": r["setting_text"], "trials": r["trials"], "queries": r["queries"], "p50_us": r["c0_p50_us"],
+        "p95_us": r["c0_p95_us"],
+        "p99_us": r["c0_p99_us"], "open_p50_us": r["open_p50_us"], "recall10_warm": r["recall10"],
+        "recall10_warm_queries": r["warm_queries"], "recall10_warm_split": "test",
+        "c0_exact_p50_us": (r.get("c0_exact") or {}).get("p50_us"), "p50_ratio": against.get("c0_p50", 1.0),
+        "paired_ratio": against.get("c0_paired"), "exact_ratio": against.get("c0_exact"), "modeled": False,
+        "source": rel(folder / f"{r['system']}.jsonl", repo), "machine_state": driver_state(trials),
+        "code": code_of(trials, repo),
+    }
+
+
+def h2h_warm_rows(entry: dict, value: str) -> list[dict]:
+    """A 10M warm panel's rows: each system's warm p50 at 1 thread or its queries per second on 6 threads, at its point
+    for the target, on the test split."""
+    rows = []
+
+    for r in entry["rows"]:
+        v = r["warm_p50_us"] if value == "p50_us" else r["qps"].get(6)
+
+        if v is not None:
+            rows.append({"system": r["system"], "variant": r["variant"], "label": SHORT.get(r["label"], r["label"]),
+                         "full_label": r["label"], value: v, "between": True, "setting": r["setting"],
+                         "recall10": r["recall10"],
+                         "invalid": [t for t in r["warm_invalid"] if t == (1 if value == "p50_us" else 6)]})
+
+    return sorted(rows, key=lambda x: x[value], reverse=value == "qps")
+
+
+def h2h_memory_row(r: dict, target: float, folder: Path, repo: Path) -> dict:
+    """One system's row of the 10M memory chart, in the shape of the smoke memory chart's rows."""
+    return {
+        "system": r["system"], "variant": r["variant"], "label": SHORT.get(r["label"], r["label"]),
+        "full_label": r["label"], "target_recall10": target, "source": rel(folder / f"{r['system']}.jsonl", repo),
+        "cold": {"setting": r["setting"], "trials": r["trials"], "process": r["cold_process"], "pages": r["cold_pages"],
+                 "total": r["cold_total"]},
+        "warm": {"setting": r["setting"], "mode": r["warm_mode"], "process_bytes": r["warm_footprint"],
+                 "process_source": "footprint, the whole process", "resident_file_bytes": r["warm_cached"]},
+        "build": {"peak_footprint": r["build_peak"], "seconds": r["build_s"], "shared_file": r["shared_file"]},
+        "disk": {"index_bytes": r["index_bytes"], "n": r["_trials"][0].get("n") if r["_trials"] else None,
+                 "bytes_per_vector": r["bytes_per_vector"], "exact_f32_stored": None},
+        "machine_state": driver_state(r["_trials"] + r["_warm"]), "code": code_of(r["_trials"] + r["_warm"], repo),
+    }
+
+
+def h2h_charts(suite_path: Path, repo: Path) -> tuple[list[dict], dict]:
+    """The 10M head-to-head's charts from its suite's results, by headtohead.py's picks: the cold first query at
+    recall@10 0.95 and 0.90, the warm p50 and queries per second at each target, and memory. It returns them with the
+    machine their lines recorded."""
+    import driver
+    import headtohead
+
+    suite = driver.load_suite(suite_path)
+    folder = suite.results_root / suite.phase
+    res = headtohead.Results(folder)
+    data = headtohead.collect(suite, res)
+    # ColdIVF shows once, through its Python module as every other system runs through its binding. Its binaries'
+    # rows, a control for comparing ColdIVF with itself, stay in the tables.
+    ours = headtohead.find(suite.systems, headtohead.REFERENCE)
+
+    def shown(r: dict) -> bool:
+        return ours is None or r["system"] != ours.name or r.get("variant") == ours.variant
+
+    for entry in [*data["targets"].values(), {"rows": data["hand"]}]:
+        entry["rows"][:] = [r for r in entry["rows"] if shown(r)]
+        entry.get("not_reached", [])[:] = [m for m in entry.get("not_reached", []) if shown(m)]
+
+    machine = machine_record(res.lines)
+    chip = machine.get("chip", "machine")
+    n, dataset = suite.n, suite.dataset
+    about = (f"{millions(n)} vectors of {dataset} ({DATASETS.get(dataset, dataset)}), on one {chip} with "
+             f"{(machine.get('memory_bytes') or 0) / 2 ** 30:.0f} GB of memory.")
+    charts = []
+    systems = {r["system"] for t in headtohead.TARGETS for r in data["targets"][t]["rows"]}
+    systems |= {m["system"] for t in headtohead.TARGETS for m in data["targets"][t]["not_reached"]}
+
+    def missing(rows: list[dict]) -> list[dict]:
+        """The systems with no row in a chart, since no configuration of theirs reaches its target."""
+        have = {r["system"] for r in rows}
+        return [{"system": s, "label": SYSTEM_NAMES.get(s, s)} for s in sorted(systems - have, key=SYSTEM_NAMES.get)]
+
+    for t in H2H_COLD:
+        entry = data["targets"][t]
+        rows = one_per_system([h2h_cold_row(r, folder, repo) for r in entry["rows"] if r["c0_p50_us"] is not None],
+                              lambda r: r["p50_us"])
+        recalls = [r["recall10_warm"] for r in rows if r["recall10_warm"] is not None]
+        charts.append({
+            "id": f"cold-10m-{round(t * 100)}",
+            "title": f"Cold first query at {millions(n)} vectors, recall@10 {t:.2f}",
+            "dataset": dataset, "n": n, "unit": "microseconds", "target_recall10": t, "preliminary": False,
+            "legend": ["ColdIVF", "Other systems"],
+            "subtitle": f"{about} Each dot is the p50 of {fmt_range([r['trials'] for r in rows])} true-cold trials, "
+                        "each a fresh process with the index evicted from the cache, and its line runs to the p99. "
+                        f"Each system runs at its pick for recall@10 {t:.2f}, whose recall over the "
+                        f"{fmt_count([r['recall10_warm_queries'] for r in rows])} test queries is "
+                        f"{min(recalls):.3f} to {max(recalls):.3f}. Log scale.",
+            "footer": "ColdIVF runs through its Python module, as every other system runs through its binding, and "
+                      "each trial first searches a small index of its own config. Indexes that load whole at open, "
+                      "and the in-memory graphs, read most of their index before the first query. A system's trials "
+                      "time at most 50 distinct test queries, so a p99 shows the spread over repeats of them.",
+            "notes": ["Each row is headtohead.py's pick for the target, pick.py's verdict rule on the tune split, "
+                      "measured on the test split.",
+                      "p50_ratio is the row's C0 p50 over ColdIVF's at the same target, paired_ratio the median of "
+                      "per-query ratios over the queries both timed with its 95% bootstrap interval, and exact_ratio "
+                      "the ratio of the two p50s at exactly the target, where both have cells around it."],
+            "rows": rows, "models": [], "not_reached": missing(rows), "reference": entry["reference"],
+        })
+
+    def board(t: float, value: str) -> dict:
+        key = (lambda r: r["p50_us"]) if value == "p50_us" else (lambda r: -r["qps"])
+        rows = one_per_system(h2h_warm_rows(data["targets"][t], value), key)
+        return {"recall10": t, "rows": rows, "not_reached": missing(rows)}
+
+    boards = {value: [board(t, value) for t in headtohead.TARGETS] for value in ("p50_us", "qps")}
+    common = {"dataset": dataset, "n": n, "preliminary": False, "not_reached_text": "Not reached",
+              "layout": {"label_w": 100.0, "plot_w": 88.0, "value_w": 42.0}, "left_out": []}
+    charts.append({
+        "id": "warm-10m", "title": f"Warm query at {millions(n)} vectors, 1 thread", "unit": "microseconds",
+        "value": "p50_us", **common,
+        "subtitle": f"{about} Each panel ranks the systems by warm p50 at their pick for one recall@10 target, over "
+                    "the 500 test queries at 1 thread, 3 passes, with every index read into memory first. LanceDB "
+                    "caches only its index files, so its rows are read from its table. The panels share one log "
+                    "scale.",
+        "footer": "Every system runs through its Python binding, so each time holds that binding's per-call cost.",
+        "boards": boards["p50_us"],
+    })
+    charts.append({
+        "id": "qps-10m", "title": f"Queries per second at {millions(n)} vectors, 6 threads",
+        "unit": "queries per second",
+        "value": "qps", **common,
+        "subtitle": f"{about} Each panel ranks the systems by queries per second on 6 threads, the M3 Pro's "
+                    "performance cores, at their pick for one recall@10 target, the median of 3 runs of 10 s each. "
+                    "Higher is faster. The panels share one log scale.",
+        "footer": "Libraries with a batch call that releases Python's lock use it, and the rest search from 6 Python "
+                  "threads, or 6 processes for faiss's batched reads. ColdIVF's module has no batch call.",
+        "boards": boards["qps"],
+    })
+    rows, seen = [], set()
+    shown = {r["label"] for c in charts for r in c.get("rows", [])}
+
+    for t in (0.95, 0.90):
+        for r in data["targets"][t]["rows"]:
+            if r["label"] in shown and r["system"] not in seen:
+                seen.add(r["system"])
+                rows.append(h2h_memory_row(r, t, folder, repo))
+
+    for r in data["hand"]:
+        if r["system"] not in seen:
+            seen.add(r["system"])
+            rows.append(h2h_memory_row(r, None, folder, repo))
+
+    charts.append({
+        "id": "memory-10m", "title": f"Memory at {millions(n)} vectors", "dataset": dataset, "n": n, "unit": "bytes",
+        "preliminary": False,
+        "cold_title": "Open and first cold query: process plus index pages",
+        "warm_title": "Warm: process memory plus cached index pages",
+        "subtitle": f"{about} Each system at its pick for recall@10 0.95, or 0.90 where it doesn't reach 0.95. Cold "
+                    "is the median of its trials of what the open and the first query add to the process, plus the "
+                    "index's pages they bring into the page cache. Warm is the process plus the cached pages of its "
+                    "index files, with every file read first.",
+        "footer": "Pages an index copies into its own memory at open count once, in the process. LanceDB's warm "
+                  "runs cache only its index files and leave its 30.7 GB table on disk. Setups that search another "
+                  "setup's file show that file's build.",
+        "rows": rows,
+    })
+    return charts, machine
+
+
 def binding_note(curves: list[dict]) -> str:
     """How the warm times hold each binding's per-call cost, by whether ColdIVF ran through its Python module too."""
     ours = next((c for c in curves if c["system"] == "coldivf"), {})
@@ -943,20 +1168,25 @@ def busy_note(states: list[dict], ours: list[bool]) -> str:
     return note + (f", and ColdIVF's refreshed cells at {min(mine):.0f}%." if mine and note else "." if note else "")
 
 
-def chart_data(suite: Path = SUITE, quiet: Path = QUIET, repo: Path = REPO) -> dict:
-    """Every number the charts plot and the README's text cites, with where it came from."""
+def chart_data(suite: Path = SUITE, quiet: Path = QUIET, repo: Path = REPO, h2h: Path | None = None) -> dict:
+    """Every number the charts plot and the README's text cites, with where it came from. The 10M charts come from the
+    head-to-head suite `h2h`, by default the repo's bench-10m.toml, and are left out when it isn't there."""
     warm, cold, mem, missing, machine = smoke_charts(suite, repo)
     scenarios, head_to_head = cold_matched(quiet, repo)
+    h2h = Path(h2h) if h2h is not None else repo / H2H_SUITE
+    big, big_machine = h2h_charts(h2h, repo) if h2h.exists() else ([], {})
     return tidy({
         "about": "Every number the README's charts plot and its text cites, written by coldivf-bench/py/charts.py. "
-                 "The results are preliminary, and the full head-to-head runs will replace them.",
-        "preliminary": True,
-        "machine": machine,
+                 "The 10M charts are the head-to-head's. The 1M ones are preliminary, and the full head-to-head run "
+                 "at 1M will replace them.",
+        "preliminary": not big,
+        "machine": machine or big_machine,
         "drawn_with": None,
         "datasets": dict(DATASETS),
         "smoke_suite": rel(suite, repo),
+        "h2h_suite": rel(h2h, repo) if big else None,
         "missing_systems": missing,
-        "charts": [scenarios, head_to_head, warm, cold, mem],
+        "charts": [*big, scenarios, head_to_head, warm, cold, mem],
     })
 
 
@@ -981,8 +1211,12 @@ def fmt_bytes(b: float) -> str:
 
 
 def fmt_setting(row: dict) -> str:
-    """A row's setting in words, eg. "nprobe 96, rerank 35", or the reads of a modeled row."""
+    """A row's setting in words, eg. "nprobe 96, rerank 35", or the reads of a modeled row. A row that names its setting
+    in words already, eg. without the settings its whole grid shares, keeps those words."""
     s = row["setting"]
+
+    if row.get("setting_text"):
+        return row["setting_text"]
 
     if row.get("modeled"):
         return f"{s['rounds']} rounds of {s['ranges']} × {s['page'] // 1024} KiB reads"
@@ -1032,6 +1266,22 @@ def headline_table(data: dict, chart_id: str = "cold-head-to-head") -> str:
         ratio = f"{r['p50_ratio']:.2f}x" if r.get("p50_ratio") is not None else "-"
         out.append(f"| {r['label']} | {fmt_setting(r)} | {recall} | {r['trials']} | {fmt_ms(r['p50_us'])} | {p95} | "
                    f"{fmt_ms(r['p99_us'])} | {ratio} |")
+
+    return "\n".join(out)
+
+
+def h2h_table(data: dict, chart_id: str) -> str:
+    """A README table of a 10M cold chart: each row's setting, test recall, trials, cold times and its ratios to
+    ColdIVF, the plain one and the one paired by query."""
+    rows = next(c for c in data["charts"] if c["id"] == chart_id)["rows"]
+    out = ["| System | Setting | Recall@10 | Trials (Queries) | Cold p50 | Cold p99 | p50 Against ColdIVF "
+           "| Paired by Query |", "|---|---|---|---|---|---|---|---|"]
+
+    for r in rows:
+        pair = r.get("paired_ratio")
+        paired_text = f"{pair['median']:.2f}x ({pair['low']:.2f} to {pair['high']:.2f})" if pair else "-"
+        out.append(f"| {r['label']} | {fmt_setting(r)} | {r['recall10_warm']:.3f} | {r['trials']} ({r['queries']}) "
+                   f"| {fmt_ms(r['p50_us'])} | {fmt_ms(r['p99_us'])} | {r['p50_ratio']:.2f}x | {paired_text} |")
 
     return "\n".join(out)
 
@@ -1233,11 +1483,12 @@ def draw_cold_matched(data: dict, chart: dict, t: dict, path: Path) -> None:
     reach = (f"Each row runs at a setting picked to reach recall@10 {chart['target_recall10']:.2f} warm, and its "
              f"warm recall is {min(recalls):.3f} to {max(recalls):.3f} over "
              f"{fmt_count([r.get('recall10_warm_queries') for r in measured])} queries. ") if recalls else ""
-    page = Page(t, f"{chart['title']} (preliminary)", [
+    subtitle = chart.get("subtitle") or (
         f"{millions(chart['n'])} vectors of {dataset} ({DATASETS.get(dataset, dataset)}), on one "
         f"{data['machine'].get('chip', 'machine')} in a quiet window. Each dot is the p50 of "
-        f"{fmt_range([r['trials'] for r in measured])} trials, and its line runs to the p99. {reach}Log scale."
-    ], 34 + row_h * len(slots) + 42, [chart["footer"]])
+        f"{fmt_range([r['trials'] for r in measured])} trials, and its line runs to the p99. {reach}Log scale.")
+    page = Page(t, chart["title"] + (" (preliminary)" if chart.get("preliminary", True) else ""), [subtitle],
+                34 + row_h * len(slots) + 42, [chart["footer"]])
     top = page.top + 34
     ax = page.axes(left, top, plot_w, row_h * len(slots))
     lo = 10 ** math.floor(math.log10(min(r["p50_us"] for r in rows) / 1.2))
@@ -1292,13 +1543,16 @@ def draw_cold_matched(data: dict, chart: dict, t: dict, path: Path) -> None:
 
 def draw_warm_leaderboard(data: dict, chart: dict, t: dict, path: Path) -> None:
     m = _mpl()
-    boards, curves = chart["boards"], chart["curves"]
+    boards, curves = chart["boards"], chart.get("curves", [])
     points = [p for c in curves for p in c["points"]]
     calls = [p["overhead_us"] for c in curves for p in c["points"] if p.get("overhead_us")]
     busy = busy_note([c["machine_state"] for c in curves], [c["system"] == "coldivf" for c in curves])
-    foot = []
+    # The value each row ranks by, the warm p50 by default, where lower is faster, or queries per second.
+    value = chart.get("value", "p50_us")
+    qps = value == "qps"
+    foot = [chart["footer"]] if chart.get("footer") else []
 
-    if chart["left_out"]:
+    if chart.get("left_out"):
         foot.append(f"Left off, since no setting of its grid reaches recall@10 {boards[0]['recall10']:.2f}: "
                     + ", ".join(f"{g['label']}, whose best is {g['best_recall10']:.3f}" for g in chart["left_out"])
                     + ".")
@@ -1311,14 +1565,19 @@ def draw_warm_leaderboard(data: dict, chart: dict, t: dict, path: Path) -> None:
         foot.append(busy)
 
     longest = max(len(b["rows"]) for b in boards)
-    every = [r["p50_us"] for b in boards for r in b["rows"]]
+    every = [r[value] for b in boards for r in b["rows"]]
     lo, hi = min(every) / 1.5, max(every) * 1.5
-    row_h, label_w, plot_w, value_w, gap = 16.0, 100.0, 88.0, 42.0, 6.0
+    layout = chart.get("layout") or {}
+    row_h, gap = 16.0, 6.0
+    label_w, plot_w, value_w = layout.get("label_w", 100.0), layout.get("plot_w", 88.0), layout.get("value_w", 42.0)
     panel_w = label_w + plot_w + value_w
-    short = [wrap(f"Not reached in its grid: {', '.join(r['label'] for r in b['not_reached'])}.", 7.5, panel_w - 4)
+    gone = chart.get("not_reached_text", "Not reached in its grid")
+    short = [wrap(f"{gone}: {', '.join(r['label'] for r in b['not_reached'])}.", 7.5, panel_w - 4)
              if b["not_reached"] else [] for b in boards]
     grid = [len(c["points"]) for c in curves if len(c["points"]) > 1]
-    page = Page(t, f"{chart['title']} at {millions(chart['n'])} vectors (preliminary)", [
+    title = chart["title"] if not chart.get("preliminary", True) else \
+        f"{chart['title']} at {millions(chart['n'])} vectors (preliminary)"
+    page = Page(t, title, [chart["subtitle"]] if chart.get("subtitle") else [
         f"First {millions(chart['n'])} rows of {chart['dataset']} ({DATASETS.get(chart['dataset'], '')}). Each panel "
         "ranks the systems by warm p50 at one recall@10, read off each system's grid of "
         f"{fmt_range(grid)} settings between the two around it, linear in the log of the latency. A system whose "
@@ -1335,9 +1594,9 @@ def draw_warm_leaderboard(data: dict, chart: dict, t: dict, path: Path) -> None:
         ax.set_ylim(longest - 0.5, -0.5)
         ax.yaxis.set_major_locator(m.NullLocator())
         ax.spines["left"].set_visible(False)
-        _log_ticks(ax, lo, hi, fmt=lambda v: f"{v / 1000:g}")
+        _log_ticks(ax, lo, hi, fmt=(lambda v: f"{v:,.0f}") if qps else (lambda v: f"{v / 1000:g}"))
         ax.tick_params(axis="x", labelsize=7)
-        ax.set_xlabel("ms, log scale", size=7.5, labelpad=3)
+        ax.set_xlabel("queries per second, log scale" if qps else "ms, log scale", size=7.5, labelpad=3)
         _grid(ax, t)
         page.text(x0, page.top + 18, f"Recall@10 {board['recall10']:.2f}", size=10, weight="bold", color=t["ink"])
         pos = m.blended(ax.transAxes, ax.transData)
@@ -1347,15 +1606,16 @@ def draw_warm_leaderboard(data: dict, chart: dict, t: dict, path: Path) -> None:
             color = t["coldivf"] if ours else t["rest"]
             ink = t["coldivf"] if ours else t["ink"]
             weight = "bold" if ours else "normal"
-            ax.plot([lo, r["p50_us"]], [i, i], color=color, linewidth=2 if ours else 1.2, zorder=2,
+            ax.plot([lo, r[value]], [i, i], color=color, linewidth=2 if ours else 1.2, zorder=2,
                     solid_capstyle="butt")
-            ax.plot([r["p50_us"]], [i], marker="o", markersize=6 if ours else 4.5, color=color,
+            ax.plot([r[value]], [i], marker="o", markersize=6 if ours else 4.5, color=color,
                     markeredgecolor=t["surface"], markeredgewidth=0.8, zorder=3)
             ax.text(-label_w / plot_w, i, f"{i + 1}", transform=pos, ha="left", va="center", size=7.5,
                     color=t["ink2"])
             ax.text(-0.04, i, r["label"], transform=pos, ha="right", va="center", size=8, color=ink, weight=weight)
-            ax.text(1 + value_w / plot_w, i, fmt_us(r["p50_us"]) + ("" if r["between"] else "*"), transform=pos,
-                    ha="right", va="center", size=8, color=ink, weight=weight)
+            shown = f"{r['qps']:,.0f}" if qps else fmt_us(r["p50_us"]) + ("" if r["between"] else "*")
+            ax.text(1 + value_w / plot_w, i, shown, transform=pos, ha="right", va="center", size=8, color=ink,
+                    weight=weight)
 
         for k, line in enumerate(short[b]):
             page.text(x0, page.top + 30 + row_h * longest + 40 + 10 * k, line, size=7.5, color=t["ink2"])
@@ -1462,17 +1722,23 @@ def draw_memory(data: dict, chart: dict, t: dict, path: Path) -> None:
     row_h, label_w, plot_w, gap_x = 14.5, 104.0, 196.0, 70.0
     panel_h = row_h * len(rows)
     exact = [r["label"] for r in rows if (r["disk"] or {}).get("exact_f32_stored")]
-    page = Page(t, f"{chart['title']} (preliminary)", [
+    subtitle = chart.get("subtitle") or (
         f"First {millions(chart['n'])} rows of {chart['dataset']}, from the smoke runs. Cold is the median "
         f"of {fmt_range([r['cold']['trials'] for r in rows])} trials. Warm is at the cold setting, after every index "
         f"file was read. Warm process memory comes {process_note(rows)}. Builds ran on "
-        f"{fmt_range([(r['build'] or {}).get('threads') for r in rows])} threads."
-    ], 2 * (28 + panel_h + 30) + 6, [f"The indexes that keep every float32 row on disk: {', '.join(exact)}."]
-                                     if exact else [])
+        f"{fmt_range([(r['build'] or {}).get('threads') for r in rows])} threads.")
+    foot = [f"The indexes that keep every float32 row on disk: {', '.join(exact)}."] if exact else []
+    foot += [chart["footer"]] if chart.get("footer") else []
+    page = Page(t, chart["title"] + (" (preliminary)" if chart.get("preliminary", True) else ""), [subtitle],
+                2 * (28 + panel_h + 30) + 6, foot)
+    # The cold panel plots a row's total, process plus index pages, where it has one, else the footprint the open and
+    # the first query added.
+    cold_title = chart.get("cold_title", "Added by the open and the first cold query")
     panels = [
-        ("Added by the open and the first cold query", "log scale",
-         lambda r: ((r["cold"]["footprint_delta"] or {}).get("median"), None), True, fmt_bytes),
-        ("Warm: process memory plus cached index pages", "",
+        (cold_title, "log scale",
+         lambda r: (r["cold"].get("total") if r["cold"].get("total") is not None
+                    else (r["cold"].get("footprint_delta") or {}).get("median"), None), True, fmt_bytes),
+        (chart.get("warm_title", "Warm: process memory plus cached index pages"), "",
          lambda r: ((r["warm"] or {}).get("process_bytes"), (r["warm"] or {}).get("resident_file_bytes")), False,
          fmt_bytes),
         ("Peak footprint while building", "", lambda r: ((r["build"] or {}).get("peak_footprint"), None), False,
@@ -1548,13 +1814,17 @@ def draw_memory(data: dict, chart: dict, t: dict, path: Path) -> None:
         if i == 1:
             handles = [m.Patch(facecolor=t["rest"], label="process memory"),
                        m.Patch(facecolor=t["rest_tint"], label="cached index pages")]
-            ax.legend(handles=handles, loc="upper right", handlelength=1.2, borderaxespad=0.3)
+            # Below the panel's ticks, since the rows and their labels can fill the panel to its right edge.
+            ax.legend(handles=handles, loc="upper right", ncol=2, handlelength=1.2, columnspacing=1.2, borderaxespad=0,
+                      bbox_to_anchor=(1, -22 / panel_h))
 
     page.save(path)
 
 
 DRAW = {"cold-coldivf": draw_cold_matched, "cold-head-to-head": draw_cold_matched,
-        "warm-leaderboard": draw_warm_leaderboard, "cold-smoke": draw_cold_smoke, "memory": draw_memory}
+        "warm-leaderboard": draw_warm_leaderboard, "cold-smoke": draw_cold_smoke, "memory": draw_memory,
+        "cold-10m-95": draw_cold_matched, "cold-10m-90": draw_cold_matched, "warm-10m": draw_warm_leaderboard,
+        "qps-10m": draw_warm_leaderboard, "memory-10m": draw_memory}
 
 
 def draw(data: dict, out: Path) -> list[Path]:
@@ -1565,7 +1835,7 @@ def draw(data: dict, out: Path) -> list[Path]:
     for name, t in THEMES.items():
         with m.matplotlib.rc_context(_rc(t)):
             for chart in data["charts"]:
-                if not (chart.get("rows") or chart.get("points") or chart.get("curves")):
+                if not (chart.get("rows") or chart.get("points") or chart.get("curves") or chart.get("boards")):
                     print(f"no lines for the {chart['id']} chart, so it isn't drawn", file=sys.stderr)
                     continue
 
@@ -1606,11 +1876,13 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--suite", type=Path, default=SUITE, help="the smoke suite, whose dataset, n and systems it reads")
     p.add_argument("--quiet", type=Path, default=QUIET, help="the quiet-window run's results folder")
+    p.add_argument("--h2h", type=Path, default=None,
+                   help="the head-to-head suite of the 10M charts, by default the repo's bench-10m.toml")
     p.add_argument("--out", type=Path, default=OUT, help="where chart-data.json and the charts go")
     p.add_argument("--repo", type=Path, default=REPO, help="the root that paths in chart-data.json are relative to")
     p.add_argument("--data-only", action="store_true", help="write chart-data.json without drawing")
     args = p.parse_args(argv)
-    data = chart_data(args.suite, args.quiet, args.repo)
+    data = chart_data(args.suite, args.quiet, args.repo, args.h2h)
 
     for chart in data["charts"]:
         chart["files"] = {name: f"{chart['id']}.svg" if name == "light" else f"{chart['id']}-{name}.svg"
@@ -1630,6 +1902,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.data_only:
         print("wrote only chart-data.json, so the charts may not match it until they are drawn", file=sys.stderr)
+
+    for chart in data["charts"]:
+        if chart["id"].startswith("cold-10m-"):
+            print(h2h_table(data, chart["id"]))
+            print()
 
     print(headline_table(data, "cold-head-to-head"))
     print()
