@@ -13,6 +13,7 @@ the same way. The driver reads a suite file, starts one adapter process per job,
 | `rusage.py` | Process counters from macOS's `proc_pid_rusage`, the thread's quality of service (QoS) class and swap counts |
 | `evictor.py` | Page cache eviction through mappings held for a whole batch, and residency checks with `mincore` |
 | `data.py` | `.fbin` and `.ibin` memory maps, prefixes, query splits and recall with ties |
+| `writes.py` | The write benchmark's stream files, states, ground truth per state, scoring with live ids, and the copy of a state's live rows |
 | `charts.py` | The repo README's charts and `docs/charts/chart-data.json`, drawn with matplotlib 3.11.2 from `venv-plot` |
 | `pick.py` | Each system's cold cells from its warm grid and its screening trials, written into its section of a suite |
 | `headtohead.py` | A phase's head-to-head: each system's pick for each recall target, its warm, cold and memory numbers on the test split, and how ColdIVF compares |
@@ -35,10 +36,13 @@ the same way. The driver reads a suite file, starts one adapter process per job,
 
 ```
 cd coldivf-bench/py
-python driver.py ../suites/<phase>.toml [--only build,warm,cold,refs] [--systems a,b:variant] [--groups g,h]
-                                         [--gate enforce|warn|off] [--max-attempts N] [--dry-run]
+python driver.py ../suites/<phase>.toml [--only build,stream,latency,maintain,warm,cold,refs] [--systems a,b:variant]
+                                         [--groups g,h] [--gate enforce|warn|off] [--max-attempts N] [--dry-run]
 python -m unittest discover -s tests -t .
 ```
+
+A suite runs build, warm, cold and refs by default, and a write suite, one with a `[writes]` table, the write phases
+too. Write Benchmark below describes them.
 
 `--systems` names systems by name, which takes every variant of one, or as `name:variant`, which takes one variant.
 `--groups` runs only the cold cells of those groups, eg. one rival's group with the ColdIVF cells that run beside it.
@@ -168,7 +172,8 @@ kept as a failed line with the reason.
 | `build` | Build of one config, seed and n |
 | `warm` | Search setting of a warm job |
 | `cold` | Attempt at one cold trial |
-| `update` | Epoch of an update trace |
+| `write` | Op of a write session, eg. its inserts, or a session that failed, whose op is `session` |
+| `maintain` | Maintenance action, or run of a policy pass |
 | `ref` | Drift reference, at the start or the end of a batch |
 | `batch` | Batch, with its counts, drift, gate and disk use |
 
@@ -275,6 +280,8 @@ subclasses `adapters.base.Adapter` and ends with `main(MyAdapter)`. `--data` is 
 | `overhead` | `--data --rows --threads --metric --variant --k` | `overhead` |
 | `info` | `[--variant]` | `info` |
 | `qps-worker` | Internal, run by the base class for QPS with one process per worker | `ready`, then `count` with its queries, seconds, CPU time and footprints |
+| `write` | `--data --rows --index PATH --stream FILE --mode latency\|stream --pass joint\|inserts\|policy --round R --from-round F --batch B --calls N --warmup N --durable-calls N --saves N --reserve ROW --seed S --params JSON [--policy KIND --maintain-params JSON --maintain-threads T] --threads --metric --variant` | `opened`, a `maintain` per run of the policy pass, an `op` per op, then `done` |
+| `maintain` | `--data --rows --index PATH --action A --params JSON --threads T --metric --variant` | `maintain` |
 
 `--queries` is a comma-separated list of query ids. `--grid` is a JSON list of settings, each a dict. `--clusters` is a
 stem of shared clusters, `<stem>.centroids.fbin` with one row per cluster and `<stem>.assign.ibin` with each base row's
@@ -296,6 +303,9 @@ base class points file descriptor 1 at stderr first, so a library's prints can't
 | `trial` | `trial` and `fields`, the cold fields |
 | `files` | `files`, a list of `{path, bytes, ranges}`, each range `{offset, length, kind}` with kind `bulk` or `routing`, and `loaded` true for bytes the system copies into its own memory at open or first use |
 | `overhead` | `fields` with `overhead_us`, the median cost of one call on a 1K-vector index |
+| `opened` | `pid`, `open_us`, `open_footprint` and `footprint_before_open`, once a write session's writer is open |
+| `op` | `fields`, the write fields of one op of a session, eg. its inserts or its syncs |
+| `maintain` | `fields`, the maintain fields of one action or one run of the policy pass |
 | `unsupported` | `message`. The adapter then exits with status 0 |
 | `error` | `message` and `traceback`. The adapter then exits with status 1 |
 
@@ -355,6 +365,8 @@ complete example in ~70 lines.
 | `supported_regimes(self) -> tuple` | The regimes it runs, `regimes` by default. A variant can narrow it |
 | `overhead_config(self)`, `overhead_params(self)` | The build config and settings of the per-call cost index |
 
+The write benchmark's hooks come next to these, and Write Hooks below lists them.
+
 `BuildContext` has `config`, `data_path`, `rows`, `out`, `clusters`, `threads`, `seed`, `metric`, `variant`, `dataset`,
 `data` and `dim`. `ServeContext` has `index`, `dataset`, `rows`, `k`, `metric`, `threads`, `variant`, `params`,
 `queries` (query vectors by id), `warmup` (the vectors of the warm-up queries), `warmup_ids` (their ids), `regime`,
@@ -379,6 +391,112 @@ Rules every adapter follows:
   threads alike.
 - Make a warm setting search as a fresh open with the same settings would. A key a setting leaves out gets its value
   from the open, not from the setting before it.
+
+## Write Benchmark
+
+A suite with a `[writes]` table also measures writes. Every system takes one stream of inserts and deletes on its
+build, the same calls in the same batches and order, and each point the stream reaches is a state, an index of its own
+that warm and cold entries search. `../suites/bench-1m-writes.toml` is the 1M campaign, `bench-1m-writes-drift.toml`
+its drift pass, and `writes-smoke.toml` and `writes-smoke-drift.toml` the same layouts at 20K.
+
+```
+python writes.py prepare ../suites/<suite>.toml     the stream, each state's truth and the copy of S10's live rows
+python writes.py stream|truth|copy|show ../suites/<suite>.toml
+```
+
+### Streams and States
+
+The stream file is in the COLDSTRM format of `coldivf-bench/src/stream.rs`, made once from `[writes]` and kept with a
+record of what made it, `<stream>.json`, so a suite can't take another's stream. Its base is rows 0 to n. The uniform
+pattern inserts the rows after the base in row order, and the drift pattern the rows nearest `hot_topics` of the
+`topics` clusters that k-means finds among later rows, from `drift_from` on. Each round deletes vectors drawn with
+`seed` from the ones live at its start, so the calls within a round can come in any order and leave the same state. A
+base row's id is its row, and each insert takes the next id, as a library that numbers its inserts gives them, so in a
+uniform stream every id is its row.
+
+`[writes.states]` names each state by its inserts and deletes since S0. States with deletes are the joint ladder, eg.
+S1, S5 and S10, states without them the inserts-only ladder, eg. S1i, S5i and S10i, and a state with a `policy` makes
+the joint ladder's calls with a maintenance run whenever the library's policy says one is due, eg. S10p. A maintenance
+action on S10 makes the state `s10-<action>`. S0 is a clone of the build, and a rebuild-only system's S0 is its build.
+
+Each state is a folder `<config_id>-<state>` beside its build's, under the suite's index root, with a record
+`<config_id>-<state>.state.json` beside it. The record names the stream and its hash, the pass, round and counts, the
+state it came from and that state's key, the index key the driver took when it made the state, and the run keys of the
+session that made it. Every run key of a state's searches uses that index key, since searches change some states'
+files. A state is done once its folder and record are there, the state it came from is the one it came from, and every
+line of its session is done.
+
+### Phases
+
+| Phase | What It Does | Lines |
+|---|---|---|
+| `stream` | For each pass, the joint ladder, the inserts alone and the policy pass, makes each state from the last one by one session on the pass's work folder, which it clones as the state | `write`, and `maintain` for a policy pass's runs |
+| `latency` | For each latency state, times single writes on a throwaway clone of it | `write` |
+| `maintain` | For each action, runs it on a clone of S10 in a fresh process, and keeps the clone as `s10-<action>` | `maintain` |
+
+A session's lines are written after its state's folder and record, so a crash or a sleep never leaves lines for a state
+that isn't there. A session that fails writes one `write` line of op `session`, which counts its attempts, and its work
+folder is cloned again from the last state for the next try. A state without its record, eg. after a crash between
+the two, is made again, and every state after it with it. `--dry-run` lists each pass, latency run and action and
+whether it is done.
+
+A stream session opens the writer, makes its rounds' calls, a batch of inserts then a batch of deletes, syncs after
+each call when `sync_kind` is "incremental", and ends with the durable point, then closes the writer and seals the state.
+A latency run makes `warmup_calls` untimed and `latency_calls` timed single inserts of reserved rows, then as many
+single deletes of base ids the state holds, then `durable_calls` inserts each followed by a sync, timed together and the
+sync alone, or `saves` durable points where a sync rewrites the index.
+
+### Scoring
+
+Each state's truth is the exact top 100 over the rows it holds, beside the stream as `<stem>-<state>.gt.ibin` with its
+distances. S0 takes the suite's truth file, and a policy or maintained state takes the plain state's with its counts.
+The truth runs in numpy up to 200,000 rows and in `gt --stream` above that, which scans every state in one pass with the
+head-to-head's distances. `StateRecall` scores a state's results. A returned id the state doesn't hold, deleted or not
+inserted yet, is a miss before the tie check and counts in `dead_returned`. Ids count up to the stream's last one at
+every state, and `recall10_inserted` is the share of the true top-10 neighbors that are inserts which a search found. A
+fresh build of a copy of a state's live rows returns positions, which become rows first. A rebuild-only system's S0
+lines also hold `extra.stale`, the same results scored against each state's truth. A warm entry with `findability`
+searches probe rows of the state as queries at its first setting, and `extra.findability` holds the share that come back
+first, or behind only rows at the same distance.
+
+### Suite Keys
+
+| Key | Where | Meaning |
+|---|---|---|
+| `[writes]` | The suite | `stream`, `batch`, `seed`, the latency runs' `latency_states`, `latency_calls`, `warmup_calls`, `durable_calls`, `saves`, `reserve_from` and `latency_seed`, the findability check's `probes`, and for a drift stream `pattern`, `drift_from`, `drift_rows`, `topics`, `hot_topics`, `topic_sample` and `kmeans_rounds` |
+| `[writes.states]` | The suite | Each state's `inserts` and `deletes` since S0, and `policy`, the run kind of a policy pass |
+| `[[system.write]]` | A system | `config_id`, `role`, `threads`, `states`, `params` and `timeout_s`. `states` defaults to the joint ladder and S10i for full writes, the inserts-only ladder for inserts only, and both ladders for the exact reference |
+| `[[system.maintain]]` | A system | `config_id`, `state`, S10 by default, `actions`, `threads`, `action_threads`, `params`, `unsearched`, the actions whose states "all" leaves out, `same_file`, eg. `{ job = "auto" }`, an action whose data file must match another's, `timeout_s` and `disk_gb` |
+| `data` | A build | Another base file, eg. the copy of a state's live rows, with its queries and truth beside it |
+| `states` | A warm or cold entry | The states it searches, or "all" |
+| `findability` | A warm entry | `true` for the ladders' last states and every maintained state among its states, or a list of states |
+
+### Write Hooks
+
+| Hook or Attribute | Does |
+|---|---|
+| `write_role` | `full`, `inserts`, `rebuild` or `exact`. A system that sets nothing is rebuild-only |
+| `durability` | The level a write call reaches and the level `sync` reaches, eg. `{"call": "process", "sync": "power"}`, and `durable_point` where it differs |
+| `sync_kind` | `incremental` when a sync writes only what changed, or `whole` when it rewrites the index |
+| `maintenance_actions` | The actions `maintain` takes |
+| `writer_open(ctx, path)` | Opens the index for writes and returns a handle |
+| `insert(w, ids, rows)` | One call, of len(ids) rows. A library that numbers its inserts returns the ids it gave them, which a stream session checks |
+| `delete(w, ids)` | One call. Inserts-only systems keep the default, which raises `Unsupported` |
+| `sync(w)` | Brings every change so far to the `sync` level, and returns what it did |
+| `durable_point(w)` | The system's own end of a session. The sync by default |
+| `resize(w, capacity)` | Makes room before a round's inserts, and returns whether it did anything, timed as op `resize` |
+| `maintain(w, action, threads, params)` | Runs one action and returns the library's report, with `rows_live`, `durability` and `data_file` where it knows them |
+| `due(w, params)` | Whether the library's policy calls for a run now, for the policy pass |
+| `pending(w)` | The library's counts of unmaintained changes, for `extra` |
+| `writer_close(w)` | Closes the writer after its durable point |
+| `seal_state(ctx, path)` | Leaves a state's folder as every later open finds it, eg. stores.py's seal. Nothing by default |
+
+`WriteContext` has `index`, `dataset`, `rows`, `metric`, `threads`, `variant`, `mode`, `pass_name`, `params`, `policy`,
+`maintain_threads` and `maintain_params`. The base class times each call on the calling thread at the user-interactive
+class with garbage collection off, and reads `proc_pid_rusage` and the machine's swap counts around each call, outside
+the timer. The exact reference mixes in `inproc.HarnessWrites`, whose writes the harness makes in `inserts.fbin` and
+`live.bin` beside the build's files, and its search reads `inproc.LiveRows.view` of the folder. An adapter that
+overrides `warm_run` calls `probe` for the findability check, or leaves it out.
 
 ## ColdIVF Adapter
 

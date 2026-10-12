@@ -13,7 +13,8 @@ NEEDED = {
     "build": {"seconds": 1.0, "index_bytes": 10},
     "warm": {"mode": "whole", "threads": 1, "p50_us": 5.0, "queries": 10},
     "cold": {"regime": "c0", "trial": 0, "total_us": 100.0},
-    "update": {"epoch": 0},
+    "write": {"mode": "stream", "op": "insert", "p50_us": 12.0},
+    "maintain": {"action": "fold", "seconds": 3.5},
     "ref": {"position": "start", "wave_us_p50": 3.0},
     "batch": {"started": "a", "ended": "b", "suite": "s", "suite_sha256": "x", "counts": {}, "by_system": {},
               "resumed": 0, "refs": {}, "flagged": False, "provenance_changed": False, "disk_free_gb": {}},
@@ -51,6 +52,34 @@ class ValidateTest(unittest.TestCase):
         self.assertTrue(schema.validate(make_line("cold", total_us=None)))
         self.assertEqual(schema.validate(make_line("cold", total_us=None, status="failed")), [])
         self.assertEqual(schema.validate(make_line("warm", p50_us=None, qps=100.0)), [])
+        self.assertTrue(schema.validate(make_line("write", p50_us=None)))
+        self.assertEqual(schema.validate(make_line("write", p50_us=None, rows_per_s=5e4)), [])
+        self.assertEqual(schema.validate(make_line("write", p50_us=None, status="failed", op="session")), [])
+        self.assertTrue(schema.validate(make_line("maintain", seconds=None)))
+
+    def test_the_write_kinds_and_their_fields(self):
+        self.assertNotIn("update", schema.KINDS)
+        self.assertEqual(schema.KINDS, ("build", "warm", "cold", "write", "maintain", "ref", "batch"))
+
+        for name in ("mode", "op", "state_from", "state_to", "batch", "calls", "rows", "durability", "open_us",
+                     "first_us", "p99_us", "max_us", "rows_per_s", "cpu_qos_ms", "logical_bytes_written",
+                     "disk_bytes_written", "index_bytes_after", "lifetime_max_footprint", "swapins_delta"):
+            self.assertIn(name, schema.FIELDS["write"])
+
+        for name in ("action", "params", "seconds", "peak_footprint", "peak_disk_bytes", "rows_live", "durability"):
+            self.assertIn(name, schema.FIELDS["maintain"])
+
+        for kind in ("warm", "cold"):
+            self.assertIn("dead_returned", schema.FIELDS[kind])
+            self.assertIn("recall10_inserted", schema.FIELDS[kind])
+
+        # Every kind carries the stream and the state, null outside a write suite.
+        line = make_line("build")
+        self.assertIsNone(line["stream"])
+        self.assertIsNone(line["state"])
+        line = make_line("write", stream={"path": "s", "sha256": "x", "batch": 1000, "role": "full"}, state="s5")
+        self.assertEqual(schema.validate(line), [])
+        self.assertIn("stream should be dict", " ".join(schema.validate(make_line("write", stream="s"))))
 
     def test_types(self):
         self.assertTrue(schema.validate(make_line("cold", ids=[1, 2.5])))

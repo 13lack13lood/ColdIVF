@@ -9,6 +9,10 @@ stderr, so it can't break the wire. README.md describes every subcommand, event 
 An in-process adapter implements `open` and `search`, plus `build`, and the base class does the timing, the counters,
 the cold protocol and the warm passes. An adapter that drives an outside program overrides `run_build`,
 `cold_trial` and `warm_run` instead.
+
+For the write benchmark an adapter also sets its role and fills in the write hooks, `writer_open`, `insert`, `delete`,
+`sync`, `durable_point`, `maintain` and the rest, and the base class runs the `write` and `maintain` subcommands
+around them. A hook a system lacks raises `Unsupported`, so a system with no write hook is rebuild-only.
 """
 
 from __future__ import annotations
@@ -38,9 +42,19 @@ import data  # noqa: E402
 import evictor  # noqa: E402
 import rusage  # noqa: E402
 import schema  # noqa: E402
+import writes  # noqa: E402
 
 REGIMES = ("c0", "c1", "intent")
 CPU_STATES = ("prewarm", "idle", "none")
+
+# The roles of the write benchmark. "full" inserts and deletes through the system's own calls, "inserts" has no delete
+# call, "rebuild" has no write call and takes the stream as a fresh build of the new vectors, and "exact" is the flat
+# scan, whose writes the harness makes.
+WRITE_ROLES = writes.ROLES
+# How far a write gets: lost if the process dies ("memory"), safe from kill -9 but not from a power loss ("process"),
+# or safe from a power loss too ("power").
+LEVELS = writes.LEVELS
+SYNC_KINDS = ("incremental", "whole")
 
 # Environment variables that set the thread count of common numeric libraries.
 THREAD_ENV = (
@@ -219,6 +233,29 @@ class ServeContext:
     handle: Any = None
     warmup: list[np.ndarray] = field(default_factory=list)
     warmup_ids: list[int] = field(default_factory=list)
+    # The base rows a warm run's first setting also searches as queries, for the findability check, or None.
+    probes: np.ndarray | None = None
+
+
+@dataclass
+class WriteContext:
+    """What a write session or a maintenance run gets. `index` is a clone of a state's folder, which the session may
+    change. `rows` is the build's row count, so its ids are 0 to rows, and every insert's id is its row. `params` holds
+    the write entry's settings. In the policy pass `policy` names the run kind it starts, at `maintain_threads` threads
+    with `maintain_params`, the suite's maintenance settings."""
+
+    index: Path
+    dataset: data.Dataset
+    rows: int
+    metric: str
+    threads: int
+    variant: str
+    mode: str = "stream"
+    pass_name: str = "joint"
+    params: dict = field(default_factory=dict)
+    policy: str | None = None
+    maintain_threads: int = 1
+    maintain_params: dict = field(default_factory=dict)
 
 
 def read_except(path: Path | str, skip: list[tuple[int, int]], chunk: int = 1 << 24) -> int:
@@ -244,6 +281,130 @@ def read_except(path: Path | str, skip: list[tuple[int, int]], chunk: int = 1 <<
     return done
 
 
+def logical_writes() -> int:
+    """The bytes this process has asked to write, from proc_pid_rusage, whether or not they reached the disk yet."""
+    raw = rusage.rusage_v6()
+    return raw["logical_writes"] if raw else 0
+
+
+class OpTimer:
+    """The calls of one op of a write session, eg. its inserts. It times each call with the clock a search is timed
+    with, and reads proc_pid_rusage and the machine's swap counts around each one, outside the timer, so the ops a
+    session interleaves each get their own counters."""
+
+    def __init__(self, op: str, batch: int, durability: str | None):
+        self.op, self.batch, self.durability = op, batch, durability
+        self.times: list[float] = []
+        self.first_us: float | None = None
+        self.rows = 0
+        self.measured = False
+        self.used = rusage.Delta()
+        self.logical = 0
+        self.vm = {"swapins": 0, "compressions": 0}
+        self.footprint_before: int | None = None
+        self.footprint_after: int | None = None
+        self.unsupported: str | None = None
+        self.extra: dict = {}
+        # The clock at the start and the end of the last call, in nanoseconds.
+        self.last = (0, 0)
+
+    def call(self, fn: Any, rows: int = 0, timed: bool = True, keep: Any = None) -> Any:
+        """Runs `fn`, one call of `rows` rows, and times it unless it is a warm-up call. `keep` may look at what the
+        call returned and drop its sample, eg. a resize that had nothing to do. The first call counts as `first_us`,
+        warm-up or not."""
+        before, logical, vm = rusage.Usage.now(), logical_writes(), rusage.vm_counts()
+        t0 = now_ns()
+        out = fn()
+        t1 = now_ns()
+        after, logical_after, vm_after = rusage.Usage.now(), logical_writes(), rusage.vm_counts()
+        self.last = (t0, t1)
+
+        if keep is not None and not keep(out):
+            return out
+
+        if self.first_us is None:
+            self.first_us = (t1 - t0) / 1e3
+
+        if timed:
+            self.add((t1 - t0) / 1e3, rows)
+            self.measure(before, after, logical_after - logical, rusage.vm_delta(vm, vm_after))
+
+        return out
+
+    def add(self, us: float, rows: int) -> None:
+        """One timed call of `rows` rows that took `us` microseconds."""
+        if self.first_us is None:
+            self.first_us = us
+
+        self.times.append(us)
+        self.rows += rows
+
+    def measure(self, before: rusage.Usage, after: rusage.Usage, logical: int, vm: dict) -> None:
+        if self.footprint_before is None:
+            self.footprint_before = before.footprint
+
+        self.footprint_after = after.footprint
+        self.used = self.used + (after - before)
+        self.logical += max(0, logical)
+        self.measured = True
+
+        for k in self.vm:
+            self.vm[k] += vm.get(k, 0)
+
+    @property
+    def seconds(self) -> float:
+        return float(np.sum(self.times)) / 1e6
+
+    def fields(self) -> dict:
+        """The op's write fields. Rows per second count only inserts and deletes, the calls that write rows."""
+        t = np.asarray(self.times, dtype=np.float64)
+        rate = self.rows / self.seconds if self.op in ("insert", "delete") and self.rows and self.seconds else None
+        out = {
+            "op": self.op, "batch": self.batch, "calls": len(t), "rows": self.rows, "durability": self.durability,
+            "first_us": self.first_us, "max_us": float(t.max()) if len(t) else None, "rows_per_s": rate,
+            **latency_stats(t),
+        }
+
+        if self.measured:
+            out.update(cpu_ms=self.used.cpu_ms, cpu_qos_ms=self.used.qos_ms, logical_bytes_written=self.logical,
+                       disk_bytes_written=self.used.bytes_written, footprint_before=self.footprint_before,
+                       footprint_after=self.footprint_after,
+                       lifetime_max_footprint=rusage.Usage.now().lifetime_max_footprint,
+                       swapins_delta=self.vm["swapins"], compressions_delta=self.vm["compressions"])
+
+        if self.unsupported is not None:
+            out["unsupported"] = self.unsupported
+
+        return out | {"extra": dict(self.extra)}
+
+
+def maintain_fields(action: str, threads: int, params: dict, seconds: float, before: rusage.Usage,
+                    after: rusage.Usage, report: dict | None) -> dict:
+    """A maintenance run's fields from what the hook returned. Its "rows_live", "durability" and "data_file" go to
+    their own places, and the rest of the library's report to extra."""
+    report = dict(report or {})
+    rows_live, durability, data_file = (report.pop(k, None) for k in ("rows_live", "durability", "data_file"))
+    used = after - before
+    return {
+        "action": action, "threads": threads, "params": params, "seconds": seconds, "cpu_seconds": used.cpu_ns / 1e9,
+        "footprint_before": before.footprint, "peak_footprint": after.lifetime_max_footprint,
+        "bytes_read": used.bytes_read, "bytes_written": used.bytes_written, "rows_live": rows_live,
+        "durability": durability, "extra": {"report": report, "data_file": str(data_file) if data_file else None},
+    }
+
+
+def check_ids(got: Any, ids: np.ndarray) -> None:
+    """Raises unless a library that numbers its inserts itself gave them the stream's ids, i.e. their rows."""
+    if got is None:
+        return
+
+    got = np.asarray(got, dtype=np.int64).ravel()
+
+    if not np.array_equal(got, ids):
+        raise RuntimeError(f"the library numbered the rows {int(ids[0])} to {int(ids[-1])} as {got[:3].tolist()} and "
+                           f"on, not by their rows")
+
+
 class Adapter:
     """One system. Subclasses set the class attributes and implement the hooks they need. Hooks raise `Unsupported`
     for what the system can't do."""
@@ -265,6 +426,17 @@ class Adapter:
     # Whether an open reads every file of the index into the system's own memory, so the default files() marks every
     # range "loaded".
     loads_at_open = False
+    # The system's role in the write benchmark, one of WRITE_ROLES. A system without write hooks rebuilds.
+    write_role = "rebuild"
+    # The level a write call reaches by itself and the level `sync` reaches, and the level of the durable point where
+    # it differs from the sync's, eg. {"call": "process", "sync": "power"}.
+    durability: dict[str, str] = {"call": "memory", "sync": "power"}
+    # "incremental" when a sync writes only what changed, so a stream syncs after every call and a latency run times a
+    # sync after each of its durable inserts. "whole" when it rewrites the index, so a stream saves once at its end and
+    # a latency run times `saves` durable points instead.
+    sync_kind = "whole"
+    # The actions `maintain` takes, eg. ("fold", "auto", "major", "job"). A compaction is one of them.
+    maintenance_actions: tuple[str, ...] = ()
 
     def __init__(self) -> None:
         self.children: set[subprocess.Popen] = set()
@@ -365,6 +537,247 @@ class Adapter:
                         "ranges": [{"offset": 0, "length": size, "kind": "bulk"} | loaded]})
 
         return out
+
+    def writer_open(self, ctx: WriteContext, path: Path) -> Any:
+        """Opens the index at `path` for writes and returns a handle, eg. loading a faiss index whose searches map it.
+        A system with no write call keeps this default, which makes it rebuild-only."""
+        raise Unsupported(f"{self.system} has no write call, so it takes the stream as a fresh build")
+
+    def insert(self, w: Any, ids: np.ndarray, rows: np.ndarray) -> np.ndarray | None:
+        """One insert call of `rows`, one float32 row per id of `ids`, int64. The batch is len(ids), and a batch of 1
+        uses the library's single-item call where it has one. A library that numbers its inserts itself returns the ids
+        it gave them, which a stream session checks against `ids`. Any other returns None."""
+        raise Unsupported(f"{self.system} has no insert")
+
+    def delete(self, w: Any, ids: np.ndarray) -> None:
+        """One delete call of `ids`. An inserts-only system keeps this default, so its latency runs record the deletes
+        as unsupported and the driver gives it only the inserts-only ladder."""
+        raise Unsupported(f"{self.system} has no delete")
+
+    def sync(self, w: Any) -> dict | None:
+        """Brings every change so far to the level durability["sync"] names, and returns what it did, eg. the files it
+        synced, for the line's extra."""
+        raise Unsupported(f"{self.system} has no sync")
+
+    def durable_point(self, w: Any) -> dict | None:
+        """The system's own end of a session, i.e. its sync, flush, save or close. A stream session times it once at
+        its end, and a latency run times it `saves` times when `sync_kind` is "whole". It is the sync by default. One
+        that closes the library, eg. AsterVec's close, opens it again into the same handle."""
+        return self.sync(w)
+
+    def resize(self, w: Any, capacity: int) -> bool:
+        """Makes room for ids up to `capacity` before a round's inserts, for a library that needs it, eg.
+        RaBitQ-Library's HNSW. It returns whether it did anything, and the session times it as an op of its own when it
+        did. It does nothing by default."""
+        return False
+
+    def maintain(self, w: Any, action: str, threads: int, params: dict) -> dict | None:
+        """Runs one action of `maintenance_actions` on `threads` threads with the suite's `params`, and returns what the
+        library reports, eg. ColdIVF's RunReport as a dict. Its "rows_live", the vectors the index holds after,
+        "durability", the level the maintained index is at, and "data_file", a file whose hash the driver compares
+        between actions, go to the line's fields, and the rest to its extra."""
+        raise Unsupported(f"{self.system} has no maintenance action {action}")
+
+    def due(self, w: Any, params: dict) -> bool:
+        """Whether the library's own policy calls for a maintenance run now, with the suite's `params`, for the policy
+        pass, eg. ColdIVF's Status.due."""
+        raise Unsupported(f"{self.system} has no maintenance policy")
+
+    def pending(self, w: Any) -> dict:
+        """The library's own counts of unmaintained changes, eg. ColdIVF's Status or LanceDB's fragments and versions,
+        for the extra of a session's last line. Nothing by default."""
+        return {}
+
+    def writer_close(self, w: Any) -> None:
+        """Closes the writer after its durable point."""
+
+    def seal_state(self, ctx: WriteContext, path: Path) -> dict | None:
+        """Leaves a state's folder as every later open will find it, once its session has closed. eg. a store that
+        writes at every open takes one more open and close and then stores.py's seal, as its build does. It isn't
+        timed, and does nothing by default."""
+        return None
+
+    def write_session(self, ctx: WriteContext, args: argparse.Namespace, wire: Wire) -> None:
+        """Runs the `write` subcommand. It opens the writer, makes the session's calls through the hooks, and sends
+        `opened`, an `op` event per op with its write fields, a `maintain` event per run of the policy pass, and
+        `done`. A stream session ends with the durable point, closes the writer and seals the state. A latency run
+        leaves its clone as it is, since the driver throws it away."""
+        stream = writes.read_stream(args.stream)
+        stream.check()
+        rusage.set_interactive()
+        gc.collect()
+        gc.disable()
+        start = rusage.Usage.now()
+        t0 = now_ns()
+        w = self.writer_open(ctx, ctx.index)
+        opened = {"open_us": (now_ns() - t0) / 1e3, "open_footprint": rusage.Usage.now().footprint}
+        wire.send("opened", pid=os.getpid(), footprint_before_open=start.footprint, **opened)
+        before = writes.folder_bytes(ctx.index)
+
+        if ctx.mode == "latency":
+            ops, last = self._latency_calls(ctx, w, stream, args), None
+            done: dict = {}
+        else:
+            ops, last, done = self._stream_calls(ctx, w, stream, args, wire)
+
+        after = writes.folder_bytes(ctx.index)
+        self.writer_close(w)
+        # The calls change the folder from its size at the open to its size before the durable point, which the
+        # durable point changes in turn.
+        point = done.pop("bytes_before_point", after)
+        sent = False
+
+        for op in ops:
+            if not op.times and op.unsupported is None:
+                continue
+
+            span = (point, after) if op is last else (before, point)
+            fields = op.fields() | {"mode": ctx.mode, "threads": ctx.threads, "index_bytes_before": span[0],
+                                    "index_bytes_after": span[1]}
+
+            if not sent:
+                fields.update(opened)
+                sent = True
+
+            wire.send("op", fields=fields)
+
+        if ctx.mode == "stream":
+            done["sealed"] = self.seal_state(ctx, ctx.index)
+
+        wire.send("done", **done)
+
+    def _latency_calls(self, ctx: WriteContext, w: Any, stream: writes.Stream,
+                       args: argparse.Namespace) -> list[OpTimer]:
+        """A latency run: single inserts of reserved rows and single deletes of base ids, each timed after warm-up
+        calls, then the cost of making one write durable. That is an insert and a sync after it, timed together and the
+        sync alone, where the sync writes only what changed, or else `saves` durable points."""
+        plan = writes.latency_plan(stream, args.round, ctx.pass_name != "inserts", args.reserve, args.warmup,
+                                   args.calls, args.durable_calls, args.seed)
+        call, sync = self.durability.get("call"), self.durability.get("sync")
+        grow = OpTimer("resize", 0, call)
+        held = stream.base_rows + sum(len(r.inserts) for r in stream.rounds[: args.round])
+        grow.call(lambda: self.resize(w, held + len(plan.inserts)), keep=bool)
+        ins, dels = OpTimer("insert", 1, call), OpTimer("delete", 1, call)
+
+        for i in range(plan.warmup + plan.calls):
+            ids = plan.inserts[i : i + 1]
+            rows = writes.vectors(ctx.dataset, ids)
+            ins.call(lambda: self.insert(w, ids, rows), 1, timed=i >= plan.warmup)
+
+        try:
+            for i in range(len(plan.deletes)):
+                ids = plan.deletes[i : i + 1]
+                dels.call(lambda: self.delete(w, ids), 1, timed=i >= plan.warmup)
+        except Unsupported as e:
+            dels.unsupported = str(e)
+
+        if self.sync_kind != "incremental":
+            point = OpTimer("durable_point", 0, self.durability.get("durable_point", sync))
+
+            for _ in range(args.saves):
+                point.call(lambda: self.durable_point(w))
+
+            return [grow, ins, dels, point]
+
+        # Each durable insert times the insert and the sync after it as one call, with the counters of both, and the
+        # sync alone apart, from a clock read between them.
+        both, alone = OpTimer("insert_sync", 1, sync), OpTimer("sync", 1, sync)
+        marks = [0]
+
+        def pair(ids: np.ndarray, rows: np.ndarray) -> Any:
+            self.insert(w, ids, rows)
+            marks[0] = now_ns()
+            return self.sync(w)
+
+        for i in range(plan.durable):
+            at = plan.warmup + plan.calls + i
+            ids = plan.inserts[at : at + 1]
+            rows = writes.vectors(ctx.dataset, ids)
+            both.call(lambda: pair(ids, rows), 1)
+            alone.add((both.last[1] - marks[0]) / 1e3, 1)
+
+        return [grow, ins, dels, both, alone]
+
+    def _stream_calls(self, ctx: WriteContext, w: Any, stream: writes.Stream, args: argparse.Namespace,
+                      wire: Wire) -> tuple[list[OpTimer], OpTimer, dict]:
+        """A stream session: the calls of rounds --from-round + 1 to --round in batches, a sync after each call where
+        the sync writes only what changed, in the policy pass a maintenance run whenever one is due, and the durable
+        point at the end. Each insert passes the next ids and the vectors of the stream's rows. It returns the ops, the
+        durable point among them, and what the done event carries."""
+        rounds = writes.stream_calls(stream, ctx.pass_name, args.from_round, args.round, args.batch)
+        call, sync = self.durability.get("call"), self.durability.get("sync")
+        ins, dels = OpTimer("insert", args.batch, call), OpTimer("delete", args.batch, call)
+        syncs, grow = OpTimer("sync", args.batch, sync), OpTimer("resize", 0, call)
+        capacity = stream.base_rows + sum(len(r.inserts) for r in stream.rounds[: args.from_round])
+        runs, status_us, maintain_s = 0, 0.0, 0.0
+
+        for calls in rounds:
+            capacity += sum(len(c.ids) for c in calls if c.op == "insert")
+            grow.call(lambda: self.resize(w, capacity), keep=bool)
+
+            for j, c in enumerate(calls):
+                if c.op == "insert":
+                    rows = writes.vectors(ctx.dataset, c.rows)
+                    check_ids(ins.call(lambda: self.insert(w, c.ids, rows), len(c.ids)), c.ids)
+                else:
+                    dels.call(lambda: self.delete(w, c.ids), len(c.ids))
+
+                if self.sync_kind == "incremental":
+                    syncs.call(lambda: self.sync(w), len(c.ids))
+
+                if ctx.policy:
+                    a = now_ns()
+                    due = self.due(w, ctx.maintain_params)
+                    status_us += (now_ns() - a) / 1e3
+
+                    if due:
+                        runs += 1
+                        fields = self._policy_run(ctx, w, runs, c.round, j)
+                        maintain_s += fields["seconds"]
+                        wire.send("maintain", fields=fields)
+
+        before_point = writes.folder_bytes(ctx.index)
+        pending = self.pending(w)
+        point = OpTimer("durable_point", args.batch, self.durability.get("durable_point", sync))
+        rows = ins.rows + dels.rows
+        point.call(lambda: self.durable_point(w), rows)
+        busy = ins.seconds + dels.seconds + syncs.seconds + grow.seconds
+        point.extra.update(
+            pending=pending, rows=rows, runs=runs, status_us=status_us, maintain_s=maintain_s,
+            rows_per_s=rows / busy if rows and busy else None,
+            rows_per_s_durable=rows / (busy + point.seconds) if rows else None,
+            rows_per_s_with_runs=rows / (busy + point.seconds + maintain_s) if rows and ctx.policy else None,
+        )
+        return [grow, ins, dels, syncs, point], point, {"bytes_before_point": before_point, "runs": runs}
+
+    def _policy_run(self, ctx: WriteContext, w: Any, run: int, round_: int, call: int) -> dict:
+        """One maintenance run of the policy pass, made at once when the library's policy calls for it."""
+        pending = self.pending(w)
+        before, start = rusage.Usage.now(), time.perf_counter()
+        report = self.maintain(w, ctx.policy, ctx.maintain_threads, ctx.maintain_params)
+        seconds, after = time.perf_counter() - start, rusage.Usage.now()
+        fields = maintain_fields(ctx.policy, ctx.maintain_threads, ctx.maintain_params, seconds, before, after, report)
+        fields["extra"].update(run=run, round=round_, after_call=call, pending_before=pending)
+        return fields
+
+    def maintain_session(self, ctx: WriteContext, action: str, params: dict, wire: Wire) -> None:
+        """Runs the `maintain` subcommand: one action on a clone of a state, in a fresh process, so its lifetime peak
+        footprint is the action's. It then closes the writer, seals the state and sends `maintain`."""
+        if action not in self.maintenance_actions:
+            raise Unsupported(f"{self.system} has no maintenance action {action}")
+
+        t0 = now_ns()
+        w = self.writer_open(ctx, ctx.index)
+        open_us = (now_ns() - t0) / 1e3
+        before, start = rusage.Usage.settled(), time.perf_counter()
+        report = self.maintain(w, action, ctx.threads, params)
+        seconds, after = time.perf_counter() - start, rusage.Usage.settled()
+        pending = self.pending(w)
+        self.writer_close(w)
+        fields = maintain_fields(action, ctx.threads, params, seconds, before, after, report)
+        fields["open_us"] = open_us
+        fields["extra"].update(pending=pending, sealed=self.seal_state(ctx, ctx.index))
+        wire.send("maintain", fields=fields)
 
     def run_child(self, cmd: list[str], env: dict | None = None, timeout: float | None = None,
                   capture: bool = True) -> subprocess.CompletedProcess:
@@ -547,7 +960,8 @@ class Adapter:
     def warm_run(self, ctx: ServeContext, grid: list[dict], qids: np.ndarray, ids_dir: Path, passes: int,
                  warmup: int, qps_seconds: float, qps_repeats: int) -> Iterator[dict]:
         """Runs every setting of `grid` on one open index and yields one result per setting. A result holds "params",
-        the warm "fields" and, at 1 thread, "ids_file", an .npy of the first pass's ids, one row per query of qids."""
+        the warm "fields" and, at 1 thread, "ids_file", an .npy of the first pass's ids, one row per query of qids. With
+        ctx.probes the first setting's result also holds "probes_file", the ids of a search for each probe row."""
         queries = np.stack([ctx.queries[int(q)] for q in qids])
         all_queries = list(ctx.queries.values())
         ctx.params = dict(grid[0]) if grid else {}
@@ -574,6 +988,9 @@ class Adapter:
                     fields = self._qps(handle, ctx, params, queries, qps_seconds, qps_repeats)
                     result = {"params": params, "fields": fields, "ids_file": None}
 
+                if i == 0 and ctx.probes is not None:
+                    result["probes_file"] = str(self.probe(handle, ctx, params, ids_dir))
+
                 # A run with worker processes reports its workers' figures instead.
                 fields.setdefault("footprint_before_open", before_open)
                 fields.setdefault("footprint_since_open", fields["footprint"] - before_open
@@ -582,6 +999,21 @@ class Adapter:
                 yield result
         finally:
             self.close(handle)
+
+    def probe(self, handle: Any, ctx: ServeContext, params: dict, ids_dir: Path) -> Path:
+        """Searches each row of ctx.probes as a query with `params`, for the findability check, after the timed passes,
+        and saves the ids as probes.npy in `ids_dir`, one row per probe. An adapter that overrides warm_run calls it
+        too, or leaves the probes out."""
+        found = np.full((len(ctx.probes), ctx.k), -1, dtype=np.int64)
+
+        for j, row in enumerate(np.asarray(ctx.probes).tolist()):
+            query = np.asarray(ctx.dataset.base[row], dtype=np.float32)
+            ids = np.asarray(self.search(handle, query, ctx.k, params)).ravel()[: ctx.k]
+            found[j, : len(ids)] = ids
+
+        path = ids_dir / "probes.npy"
+        np.save(path, found)
+        return path
 
     def _drop_loaded(self, ctx: ServeContext) -> int | None:
         """Drops the cached pages of the ranges files() marks "loaded", and returns the bytes that were cached there, or
@@ -834,6 +1266,10 @@ class Adapter:
             "wheel_sha256": self.wheels(),
             "venv": sys.prefix,
             "python": sys.executable,
+            "write_role": self.write_role,
+            "durability": dict(self.durability),
+            "sync_kind": self.sync_kind,
+            "maintenance_actions": list(self.maintenance_actions),
         }
 
 
@@ -883,6 +1319,7 @@ def _parser() -> argparse.ArgumentParser:
     w.add_argument("--warmup", type=int, default=1000)
     w.add_argument("--qps-seconds", type=float, default=10.0)
     w.add_argument("--qps-repeats", type=int, default=3)
+    w.add_argument("--probes", default=None, help="an .npy of base rows to search as queries, for findability")
 
     c = sub.add_parser("cold")
     common(c)
@@ -912,6 +1349,33 @@ def _parser() -> argparse.ArgumentParser:
     q.add_argument("--params", default="{}")
     q.add_argument("--split", default="tune")
     q.add_argument("--seconds", type=float, default=10.0)
+
+    wr = sub.add_parser("write")
+    common(wr)
+    wr.add_argument("--index", required=True, help="a clone of the state the session starts from")
+    wr.add_argument("--stream", required=True, help="the stream file")
+    wr.add_argument("--mode", default="stream", choices=writes.MODES)
+    wr.add_argument("--pass", dest="pass_name", default="joint", choices=writes.PASSES)
+    wr.add_argument("--round", type=int, required=True,
+                    help="the round a stream session ends at, or the round of a latency run's state")
+    wr.add_argument("--from-round", type=int, default=0, help="the round of the state a stream session starts from")
+    wr.add_argument("--batch", type=int, default=1000, help="rows per call of a stream session")
+    wr.add_argument("--calls", type=int, default=1000, help="timed calls of each op of a latency run")
+    wr.add_argument("--warmup", type=int, default=100, help="untimed calls before them")
+    wr.add_argument("--durable-calls", type=int, default=200, help="inserts each followed by a sync")
+    wr.add_argument("--saves", type=int, default=5, help="durable points timed where a sync rewrites the index")
+    wr.add_argument("--reserve", type=int, default=0, help="the first reserved row a latency run inserts")
+    wr.add_argument("--seed", type=int, default=2, help="the seed of a latency run's deletes")
+    wr.add_argument("--params", default="{}", help="the write entry's settings, as JSON")
+    wr.add_argument("--policy", default=None, help="the run kind of the policy pass")
+    wr.add_argument("--maintain-params", default="{}")
+    wr.add_argument("--maintain-threads", type=int, default=1)
+
+    m = sub.add_parser("maintain")
+    common(m)
+    m.add_argument("--index", required=True, help="a clone of the state the action maintains")
+    m.add_argument("--action", required=True)
+    m.add_argument("--params", default="{}")
     return p
 
 
@@ -960,6 +1424,7 @@ def _warm(adapter: Adapter, args: argparse.Namespace, wire: Wire, dataset: data.
     ctx.queries = _queries(dataset, sorted(set(qids.tolist()) | set(range(min(args.warmup, len(dataset.queries))))))
     ids_dir = Path(args.ids_dir)
     ids_dir.mkdir(parents=True, exist_ok=True)
+    ctx.probes = np.load(args.probes) if args.probes else None
     rusage.set_interactive()
 
     for i, result in enumerate(adapter.warm_run(ctx, grid, qids, ids_dir, args.passes, args.warmup,
@@ -969,7 +1434,8 @@ def _warm(adapter: Adapter, args: argparse.Namespace, wire: Wire, dataset: data.
         fields.setdefault("threads", ctx.threads)
         fields.setdefault("k", ctx.k)
         wire.send("setting", index=i, params=result["params"], fields=fields, ids_file=result.get("ids_file"),
-                  qids=None if result.get("ids_file") is None else qids.tolist())
+                  qids=None if result.get("ids_file") is None else qids.tolist(),
+                  probes_file=result.get("probes_file"))
 
     wire.send("done")
 
@@ -1023,3 +1489,16 @@ def run(adapter: Adapter, args: argparse.Namespace, wire: Wire, dataset: data.Da
         ctx.params = json.loads(args.params)
         ctx.queries = _queries(dataset, data.split_ids(dataset.queries.shape[0], args.split).tolist())
         adapter.qps_worker(ctx, wire, args.seconds)
+    elif args.command == "write":
+        ctx = _write_ctx(args, dataset)
+        ctx.mode, ctx.pass_name, ctx.policy = args.mode, args.pass_name, args.policy
+        ctx.maintain_params, ctx.maintain_threads = json.loads(args.maintain_params), args.maintain_threads
+        adapter.write_session(ctx, args, wire)
+    elif args.command == "maintain":
+        adapter.maintain_session(_write_ctx(args, dataset), args.action, json.loads(args.params), wire)
+
+
+def _write_ctx(args: argparse.Namespace, dataset: data.Dataset) -> WriteContext:
+    return WriteContext(index=Path(args.index), dataset=dataset, rows=args.rows, metric=args.metric or dataset.metric,
+                        threads=args.threads, variant=args.variant,
+                        params=json.loads(getattr(args, "params", None) or "{}"))

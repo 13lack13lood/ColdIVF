@@ -1,11 +1,15 @@
 """Runs a benchmark suite through each system's adapter and appends the results.
 
-    python driver.py SUITE.toml [--only build,warm,cold] [--systems a,b] [--groups g,h] [--gate enforce|warn|off]
-                                [--dry-run]
+    python driver.py SUITE.toml [--only build,stream,latency,maintain,warm,cold,refs] [--systems a,b] [--groups g,h]
+                                [--gate enforce|warn|off] [--dry-run]
 
 A batch checks the timing gate and the disk floor, runs the drift references, builds what isn't built, measures each
 system's per-call cost and runs the warm grids, then the cold trials in rounds of randomly ordered cells, runs the
 references again and writes a batch summary.
+A suite with a [writes] table also runs the write benchmark's phases after the builds. The stream phase replays the
+stream on clones of each build and keeps a clone of the work folder as each state, the latency phase times single
+writes on throwaway clones of the latency states, and the maintain phase runs each maintenance action on a clone of
+S10. Warm and cold entries with states then search every state as an index of its own.
 Every adapter is a child process of this one, started with the suite's interpreter and never in a new session, so a
 memory cap on this process group covers it. Lines go to <results>/<phase>/<system>.jsonl, and a rerun skips every run
 key that is already done. README.md describes the suite file.
@@ -40,22 +44,29 @@ import data  # noqa: E402
 import evictor  # noqa: E402
 import rusage  # noqa: E402
 import schema  # noqa: E402
+import writes  # noqa: E402
 
 REPO = PY.parents[1]
 GIB = 1 << 30
 
 SUITE_KEYS = {"phase", "dataset", "n", "index_root", "results_root", "seed", "k", "truth", "gate", "refs", "system",
-              "max_attempts", "wait_s"}
+              "max_attempts", "wait_s", "writes"}
 GATE_KEYS = {"mode", "cpu_idle_pct", "top_samples", "top_interval_s", "disk_floor_gb", "max_wait_s", "recheck_s",
              "require_ac", "require_caffeinate", "busy_names", "agents", "invalid_vm", "locks"}
 REFS_KEYS = {"mode", "wave_trials", "wave_ranges", "wave_page", "wave_file", "wave_size_mb", "coldivf_index",
              "coldivf_dataset", "coldivf_n", "coldivf_params", "coldivf_trials", "drift_pct"}
-SYSTEM_KEYS = {"name", "adapter", "python", "variant", "env", "build", "warm", "cold"}
-BUILD_KEYS = {"config_id", "config", "seeds", "threads", "disk_gb", "timeout_s", "index", "clusters", "n"}
+SYSTEM_KEYS = {"name", "adapter", "python", "variant", "env", "build", "warm", "cold", "write", "maintain"}
+BUILD_KEYS = {"config_id", "config", "seeds", "threads", "disk_gb", "timeout_s", "index", "clusters", "n", "data"}
 WARM_KEYS = {"config_id", "seed", "split", "threads", "mode", "grid", "settings", "passes", "warmup", "k",
-             "qps_seconds", "qps_repeats", "timeout_s"}
+             "qps_seconds", "qps_repeats", "timeout_s", "states", "findability"}
 COLD_KEYS = {"config_id", "seed", "regime", "params", "trials", "split", "cpu_state", "next", "delay_ms", "threads",
-             "group", "dummy", "dummy_n", "k", "self_evict", "fresh_clone", "timeout_s", "ready_timeout_s"}
+             "group", "dummy", "dummy_n", "k", "self_evict", "fresh_clone", "timeout_s", "ready_timeout_s", "states"}
+WRITE_KEYS = {"config_id", "seed", "role", "threads", "states", "params", "timeout_s"}
+MAINTAIN_KEYS = {"config_id", "seed", "state", "actions", "threads", "action_threads", "params", "timeout_s", "disk_gb",
+                 "unsearched", "same_file"}
+
+READ_PHASES = {"build", "warm", "cold", "refs"}
+WRITE_PHASES = {"stream", "latency", "maintain"}
 
 DEFAULT_GATE = {
     "mode": "enforce", "cpu_idle_pct": 85.0, "top_samples": 3, "top_interval_s": 10, "disk_floor_gb": 40.0,
@@ -84,7 +95,8 @@ WARMUP_QUERIES = 8
 OVERHEAD_ROWS = 1000
 OVERHEAD_TIMEOUT_S = 900.0
 # What the batch line keeps of each system's info event, eg. which threads it runs and at which QoS class.
-INFO_KEYS = ("system", "system_version", "binding", "regimes", "batch_api", "qps_mode", "workers", "worker_qos")
+INFO_KEYS = ("system", "system_version", "binding", "regimes", "batch_api", "qps_mode", "workers", "worker_qos",
+             "write_role", "sync_kind")
 # How often a build's folder is measured, in seconds, so files that live a fraction of a second are still seen.
 DISK_SAMPLE_S = 0.02
 
@@ -140,6 +152,12 @@ class Build:
     prebuilt: Path | None = None
     clusters: Path | None = None
     out: Path | None = None
+    # Another base file to build from, eg. the copy of a state's live rows, with its queries and truth beside it.
+    data: Path | None = None
+    # A state of the write benchmark, eg. "s5", searched as an index of its own, and the build it came from. Its n is
+    # the vectors it holds.
+    state: str | None = None
+    origin: Build | None = None
 
     @property
     def index(self) -> Path:
@@ -160,6 +178,43 @@ class Warm:
     qps_seconds: float = 10.0
     qps_repeats: int = 3
     timeout_s: float = 7200.0
+    # Whether the first setting also searches the state's probe rows as queries, for the findability check.
+    findability: bool = False
+
+
+@dataclass
+class WriteJob:
+    """A system's write entry: the build it writes to, its role, and the states its passes keep."""
+
+    system: System
+    build: Build
+    role: str
+    states: list[str]
+    threads: int = 1
+    params: dict = field(default_factory=dict)
+    timeout_s: float = 7200.0
+
+
+@dataclass
+class MaintainJob:
+    """A system's maintenance entry: each action runs on a clone of `state` and becomes the state <state>-<action>.
+    `same_file` maps an action to another whose data file it must match, and `unsearched` lists the actions whose
+    states a warm or cold entry's "all" leaves out."""
+
+    system: System
+    build: Build
+    state: str
+    actions: list[str]
+    threads: int = 10
+    action_threads: dict = field(default_factory=dict)
+    params: dict = field(default_factory=dict)
+    timeout_s: float = 7200.0
+    disk_gb: float = 0.0
+    unsearched: list[str] = field(default_factory=list)
+    same_file: dict = field(default_factory=dict)
+
+    def threads_of(self, action: str) -> int:
+        return int(self.action_threads.get(action, self.threads))
 
 
 @dataclass
@@ -208,6 +263,10 @@ class System:
     builds: list[Build] = field(default_factory=list)
     warm: list[Warm] = field(default_factory=list)
     cold: list[Cell] = field(default_factory=list)
+    writes: list[WriteJob] = field(default_factory=list)
+    maintains: list[MaintainJob] = field(default_factory=list)
+    # The states its warm and cold entries search, by build and state.
+    states: dict = field(default_factory=dict)
 
     @property
     def module(self) -> str:
@@ -231,6 +290,7 @@ class Suite:
     systems: list[System]
     max_attempts: int = 3
     wait_s: float = 1.0
+    writes: writes.WritesConfig | None = None
 
     @property
     def builds(self) -> list[Build]:
@@ -286,6 +346,12 @@ def load_suite(path: Path | str) -> Suite:
                   systems=[], max_attempts=int(doc.get("max_attempts", 3)), wait_s=float(doc.get("wait_s", 1.0)))
     names = set()
 
+    if "writes" in doc:
+        try:
+            suite.writes = writes.parse_writes(doc["writes"], n, suite.dataset)
+        except writes.StreamError as e:
+            raise SuiteError(str(e)) from e
+
     for entry in doc.get("system", []):
         _check_keys(entry, SYSTEM_KEYS, "a [[system]]")
         name, variant = str(entry["name"]), str(entry.get("variant", ""))
@@ -307,10 +373,13 @@ def load_suite(path: Path | str) -> Suite:
                 build = Build(system=system, config_id=str(b["config_id"]), config=dict(b.get("config", {})),
                               seed=int(seed), n=bn, threads=int(b.get("threads", 10)),
                               disk_gb=float(b.get("disk_gb", 0)), timeout_s=float(b.get("timeout_s", 7200)),
-                              prebuilt=_repo_path(b.get("index")), clusters=_repo_path(b.get("clusters")))
+                              prebuilt=_repo_path(b.get("index")), clusters=_repo_path(b.get("clusters")),
+                              data=_repo_path(b.get("data")))
                 folder = _slug(name + (f"-{variant}" if variant else ""))
                 build.out = index_root / folder / _slug(f"{build.config_id}-n{bn}-s{build.seed}")
                 system.builds.append(build)
+
+        _load_writes(suite, system, entry)
 
         for w in entry.get("warm", []):
             _check_keys(w, WARM_KEYS, f"a warm entry of {name}")
@@ -320,13 +389,18 @@ def load_suite(path: Path | str) -> Suite:
             if not settings:
                 raise SuiteError(f"a warm entry of {name} has no settings")
 
-            system.warm.append(Warm(system=system, build=build, split=str(w.get("split", "tune")),
-                                    threads=int(w.get("threads", 1)), mode=str(w.get("mode", "whole")),
-                                    settings=settings, passes=int(w.get("passes", 3)),
-                                    warmup=int(w.get("warmup", 1000)), k=int(w.get("k", k)),
-                                    qps_seconds=float(w.get("qps_seconds", 10)),
-                                    qps_repeats=int(w.get("qps_repeats", 3)),
-                                    timeout_s=float(w.get("timeout_s", 7200))))
+            states = _entry_states(suite, system, build, w.get("states"), f"a warm entry of {name}")
+            probed = _findability(suite, system, build, w.get("findability", False), states, name)
+
+            for target in [state_build(suite, system, build, x) for x in states] if states is not None else [build]:
+                system.warm.append(Warm(system=system, build=target, split=str(w.get("split", "tune")),
+                                        threads=int(w.get("threads", 1)), mode=str(w.get("mode", "whole")),
+                                        settings=settings, passes=int(w.get("passes", 3)),
+                                        warmup=int(w.get("warmup", 1000)), k=int(w.get("k", k)),
+                                        qps_seconds=float(w.get("qps_seconds", 10)),
+                                        qps_repeats=int(w.get("qps_repeats", 3)),
+                                        timeout_s=float(w.get("timeout_s", 7200)),
+                                        findability=target.state in probed))
 
         for c in entry.get("cold", []):
             _check_keys(c, COLD_KEYS, f"a cold entry of {name}")
@@ -343,19 +417,176 @@ def load_suite(path: Path | str) -> Suite:
                               n=int(c["dummy_n"]), threads=build.threads, disk_gb=0.0, timeout_s=build.timeout_s)
                 dummy.out = build.out.parent / f"{build.out.name}-dummy{dummy.n}"
 
-            system.cold.append(Cell(system=system, build=build, regime=regime, params=dict(c.get("params", {})),
-                                    trials=int(c.get("trials", 30)), split=str(c.get("split", "test")),
-                                    cpu_state=str(c.get("cpu_state", "prewarm")),
-                                    next=int(c.get("next", 9 if regime != "c1" else 0)),
-                                    delay_ms=float(c.get("delay_ms", 0)), threads=int(c.get("threads", 1)),
-                                    group=str(c.get("group", "main")), dummy=dummy, k=int(c.get("k", k)),
-                                    self_evict=bool(c.get("self_evict", False)),
-                                    fresh_clone=bool(c.get("fresh_clone", False)),
-                                    timeout_s=float(c.get("timeout_s", 600)),
-                                    ready_timeout_s=float(c.get("ready_timeout_s", 600))))
+            states = _entry_states(suite, system, build, c.get("states"), f"a cold entry of {name}")
+
+            for target in [state_build(suite, system, build, x) for x in states] if states is not None else [build]:
+                system.cold.append(Cell(system=system, build=target, regime=regime, params=dict(c.get("params", {})),
+                                        trials=int(c.get("trials", 30)), split=str(c.get("split", "test")),
+                                        cpu_state=str(c.get("cpu_state", "prewarm")),
+                                        next=int(c.get("next", 9 if regime != "c1" else 0)),
+                                        delay_ms=float(c.get("delay_ms", 0)), threads=int(c.get("threads", 1)),
+                                        group=str(c.get("group", "main")), dummy=dummy, k=int(c.get("k", k)),
+                                        self_evict=bool(c.get("self_evict", False)),
+                                        fresh_clone=bool(c.get("fresh_clone", False)),
+                                        timeout_s=float(c.get("timeout_s", 600)),
+                                        ready_timeout_s=float(c.get("ready_timeout_s", 600))))
 
     _check_groups(suite)
     return suite
+
+
+def _load_writes(suite: Suite, system: System, entry: dict) -> None:
+    """Reads a system's write and maintenance entries, which need the suite's [writes] table."""
+    cfg = suite.writes
+
+    for w in entry.get("write", []):
+        _check_keys(w, WRITE_KEYS, f"a write entry of {system.name}")
+
+        if cfg is None:
+            raise SuiteError(f"a write entry of {system.name} needs the suite's [writes] table")
+
+        build = _find_build(system, str(w["config_id"]), w.get("seed"), f"a write entry of {system.name}")
+        role = str(w.get("role", "full"))
+
+        if role not in writes.ROLES or role == "rebuild":
+            raise SuiteError(f"a write entry of {system.name} has role {role}, not full, inserts or exact")
+
+        states = [str(x) for x in w.get("states") or default_states(cfg, role)]
+
+        for x in states:
+            spec = _spec(cfg, x, f"a write entry of {system.name}")
+
+            if not spec.pass_name or (role == "inserts" and spec.pass_name != "inserts") or \
+                    (role == "exact" and spec.pass_name == "policy"):
+                raise SuiteError(f"a write entry of {system.name} with role {role} can't make state {x}")
+
+        system.writes.append(WriteJob(system=system, build=build, role=role, states=states,
+                                      threads=int(w.get("threads", 1)), params=dict(w.get("params", {})),
+                                      timeout_s=float(w.get("timeout_s", 7200))))
+
+    for m in entry.get("maintain", []):
+        _check_keys(m, MAINTAIN_KEYS, f"a maintenance entry of {system.name}")
+
+        if cfg is None:
+            raise SuiteError(f"a maintenance entry of {system.name} needs the suite's [writes] table")
+
+        build = _find_build(system, str(m["config_id"]), m.get("seed"), f"a maintenance entry of {system.name}")
+        final = cfg.final("joint")
+        state = str(m.get("state") or (final.name if final else ""))
+        _spec(cfg, state, f"a maintenance entry of {system.name}")
+        actions = [str(a) for a in m.get("actions", [])]
+
+        if not actions or not all(writes.STATE_NAME.match(a) for a in actions):
+            raise SuiteError(f"a maintenance entry of {system.name} needs actions of letters and digits")
+
+        job = MaintainJob(system=system, build=build, state=state, actions=actions, threads=int(m.get("threads", 10)),
+                          action_threads={str(a): int(t) for a, t in m.get("action_threads", {}).items()},
+                          params=dict(m.get("params", {})), timeout_s=float(m.get("timeout_s", 7200)),
+                          disk_gb=float(m.get("disk_gb", 0)), unsearched=[str(a) for a in m.get("unsearched", [])],
+                          same_file={str(a): str(b) for a, b in m.get("same_file", {}).items()})
+
+        if not set(job.action_threads) | set(job.unsearched) | set(job.same_file) | set(job.same_file.values()) <= \
+                set(actions):
+            raise SuiteError(f"a maintenance entry of {system.name} names an action it doesn't run")
+
+        system.maintains.append(job)
+
+
+def _spec(cfg: writes.WritesConfig, name: str, where: str) -> writes.StateSpec:
+    try:
+        return cfg.spec(name)
+    except writes.StreamError as e:
+        raise SuiteError(f"{where}: {e}") from e
+
+
+def default_states(cfg: writes.WritesConfig, role: str) -> list[str]:
+    """The states a write entry keeps when it names none: the joint ladder and S10i for full writes, the inserts-only
+    ladder for inserts only, and both ladders for the exact reference."""
+    joint = [s.name for s in cfg.ladder("joint")]
+    inserts = [s.name for s in cfg.ladder("inserts")]
+    final = inserts[-1:] if inserts else []
+    return {"full": joint + final, "inserts": inserts, "exact": joint + inserts}[role]
+
+
+def role_of(system: System, build: Build) -> str:
+    """The write role of a build, from the system's write entry for it, or "rebuild" without one."""
+    for job in system.writes:
+        if job.build is build:
+            return job.role
+
+    return "rebuild"
+
+
+def known_states(system: System, build: Build, searched: bool = False) -> list[str]:
+    """Every state of a build: S0, each state its write entries keep, and each state its maintenance actions make. With
+    `searched` it leaves out the states of the actions an entry lists as unsearched."""
+    out = ["s0"]
+
+    for job in system.writes:
+        if job.build is build:
+            out += [x for x in job.states if x not in out]
+
+    for job in system.maintains:
+        if job.build is build:
+            out += [f"{job.state}-{a}" for a in job.actions if not (searched and a in job.unsearched)]
+
+    return out
+
+
+def _entry_states(suite: Suite, system: System, build: Build, value: object, where: str) -> list[str] | None:
+    """The states a warm or cold entry searches: None without `states`, every searched state for "all", or the ones
+    it lists, each of which the build must make."""
+    if value is None:
+        return None
+
+    if suite.writes is None:
+        raise SuiteError(f"{where} names states, which need the suite's [writes] table")
+
+    if value == "all":
+        return known_states(system, build, searched=True)
+
+    states = [str(x) for x in value] if isinstance(value, list) else []
+    unknown = [x for x in states if x not in known_states(system, build)]
+
+    if not states or unknown:
+        raise SuiteError(f"{where} names states {unknown or value}, which its build doesn't make")
+
+    return states
+
+
+def _findability(suite: Suite, system: System, build: Build, value: object, states: list[str] | None,
+                 name: str) -> set:
+    """The states a warm entry's findability check runs at. `true` takes the last state of each ladder and every
+    maintained state among the entry's states, and a list takes the states it names."""
+    if not value:
+        return set()
+
+    if states is None:
+        raise SuiteError(f"a warm entry of {name} with findability needs states")
+
+    if isinstance(value, list):
+        return {str(x) for x in value} & set(states)
+
+    cfg = suite.writes
+    ends = {s.name for s in (cfg.final("joint"), cfg.final("inserts")) if s is not None}
+    return {x for x in states if x in ends or cfg.spec(x).action is not None}
+
+
+def state_build(suite: Suite, system: System, build: Build, name: str) -> Build:
+    """The state `name` of a build as an index of its own, a folder <config_id>-<state> beside the build's own. A
+    rebuild-only system's S0 is its build itself."""
+    key = (build.config_id, build.seed, name)
+
+    if key not in system.states:
+        cfg = suite.writes
+        path = build.index if name == "s0" and role_of(system, build) == "rebuild" else \
+            build.out.parent / _slug(f"{build.config_id}-{name}")
+        target = Build(system=system, config_id=build.config_id, config=build.config, seed=build.seed,
+                       n=cfg.live_count(name), threads=build.threads, prebuilt=path, state=name, origin=build)
+        target.out = path
+        system.states[key] = target
+
+    return system.states[key]
 
 
 def _check_groups(suite: Suite) -> None:
@@ -679,6 +910,14 @@ def remove_stale(root: Path) -> list[str]:
             shutil.rmtree(folder, ignore_errors=True)
             removed.append(str(folder))
 
+    # A state the driver was placing when it stopped, under its temporary name.
+    for folder in sorted(root.glob("*/*.tmp-*")):
+        owner = folder.name.rsplit(".tmp-", 1)[1]
+
+        if folder.is_dir() and owner.isdigit() and not _alive(int(owner)):
+            shutil.rmtree(folder, ignore_errors=True)
+            removed.append(str(folder))
+
     for p in root.rglob("*"):
         m = STALE.search(p.name)
 
@@ -713,6 +952,20 @@ def touched_files(residency: evictor.Residency, files_read: dict | None, paths: 
     cached = {p for p, pages in residency.pages.items() if pages > 0}
     read = {str(Path(p)) for p, n in (files_read or {}).items() if n} & known
     return len(cached | read)
+
+
+def folder_key(path: Path | None) -> str:
+    """An index's size, file count, newest change and inode, the part of a run key that names it."""
+    if path is None or not path.exists():
+        return f"missing:{path}"
+
+    ident = identity(path, checksum=False)
+    return f"{ident['bytes']}:{ident['files']}:{ident['mtime_ns']}:{ident['inode']}"
+
+
+def work_marker(work: Path) -> Path:
+    """The record of what a pass's work folder holds, beside it."""
+    return work.with_name(f"{work.name}.work.json")
 
 
 def moved_files(files: list[dict], src: Path, dst: Path) -> list[dict]:
@@ -827,7 +1080,7 @@ class Driver:
                  gate_mode: str | None = None, dry_run: bool = False, max_attempts: int | None = None,
                  groups: set[str] | None = None):
         self.suite = suite
-        self.only = only or {"build", "warm", "cold", "refs"}
+        self.only = only or (READ_PHASES | (WRITE_PHASES if suite.writes is not None else set()))
         self.systems = systems
         # The cold groups this batch runs, eg. one rival's group with the ColdIVF cells that run beside it. None is all.
         self.groups = groups
@@ -858,6 +1111,10 @@ class Driver:
         self._recalls: dict[int, data.Recall | None] = {}
         # Each system's per-call cost on a small index, measured once per batch, by system, variant and interpreter.
         self.overheads: dict[str, dict] = {}
+        # The write benchmark's stream, its hash, and each state's scorer, read once per batch.
+        self._stream: writes.Stream | None = None
+        self._stream_sha: str | None = None
+        self._state_recalls: dict[tuple, data.Recall | None] = {}
 
     def selected(self, system: System) -> bool:
         """Whether --systems names the system, by its name for every variant of it, or as name:variant for one."""
@@ -888,6 +1145,141 @@ class Driver:
         recall = self.recall_for(n)
         return recall.truth.record() if recall is not None else None
 
+    def scorer(self, build: Build) -> data.Recall | None:
+        """Scores the results of a search of `build`. A state, a copy of a state's live rows and a build of an
+        inserts-only state's prefix take that state's truth, through StateRecall. Any other build takes the truth of
+        its n, as in the head-to-head."""
+        cfg = self.suite.writes
+
+        if cfg is not None:
+            if build.state is not None:
+                return self.state_recall(build.state)
+
+            if build.data is not None:
+                record = writes.copy_record(build.data)
+
+                if record is not None:
+                    return self.state_recall(record["state"], build.data)
+
+            prefix = self.prefix_state(build.n)
+
+            if prefix is not None:
+                return self.state_recall(prefix)
+
+        return self.recall_for(build.n)
+
+    def scorer_record(self, build: Build) -> dict | None:
+        recall = self.scorer(build)
+        return recall.truth.record() if recall is not None else None
+
+    def prefix_state(self, n: int) -> str | None:
+        """The inserts-only state whose vectors are the base's first n rows, other than S0, or None."""
+        cfg = self.suite.writes
+
+        for spec in cfg.ladder("inserts"):
+            if cfg.live_count(spec.name) == n:
+                return spec.name
+
+        return None
+
+    def stream(self) -> writes.Stream:
+        """The suite's stream, made when its file is missing."""
+        if self._stream is None:
+            self._stream = writes.ensure_stream(self.suite.writes, self.dataset)
+            self._stream_sha = schema.file_sha256(self.suite.writes.stream)
+
+        return self._stream
+
+    def stream_sha(self) -> str | None:
+        cfg = self.suite.writes
+
+        if cfg is not None and self._stream_sha is None and cfg.stream.exists():
+            self._stream_sha = schema.file_sha256(cfg.stream)
+
+        return self._stream_sha
+
+    def state_truth(self, name: str) -> Path:
+        """The truth file of a state. S0 takes the suite's truth file when it has one, as the head-to-head did."""
+        cfg = self.suite.writes
+        name = cfg.truth_state(name)
+
+        if name == "s0" and self.suite.truth is not None and self.suite.truth.exists():
+            return self.suite.truth
+
+        return cfg.truth_path(name)
+
+    def state_recall(self, name: str, copy: Path | None = None) -> data.Recall | None:
+        """The scorer of state `name`, or of a copy of its live rows whose results are positions. It is None when the
+        truth file is missing, so the lines carry no recall, as for a build without truth."""
+        cfg = self.suite.writes
+        key = (cfg.truth_state(name), str(copy))
+
+        if key not in self._state_recalls:
+            path = self.state_truth(name)
+
+            if not path.exists() or not cfg.stream.exists():
+                self.log(f"no ground truth at {path} or no stream, so searches of {name} get no recall. Make them "
+                         f"with writes.py prepare")
+                self._state_recalls[key] = None
+            else:
+                stream = self.stream()
+                live = writes.state_mask(cfg, stream, name)
+                # A copy's results are positions, and a drift stream's ids aren't its rows, so both map to rows.
+                rows = writes.copy_rows(copy) if copy is not None else (None if stream.identity else stream.row_of)
+                truth = self.dataset.truth(cfg.id_bound, path)
+                self._state_recalls[key] = writes.StateRecall(self.dataset, truth, live, cfg.n, rows)
+
+        return self._state_recalls[key]
+
+    def stream_field(self, system: System, build: Build | None) -> dict | None:
+        """The stream a line belongs to, for every line of a write suite."""
+        cfg = self.suite.writes
+
+        if cfg is None:
+            return None
+
+        origin = build.origin if build is not None and build.origin is not None else build
+        own = [job.role for job in system.writes if job.build is origin]
+        role = own[0] if own else next((job.role for job in system.writes), "rebuild")
+        return {"path": str(cfg.stream), "sha256": self.stream_sha(), "batch": cfg.batch, "role": role}
+
+    def state_label(self, build: Build | None) -> str | None:
+        """A line's state: the state it searched, or "fresh" for a build of a copy of the joint ladder's last state, and
+        "fresh-i" for a build of the inserts-only ladder's last prefix."""
+        cfg = self.suite.writes
+
+        if cfg is None or build is None:
+            return None
+
+        if build.state is not None:
+            return build.state
+
+        if build.data is not None:
+            record = writes.copy_record(build.data)
+            final = cfg.final("joint")
+
+            if record is not None:
+                return "fresh" if final is not None and record["state"] == final.name else f"fresh-{record['state']}"
+
+        prefix = self.prefix_state(build.n)
+        final = cfg.final("inserts")
+
+        if prefix is not None:
+            return "fresh-i" if final is not None and prefix == final.name else f"fresh-{prefix}"
+
+        return None
+
+    def rows_arg(self, build: Build) -> int:
+        """The --rows of a search of `build`. A state's ids go up to its last insert, past its live count."""
+        if build.state is not None:
+            return self.suite.writes.n + self.suite.writes.spec(build.state).inserts
+
+        return build.n
+
+    def base_of(self, build: Build) -> Path:
+        """The base file a build reads, or a search of it takes its queries beside."""
+        return build.data if build.data is not None else self.dataset.base_path
+
     def env(self, system: System, threads: int) -> dict:
         env = dict(os.environ)
         env.update({k: str(threads) for k in ("OMP_NUM_THREADS", "RAYON_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
@@ -901,8 +1293,9 @@ class Driver:
         cmd = [system.python, "-m", system.module, *args]
         return Child(cmd, self.env(system, threads), self.log_dir / f"{system.name}.log")
 
-    def data_args(self, n: int, threads: int, system: System, k: int | None = None) -> list[str]:
-        args = ["--data", str(self.dataset.base_path), "--rows", str(n), "--metric", self.dataset.metric,
+    def data_args(self, n: int, threads: int, system: System, k: int | None = None,
+                  base: Path | None = None) -> list[str]:
+        args = ["--data", str(base or self.dataset.base_path), "--rows", str(n), "--metric", self.dataset.metric,
                 "--threads", str(threads), "--variant", system.variant]
         return args + (["--k", str(k)] if k is not None else [])
 
@@ -935,6 +1328,12 @@ class Driver:
         return self.files_cache[key]
 
     def index_identity(self, build: Build) -> dict | None:
+        """What lines record about an index. A state's comes from its record, taken when the driver made the state,
+        since searches change some states' files."""
+        if build.state is not None and not self.rebuild_s0(build):
+            record = self.state_record(build)
+            return record.get("identity") if record is not None else None
+
         key = str(build.index)
 
         if key not in self.identities and build.index is not None and build.index.exists():
@@ -966,6 +1365,9 @@ class Driver:
 
         if build is not None:
             line.update(config_id=build.config_id, build_params=build.config, index_identity=self.index_identity(build))
+
+        if system is not None and self.suite.writes is not None:
+            line.update(stream=self.stream_field(system, build), state=self.state_label(build))
 
         return line
 
@@ -1022,6 +1424,18 @@ class Driver:
                 for build in self.suite.builds:
                     if self.selected(build.system):
                         self.run_build(build)
+
+            if self.suite.writes is not None and self.only & (WRITE_PHASES | {"warm", "cold"}):
+                self.stream()
+
+            if "stream" in self.only:
+                self.run_streams()
+
+            if "latency" in self.only:
+                self.run_latency()
+
+            if "maintain" in self.only:
+                self.run_maintain()
 
             if "warm" in self.only:
                 jobs = [w for w in self.suite.warm if self.selected(w.system)]
@@ -1094,12 +1508,32 @@ class Driver:
             state = "prebuilt" if b.prebuilt else ("done" if self.progress.done(self.build_key(b)) else "to do")
             print(f"build {b.system.name} {b.config_id} n={b.n} seed={b.seed}: {state} -> {b.index}")
 
+        for system in (s for s in self.suite.systems if self.selected(s)):
+            label = ":".join(x for x in (system.name, system.variant) if x)
+
+            for job in system.writes:
+                for pass_name, ladder in self.passes(job):
+                    done = [f"{x.name} {'done' if self.state_done(self.state_of(job, x.name)) else 'to do'}"
+                            for x in ladder]
+                    print(f"stream {label} {job.build.config_id} {pass_name}: {', '.join(done)}")
+
+                for name in self.latency_states(job):
+                    state = "done" if self.latency_done(self.state_of(job, name)) else "to do"
+                    print(f"latency {label} {job.build.config_id} {name}: {state}")
+
+            for job in system.maintains:
+                for action in job.actions:
+                    target = state_build(self.suite, system, job.build, f"{job.state}-{action}")
+                    state = "done" if self.state_done(target) else "to do"
+                    print(f"maintain {label} {job.build.config_id} {action} on {job.state}: {state}")
+
         for w in self.suite.warm:
             if not self.selected(w.system):
                 continue
 
             todo = sum(1 for s in w.settings if not self.progress.done(self.warm_key(w, s)))
-            print(f"warm {w.system.name} {w.build.config_id} split={w.split} threads={w.threads}: "
+            at = f" state={w.build.state}" if w.build.state else ""
+            print(f"warm {w.system.name} {w.build.config_id}{at} split={w.split} threads={w.threads}: "
                   f"{todo} of {len(w.settings)} settings to do")
 
         for c in self.suite.cells:
@@ -1107,39 +1541,549 @@ class Driver:
                 continue
 
             todo = sum(1 for r in range(c.trials) if not self.progress.done(self.cold_key(c, r)))
-            print(f"cold {c.label} group={c.group} params={c.params}: {todo} of {c.trials} trials to do")
+            at = f" state={c.build.state}" if c.build.state else ""
+            print(f"cold {c.label}{at} group={c.group} params={c.params}: {todo} of {c.trials} trials to do")
 
     def build_key(self, b: Build) -> str:
-        return schema.run_key({"kind": "build", "phase": self.suite.phase, "system": b.system.name,
-                               "variant": b.system.variant, "config_id": b.config_id, "config": b.config,
-                               "dataset": self.suite.dataset, "n": b.n, "seed": b.seed})
+        ident = {"kind": "build", "phase": self.suite.phase, "system": b.system.name, "variant": b.system.variant,
+                 "config_id": b.config_id, "config": b.config, "dataset": self.suite.dataset, "n": b.n, "seed": b.seed}
+
+        if b.data is not None:
+            ident["data"] = str(b.data.relative_to(REPO)) if b.data.is_relative_to(REPO) else str(b.data)
+
+        return schema.run_key(ident)
 
     def _index_key(self, build: Build) -> str:
-        """The index's size, file count, newest change and inode. A rebuilt index gets new run keys."""
-        index = build.index
+        """The index's size, file count, newest change and inode. A rebuilt index gets new run keys. A state's key is
+        the one the driver took when it made the state, kept in its record."""
+        if build.state is not None and not self.rebuild_s0(build):
+            record = self.state_record(build)
+            return str(record["index_key"]) if record and record.get("index_key") else f"missing:{build.index}"
 
-        if index is None or not index.exists():
-            return f"missing:{index}"
-
-        ident = identity(index, checksum=False)
-        return f"{ident['bytes']}:{ident['files']}:{ident['mtime_ns']}:{ident['inode']}"
+        return folder_key(build.index)
 
     def warm_key(self, w: Warm, params: dict) -> str:
-        return schema.run_key({"kind": "warm", "phase": self.suite.phase, "system": w.system.name,
-                               "variant": w.system.variant, "config_id": w.build.config_id,
-                               "dataset": self.suite.dataset, "n": w.build.n, "split": w.split, "params": params,
-                               "mode": w.mode, "threads": w.threads, "k": w.k, "index": self._index_key(w.build)})
+        ident = {"kind": "warm", "phase": self.suite.phase, "system": w.system.name, "variant": w.system.variant,
+                 "config_id": w.build.config_id, "dataset": self.suite.dataset, "n": w.build.n, "split": w.split,
+                 "params": params, "mode": w.mode, "threads": w.threads, "k": w.k, "index": self._index_key(w.build)}
+
+        # A state's key names it, and a head-to-head line's key stays as it was.
+        if w.build.state is not None:
+            ident["state"] = w.build.state
+
+        return schema.run_key(ident)
 
     def cold_key(self, c: Cell, trial: int) -> str:
         """A cold trial's run key. It names the index by the key its cell took before its process started, since a C1
-        process may hold the index open, and change it, for as long as the cell runs."""
+        process may hold the index open, and change it, for as long as the cell runs. A state's trial also names its
+        group, since every group holds a ColdIVF cell at the same state and setting."""
         index = c.index_key if c.index_key is not None else self._index_key(c.build)
-        return schema.run_key({"kind": "cold", "phase": self.suite.phase, "system": c.system.name,
-                               "variant": c.system.variant, "config_id": c.build.config_id,
-                               "dataset": self.suite.dataset, "n": c.build.n, "split": c.split, "params": c.params,
-                               "regime": c.regime, "cpu_state": c.cpu_state, "delay_ms": c.delay_ms,
-                               "threads": c.threads, "k": c.k, "next": c.next, "trial": trial,
-                               "fresh_clone": c.fresh_clone, "index": index})
+        ident = {"kind": "cold", "phase": self.suite.phase, "system": c.system.name, "variant": c.system.variant,
+                 "config_id": c.build.config_id, "dataset": self.suite.dataset, "n": c.build.n, "split": c.split,
+                 "params": c.params, "regime": c.regime, "cpu_state": c.cpu_state, "delay_ms": c.delay_ms,
+                 "threads": c.threads, "k": c.k, "next": c.next, "trial": trial, "fresh_clone": c.fresh_clone,
+                 "index": index}
+
+        if c.build.state is not None:
+            ident.update(state=c.build.state, group=c.group)
+
+        return schema.run_key(ident)
+
+    def write_key(self, system: System, build: Build, mode: str, op: str, batch: int | None, start: Build,
+                  target: Build) -> str:
+        """A write line's run key. It names the stream, the op and its batch, both states and the state it started
+        from, as the driver made it."""
+        return schema.run_key({"kind": "write", "phase": self.suite.phase, "system": system.name,
+                               "variant": system.variant, "config_id": build.config_id, "stream": self.stream_sha(),
+                               "mode": mode, "op": op, "batch": batch, "state_from": start.state,
+                               "state_to": target.state, "index": self._index_key(start)})
+
+    def session_key(self, job: WriteJob, mode: str, start: Build, target: Build) -> str:
+        """The key of a session's failure line, which counts the session's attempts."""
+        return self.write_key(job.system, job.build, mode, "session", None, start, target)
+
+    def maintain_key(self, system: System, build: Build, action: str, threads: int | None, params: dict | None,
+                     start: Build, target: Build, run: int | None = None) -> str:
+        ident = {"kind": "maintain", "phase": self.suite.phase, "system": system.name, "variant": system.variant,
+                 "config_id": build.config_id, "stream": self.stream_sha(), "action": action, "threads": threads,
+                 "params": params or {}, "state_from": start.state, "state_to": target.state,
+                 "index": self._index_key(start)}
+
+        # Each run of the policy pass is a line of its own.
+        if run is not None:
+            ident["run"] = run
+
+        return schema.run_key(ident)
+
+    def rebuild_s0(self, build: Build) -> bool:
+        """Whether `build` is a rebuild-only system's S0, which is its build itself."""
+        return build.state == "s0" and build.origin is not None and role_of(build.system, build.origin) == "rebuild"
+
+    def state_record(self, build: Build) -> dict | None:
+        return writes.read_json(writes.record_path(build.index))
+
+    def state_of(self, job: WriteJob | MaintainJob, name: str) -> Build:
+        return state_build(self.suite, job.system, job.build, name)
+
+    def state_done(self, build: Build) -> bool:
+        """Whether a state is made. Its folder and record are there, the record names this stream, the state it came
+        from is made and is the one it came from, and every line of the session that made it is done."""
+        if self.rebuild_s0(build):
+            return build.index is not None and build.index.exists()
+
+        record = self.state_record(build)
+
+        if record is None or not build.index.is_dir():
+            return False
+
+        if build.state == "s0":
+            return record.get("from_key") == folder_key(build.origin.index)
+
+        if record.get("stream_sha256") != self.stream_sha() or not record.get("from_state"):
+            return False
+
+        start = state_build(self.suite, build.system, build.origin, str(record["from_state"]))
+
+        if not self.state_done(start) or record.get("from_key") != self._index_key(start):
+            return False
+
+        return all(self.progress.done(k) for k in record.get("keys", []))
+
+    def state_ready(self, build: Build) -> bool:
+        """Whether a state is there to search or to start from. S0 is a clone of the build, made here when missing."""
+        if self.state_done(build):
+            return True
+
+        return build.state == "s0" and not self.dry_run and self.make_s0(build)
+
+    def make_s0(self, build: Build) -> bool:
+        origin = build.origin
+
+        if origin.index is None or not origin.index.exists():
+            self.log(f"{build.system.name} has no build {origin.config_id} at {origin.index} to clone as S0")
+            return False
+
+        self.log(f"cloning {origin.index} as S0 of {build.system.name} {origin.config_id}")
+        self.place_state(build, origin.index, {"pass": "", "round": 0, "from_state": None,
+                                               "from_key": folder_key(origin.index), "keys": []})
+        return True
+
+    def place_state(self, build: Build, source: Path, record: dict, move: bool = False) -> dict:
+        """Makes the folder of state `build` from `source`, as an APFS clone, or with `move` by a rename, and writes its
+        record beside it. The folder appears whole under its name or not at all, and the record comes after it, so a
+        folder without a record is a state that a crash cut short, which is made again."""
+        cfg, target = self.suite.writes, build.index
+        tmp = target.with_name(f"{target.name}.tmp-{os.getpid()}")
+        writes.remove_tree(tmp)
+
+        if move:
+            os.rename(source, tmp)
+        else:
+            writes.clone_tree(source, tmp)
+
+        writes.remove_tree(writes.record_path(target))
+        writes.remove_tree(target)
+        os.rename(tmp, target)
+        ident = identity(target)
+        spec = cfg.spec(build.state)
+        full = {"system": build.system.name, "variant": build.system.variant, "config_id": build.config_id,
+                "state": build.state, "stream": str(cfg.stream), "stream_sha256": self.stream_sha(),
+                "inserts": spec.inserts, "deletes": spec.deletes, "live": cfg.live_count(build.state),
+                "index_key": f"{ident['bytes']}:{ident['files']}:{ident['mtime_ns']}:{ident['inode']}",
+                "identity": ident, "batch_id": self.batch_id, "made": schema.utc_now()} | record
+        writes.write_json(writes.record_path(target), full)
+        self.identities.pop(str(target), None)
+        return full
+
+    def passes(self, job: WriteJob) -> list[tuple[str, list[writes.StateSpec]]]:
+        """Each pass of a write entry with the states it keeps, in the order the pass makes them."""
+        out = []
+
+        for pass_name in writes.PASSES:
+            ladder = [self.suite.writes.spec(x) for x in job.states]
+            ladder = sorted((x for x in ladder if x.pass_name == pass_name), key=lambda x: x.round)
+
+            if ladder:
+                out.append((pass_name, ladder))
+
+        return out
+
+    def latency_states(self, job: WriteJob) -> list[str]:
+        """The states a write entry's latency runs take: the suite's latency states, with S10i for S10 in the
+        inserts-only role, and none for the exact reference."""
+        cfg, out = self.suite.writes, []
+
+        if job.role not in ("full", "inserts"):
+            return out
+
+        for name in cfg.latency_states:
+            spec = cfg.spec(name)
+
+            if job.role == "inserts" and spec.with_deletes:
+                twin = [x for x in cfg.ladder("inserts") if x.round == spec.round]
+                name = twin[0].name if twin else ""
+
+            if name and (name == "s0" or name in job.states) and name not in out:
+                out.append(name)
+
+        return out
+
+    def latency_done(self, build: Build) -> bool:
+        record = writes.read_json(writes.latency_path(build.index))
+
+        if record is None or record.get("index_key") != self._index_key(build) or not self.state_done(build):
+            return False
+
+        return all(self.progress.done(k) for k in record.get("keys", []))
+
+    def maintain_job(self, system: System, build: Build) -> MaintainJob | None:
+        return next((m for m in system.maintains if m.build is build), None)
+
+    def session(self, system: System, args: list[str], threads: int, timeout_s: float,
+                terminal: str = "done") -> tuple[list[dict], dict | None]:
+        """Runs one write or maintenance session in a fresh adapter process, and returns its events and the one that
+        ended it, which is `terminal` when it worked, or an error, unsupported or None."""
+        child = self.child(system, args, threads)
+        events, end = [], None
+        deadline = time.monotonic() + timeout_s
+        floor = float(self.suite.gate["disk_floor_gb"])
+
+        try:
+            while end is None:
+                msg = child.event(1.0)
+
+                if msg is not None:
+                    if msg["event"] in (terminal, "error", "unsupported"):
+                        end = msg
+                    else:
+                        events.append(msg)
+                elif child.proc.poll() is not None:
+                    end = {"event": "error", "message": f"exit {child.proc.returncode}: {child.tail()}"}
+                elif time.monotonic() > deadline:
+                    child.kill()
+                    end = {"event": "error", "message": f"timed out after {timeout_s:.0f} s"}
+                elif free_gib(REPO) < min(floor, 20.0):
+                    child.kill()
+                    end = {"event": "error", "message": f"stopped with only {free_gib(REPO):.0f} GiB of disk free"}
+        finally:
+            child.close()
+
+        return events, end
+
+    def run_streams(self) -> None:
+        for system in self.suite.systems:
+            if not self.selected(system):
+                continue
+
+            for job in system.writes:
+                for pass_name, ladder in self.passes(job):
+                    self.run_pass(job, pass_name, ladder)
+
+    def run_pass(self, job: WriteJob, pass_name: str, ladder: list[writes.StateSpec]) -> None:
+        """Makes the states of one pass in order. Each comes from the one before it, or from S0 for the first, by one
+        session on the pass's work folder, which a crash or failure leaves to be cloned again from the last state."""
+        start = self.state_of(job, "s0")
+        work = job.build.out.parent / _slug(f"{job.build.config_id}-work-{pass_name}")
+
+        for spec in ladder:
+            target = self.state_of(job, spec.name)
+
+            if self.state_done(target):
+                self.resumed += 1
+                start = target
+                continue
+
+            if not self.state_ready(start):
+                self.log(f"stream {job.system.name} {pass_name}: {start.state} isn't made, so {spec.name} waits")
+                return
+
+            if not self.stream_step(job, pass_name, start, target, work):
+                return
+
+            start = target
+
+        writes.remove_tree(work)
+        writes.remove_tree(work_marker(work))
+
+    def stream_step(self, job: WriteJob, pass_name: str, start: Build, target: Build, work: Path) -> bool:
+        """Makes `target` from `start`, again after a failure or a line that isn't ok, until the attempts run out."""
+        key = self.session_key(job, "stream", start, target)
+
+        for _ in range(self.max_attempts + 1):
+            if self.state_done(target):
+                return True
+
+            if self.progress.done(key):
+                self.log(f"stream {job.system.name} {start.state} to {target.state}: no attempts left")
+                return False
+
+            self.stream_session(job, pass_name, start, target, work, key)
+
+        return self.state_done(target)
+
+    def prepare_work(self, start: Build, work: Path) -> None:
+        """Leaves the work folder holding `start`. It goes on from where the last session left it when that was
+        `start` and nothing changed it since, and is cloned from `start` again otherwise, eg. after a killed round."""
+        marker = writes.read_json(work_marker(work))
+
+        if (marker is not None and work.is_dir() and marker.get("holds") == start.state
+                and marker.get("key") == self._index_key(start) and marker.get("work_key") == folder_key(work)):
+            return
+
+        writes.remove_tree(work_marker(work))
+        writes.remove_tree(work)
+        writes.clone_tree(start.index, work)
+
+    def stream_session(self, job: WriteJob, pass_name: str, start: Build, target: Build, work: Path,
+                       key: str) -> None:
+        cfg, system = self.suite.writes, job.system
+        spec, origin = cfg.spec(target.state), cfg.spec(start.state)
+        self.prepare_work(start, work)
+        args = ["write", *self.data_args(cfg.n, job.threads, system), "--index", str(work), "--stream",
+                str(cfg.stream), "--mode", "stream", "--pass", pass_name, "--round", str(spec.round), "--from-round",
+                str(origin.round), "--batch", str(cfg.batch), "--params", json.dumps(job.params)]
+
+        if spec.policy:
+            m = self.maintain_job(system, job.build)
+            args += ["--policy", spec.policy, "--maintain-params", json.dumps(m.params if m else {}),
+                     "--maintain-threads", str(m.threads if m else 10)]
+
+        self.log(f"stream {system.name} {job.build.config_id} {pass_name}: {start.state} to {target.state}")
+        events, end = self.session(system, args, job.threads, job.timeout_s)
+
+        if end is None or end["event"] != "done":
+            self.session_failed(job, "stream", start, target, key, end)
+            writes.remove_tree(work_marker(work))
+            writes.remove_tree(work)
+            return
+
+        session = schema.new_run_id()
+        lines = self.session_lines(job, "stream", start, target, events, session)
+        made = self.place_state(target, work, {"pass": pass_name, "round": spec.round, "from_state": start.state,
+                                               "from_key": self._index_key(start), "session": session,
+                                               "keys": [x["run_key"] for x in lines], "sealed": end.get("sealed")})
+        writes.write_json(work_marker(work), {"holds": target.state, "key": made["index_key"],
+                                              "work_key": folder_key(work)})
+
+        for line in lines:
+            self.write(system.name, line)
+
+    def run_latency(self) -> None:
+        for system in self.suite.systems:
+            if not self.selected(system):
+                continue
+
+            for job in system.writes:
+                for name in self.latency_states(job):
+                    target = self.state_of(job, name)
+
+                    if not self.state_ready(target):
+                        self.log(f"latency {system.name} {name}: the state isn't made yet")
+                    elif self.latency_done(target):
+                        self.resumed += 1
+                    else:
+                        self.latency_step(job, target)
+
+    def latency_step(self, job: WriteJob, target: Build) -> None:
+        """Times single writes on a throwaway clone of a state, again after a failure until the attempts run out."""
+        cfg, system = self.suite.writes, job.system
+        spec = cfg.spec(target.state)
+        key = self.session_key(job, "latency", target, target)
+
+        for _ in range(self.max_attempts + 1):
+            if self.latency_done(target) or self.progress.done(key):
+                return
+
+            folder = self.suite.index_root / "clones.noindex" / f"{os.getpid()}-latency-{os.urandom(3).hex()}"
+            clone = folder / target.index.name
+            writes.clone_tree(target.index, clone)
+            args = ["write", *self.data_args(cfg.n, job.threads, system), "--index", str(clone), "--stream",
+                    str(cfg.stream), "--mode", "latency", "--pass", spec.pass_name or "joint", "--round",
+                    str(spec.round), "--calls", str(cfg.latency_calls), "--warmup", str(cfg.warmup_calls),
+                    "--durable-calls", str(cfg.durable_calls), "--saves", str(cfg.saves), "--reserve",
+                    str(cfg.reserve_from), "--seed", str(cfg.latency_seed), "--params", json.dumps(job.params)]
+            self.log(f"latency {system.name} {job.build.config_id} at {target.state}")
+
+            try:
+                events, end = self.session(system, args, job.threads, job.timeout_s)
+            finally:
+                writes.remove_tree(folder)
+
+            if end is None or end["event"] != "done":
+                self.session_failed(job, "latency", target, target, key, end)
+                continue
+
+            session = schema.new_run_id()
+            lines = self.session_lines(job, "latency", target, target, events, session)
+            writes.write_json(writes.latency_path(target.index),
+                              {"index_key": self._index_key(target), "session": session,
+                               "keys": [x["run_key"] for x in lines], "made": schema.utc_now()})
+
+            for line in lines:
+                self.write(system.name, line)
+
+    def run_maintain(self) -> None:
+        for system in self.suite.systems:
+            if not self.selected(system):
+                continue
+
+            for job in system.maintains:
+                source = self.state_of(job, job.state)
+
+                if not self.state_ready(source):
+                    self.log(f"maintain {system.name}: {job.state} isn't made yet")
+                    continue
+
+                for action in job.actions:
+                    target = self.state_of(job, f"{job.state}-{action}")
+
+                    if self.state_done(target):
+                        self.resumed += 1
+                    else:
+                        self.maintain_step(job, action, source, target)
+
+    def maintain_step(self, job: MaintainJob, action: str, source: Build, target: Build) -> None:
+        key = self.maintain_key(job.system, job.build, action, job.threads_of(action), job.params, source, target)
+
+        for _ in range(self.max_attempts + 1):
+            if self.state_done(target) or self.progress.done(key):
+                return
+
+            self.maintain_session(job, action, source, target, key)
+
+    def maintain_session(self, job: MaintainJob, action: str, source: Build, target: Build, key: str) -> None:
+        """One action on a clone of the source state, in a fresh adapter process, whose folder becomes the state
+        <source>-<action>. The driver measures the folder for its peak disk use, as for a build."""
+        cfg, system, threads = self.suite.writes, job.system, job.threads_of(action)
+        work = job.build.out.parent / _slug(f"{job.build.config_id}-work-{action}")
+        writes.remove_tree(work)
+        writes.clone_tree(source.index, work)
+        floor, free = float(self.suite.gate["disk_floor_gb"]), free_gib(REPO)
+        fields: dict = {"action": action, "threads": threads, "params": job.params}
+
+        if free - job.disk_gb < floor:
+            end = {"event": "error", "message": f"{free:.0f} GiB free, the action needs {job.disk_gb:.0f} GiB above "
+                                                f"the {floor:.0f} GiB floor"}
+            events: list = []
+        else:
+            args = ["maintain", *self.data_args(cfg.n, threads, system), "--index", str(work), "--action", action,
+                    "--params", json.dumps(job.params)]
+            before = writes.folder_bytes(work)
+            self.log(f"maintain {system.name} {job.build.config_id} {action} on a clone of {source.state}")
+            sampler = DiskSampler(work, DISK_SAMPLE_S)
+
+            try:
+                events, end = self.session(system, args, threads, job.timeout_s, terminal="maintain")
+            finally:
+                peak, _ = sampler.stop()
+
+            if end is not None and end["event"] == "maintain":
+                fields = dict(end["fields"])
+                fields.update(peak_disk_bytes=peak, index_bytes_before=before,
+                              index_bytes_after=writes.folder_bytes(work))
+
+        session = schema.new_run_id()
+        line = self.maintain_line(system, job.build, source, target, fields, session)
+
+        if end is None or end["event"] != "maintain":
+            line.update(status="unsupported" if end and end["event"] == "unsupported" else "failed",
+                        error=((end or {}).get("message") or "no result")[:4000])
+            writes.remove_tree(work)
+            self.write(system.name, line)
+            return
+
+        data_file = (line["extra"] or {}).get("data_file")
+        rel = os.path.relpath(data_file, work) if data_file and Path(data_file).is_relative_to(work) else data_file
+        self.place_state(target, work, {"pass": "", "round": cfg.spec(target.state).round, "action": action,
+                                        "from_state": source.state, "from_key": self._index_key(source),
+                                        "session": session, "keys": [line["run_key"]], "data_file": rel}, move=True)
+
+        if action in job.same_file:
+            line["extra"]["same_file"] = self.same_file(job, action, job.same_file[action], rel)
+
+        self.write(system.name, line)
+
+    def same_file(self, job: MaintainJob, action: str, other: str, rel: str | None) -> dict:
+        """Checks that an action's data file has the same bytes as another action's, eg. the job's and the auto
+        run's, which are one run of kind auto with the same seed."""
+        theirs = self.state_of(job, f"{job.state}-{other}")
+        record = self.state_record(theirs) if self.state_done(theirs) else None
+        mine = self.state_of(job, f"{job.state}-{action}").index
+
+        if record is None or not rel or not record.get("data_file"):
+            return {"action": other, "match": None}
+
+        a = schema.file_sha256(Path(mine) / rel)
+        b = schema.file_sha256(Path(theirs.index) / str(record["data_file"]))
+
+        if a != b:
+            self.log(f"maintain {job.system.name}: the data files of {action} and {other} differ")
+
+        return {"action": other, "match": a == b, "sha256": a, "other_sha256": b}
+
+    def session_lines(self, job: WriteJob, mode: str, start: Build, target: Build, events: list[dict],
+                      session: str) -> list[dict]:
+        """The lines of a session's op and maintain events, which every name the session."""
+        lines = []
+
+        for event in events:
+            if event["event"] == "op":
+                lines.append(self.write_line(job, mode, start, target, event["fields"], session))
+            elif event["event"] == "maintain":
+                run = (event["fields"].get("extra") or {}).get("run")
+                lines.append(self.maintain_line(job.system, job.build, start, target, event["fields"], session, run,
+                                                runs_in=target))
+
+        return lines
+
+    def write_line(self, job: WriteJob, mode: str, start: Build, target: Build, fields: dict, session: str) -> dict:
+        fields = dict(fields)
+        extra = fields.pop("extra", {}) or {}
+        unsupported = fields.pop("unsupported", None)
+        key = self.write_key(job.system, job.build, mode, fields["op"], fields.get("batch"), start, target)
+        line = self.base_line("write", job.system, start, key, self.progress.attempts(key) + 1, job.threads)
+        line.update({k: v for k, v in fields.items() if k in schema.FIELDS["write"]})
+        line.update(mode=mode, state_from=start.state, state_to=target.state, state=target.state, n=target.n)
+        line["extra"] = extra | {k: v for k, v in fields.items() if k not in schema.FIELDS["write"]} | \
+            {"session": session}
+
+        if unsupported is not None:
+            line.update(status="unsupported", error=str(unsupported)[:4000])
+
+        moved = self.vm_moved({"swapins": line.get("swapins_delta"), "compressions": line.get("compressions_delta")})
+
+        if moved and line["status"] == "ok":
+            line.update(status="invalid", error=f"{moved} during the timed calls")
+
+        return line
+
+    def maintain_line(self, system: System, build: Build, start: Build, target: Build, fields: dict, session: str,
+                      run: int | None = None, runs_in: Build | None = None) -> dict:
+        """A maintain line. A run of the policy pass has the pass's state in both of its states."""
+        fields = dict(fields)
+        extra = fields.pop("extra", {}) or {}
+        start_name = runs_in.state if runs_in is not None else start.state
+        key = self.maintain_key(system, build, str(fields.get("action")), fields.get("threads"), fields.get("params"),
+                                start, target, run)
+        line = self.base_line("maintain", system, start, key, self.progress.attempts(key) + 1,
+                              int(fields.get("threads") or 1))
+        line.update({k: v for k, v in fields.items() if k in schema.FIELDS["maintain"]})
+        line.update(state_from=start_name, state_to=target.state, state=target.state,
+                    n=fields.get("rows_live") or target.n)
+        line["extra"] = extra | {k: v for k, v in fields.items() if k not in schema.FIELDS["maintain"]} | \
+            {"session": session}
+        return line
+
+    def session_failed(self, job: WriteJob, mode: str, start: Build, target: Build, key: str,
+                       end: dict | None) -> None:
+        """Records a session that didn't finish, under the session's own key, so its attempts count."""
+        line = self.base_line("write", job.system, start, key, self.progress.attempts(key) + 1, job.threads)
+        status = "unsupported" if end is not None and end["event"] == "unsupported" else "failed"
+        line.update(mode=mode, op="session", state_from=start.state, state_to=target.state, state=target.state,
+                    n=target.n, threads=job.threads, status=status,
+                    error=((end or {}).get("message") or "the session sent no result")[:4000])
+        self.log(f"{mode} {job.system.name} {start.state} to {target.state}: {status}, {line['error'][:200]}")
+        self.write(job.system.name, line)
 
     def run_build(self, build: Build) -> None:
         system = build.system
@@ -1173,9 +2117,18 @@ class Driver:
         if build.out.exists():
             shutil.rmtree(build.out)
 
+        if build.data is not None:
+            line.update(dataset=build.data.name[: -len(".base.fbin")], extra={"data": str(build.data)})
+
+            if not build.data.exists() or data.header(build.data)[0] < build.n:
+                line.update(status="failed", error=f"{build.data} isn't there or holds fewer than {build.n} rows. Make "
+                                                   f"it with writes.py copy")
+                self.write(system.name, line)
+                return
+
         build.out.mkdir(parents=True)
-        args = ["build", *self.data_args(build.n, build.threads, system), "--config", json.dumps(build.config),
-                "--out", str(build.out), "--seed", str(build.seed)]
+        args = ["build", *self.data_args(build.n, build.threads, system, base=self.base_of(build)), "--config",
+                json.dumps(build.config), "--out", str(build.out), "--seed", str(build.seed)]
 
         if build.clusters is not None:
             args += ["--clusters", str(build.clusters)]
@@ -1228,7 +2181,8 @@ class Driver:
         line.update(
             peak_disk_bytes=peak, temporary_files=len(seen - final), index_bytes=ident["bytes"],
             index_alloc_bytes=ident["alloc_bytes"], index_files=ident["files"], index_identity=ident,
-            extra=extra | {k: v for k, v in fields.items() if k not in schema.FIELDS["build"]},
+            extra=(line.get("extra") or {}) | extra | {k: v for k, v in fields.items()
+                                                       if k not in schema.FIELDS["build"]},
         )
         self.write(system.name, line)
 
@@ -1337,6 +2291,11 @@ class Driver:
 
     def run_warm(self, job: Warm) -> None:
         system = job.system
+
+        if job.build.state is not None and not self.state_ready(job.build):
+            self.log(f"warm {system.name} {job.build.config_id}: state {job.build.state} isn't made yet")
+            return
+
         keys = [self.warm_key(job, s) for s in job.settings]
         todo = [i for i, key in enumerate(keys) if not self.progress.done(key)]
         self.resumed += len(keys) - len(todo)
@@ -1359,10 +2318,17 @@ class Driver:
         self.index_identity(job.build)
         ids_dir = self.out_dir / "ids"
         tmp_ids = Path(tempfile.mkdtemp(prefix="ids-", dir=self.out_dir))
-        args = ["warm", *self.data_args(job.build.n, job.threads, system, job.k), "--index", str(job.build.index),
-                "--grid", json.dumps([job.settings[i] for i in todo]), "--split", job.split, "--mode", job.mode,
-                "--ids-dir", str(tmp_ids), "--passes", str(job.passes), "--warmup", str(job.warmup),
-                "--qps-seconds", str(job.qps_seconds), "--qps-repeats", str(job.qps_repeats)]
+        args = ["warm", *self.data_args(self.rows_arg(job.build), job.threads, system, job.k,
+                                        base=self.base_of(job.build)),
+                "--index", str(job.build.index), "--grid", json.dumps([job.settings[i] for i in todo]), "--split",
+                job.split, "--mode", job.mode, "--ids-dir", str(tmp_ids), "--passes", str(job.passes), "--warmup",
+                str(job.warmup), "--qps-seconds", str(job.qps_seconds), "--qps-repeats", str(job.qps_repeats)]
+        probes = None
+
+        if job.findability and job.build.state is not None and 0 in todo:
+            probes = writes.probe_rows(self.suite.writes, self.stream(), job.build.state)
+            np.save(tmp_ids / "probe-rows.npy", probes)
+            args += ["--probes", str(tmp_ids / "probe-rows.npy")]
         self.log(f"warm {system.name} {job.build.config_id}: {len(todo)} settings, split {job.split}, "
                  f"{job.threads} threads")
         child = self.child(system, args, job.threads)
@@ -1391,12 +2357,24 @@ class Driver:
                     ids_dir.mkdir(parents=True, exist_ok=True)
                     path = ids_dir / f"{keys[i]}.{line['run_id'][:8]}.npy"
                     shutil.move(msg["ids_file"], path)
-                    recall = self.recall_for(job.build.n)
+                    recall = self.scorer(job.build)
 
                     if recall is not None:
                         line.update(recall.summary(np.asarray(msg["qids"]), np.load(path)))
 
+                    stale = self.stale(job.build, np.asarray(msg["qids"]), np.load(path))
+
+                    if stale:
+                        line["extra"]["stale"] = stale
+
                     line["ids_file"] = str(path)
+
+                if msg.get("probes_file") and probes is not None:
+                    found = np.load(msg["probes_file"])
+                    stream = self.stream()
+                    rows = None if stream.identity else stream.row_of
+                    line["extra"]["findability"] = writes.findability(self.dataset, probes, found,
+                                                                      self.suite.writes.n, rows)
 
                 moved = self.vm_moved({"swapins": line.get("swapins_delta"),
                                        "compressions": line.get("compressions_delta")})
@@ -1422,8 +2400,29 @@ class Driver:
     def warm_line(self, job: Warm, params: dict, key: str) -> dict:
         line = self.base_line("warm", job.system, job.build, key, self.progress.attempts(key) + 1, job.threads)
         line.update(search_params=params, split=job.split, mode=job.mode, threads=job.threads, k=job.k,
-                    gt=self.truth_record(job.build.n), overhead_us=self.overhead_of(job.system).get("overhead_us"))
+                    gt=self.scorer_record(job.build), overhead_us=self.overhead_of(job.system).get("overhead_us"))
         return line
+
+    def stale(self, build: Build, qids: np.ndarray, found: np.ndarray) -> dict:
+        """A rebuild-only system's S0 results scored against each state's truth, i.e. what serving the old index costs
+        until the rebuild. Empty for any other search."""
+        cfg = self.suite.writes
+
+        if cfg is None or build.state != "s0" or not self.rebuild_s0(build):
+            return {}
+
+        out = {}
+
+        for spec in cfg.states.values():
+            if spec.pass_name in ("joint", "inserts"):
+                recall = self.state_recall(spec.name)
+
+                if recall is not None:
+                    summary = recall.summary(qids, found)
+                    out[spec.name] = {k: summary.get(k) for k in ("recall10", "recall10_ids_only", "dead_returned",
+                                                                   "recall10_inserted")}
+
+        return out
 
     def query_blocks(self, cell: Cell) -> tuple[int, int, int, int]:
         """Where the trials of `cell` take their queries. The m cells of its group that search its index with its split
@@ -1492,6 +2491,12 @@ class Driver:
         for cell in cells:
             index = cell.build.index
 
+            if cell.build.state is not None and not self.state_ready(cell.build):
+                # A state the stream phase hasn't made yet waits for a later batch, without a line.
+                cell.skip, cell.reported = f"state {cell.build.state} isn't made yet", True
+                self.log(f"cold {cell.label}: {cell.skip}")
+                continue
+
             if index is None or not index.exists():
                 cell.skip = f"the index {index} isn't there"
                 continue
@@ -1555,7 +2560,7 @@ class Driver:
         qids = self.trial_queries(cell, trial)
         line.update(search_params=cell.params, split=cell.split, regime=cell.regime, cpu_state=cell.cpu_state,
                     delay_ms=cell.delay_ms, threads=cell.threads, k=cell.k, trial=trial, query_id=qids[0],
-                    predecessor=previous, gt=self.truth_record(cell.build.n))
+                    predecessor=previous, gt=self.scorer_record(cell.build))
         return line
 
     def cold_failed(self, cell: Cell, trial: int, key: str, status: str, error: str, previous: str | None) -> None:
@@ -1575,8 +2580,9 @@ class Driver:
             self.cold_failed(cell, trial, key, "failed", message, previous)
 
     def cold_args(self, cell: Cell, queries: list[int]) -> list[str]:
-        args = ["cold", *self.data_args(cell.build.n, cell.threads, cell.system, cell.k), "--index",
-                str(cell.build.index), "--params", json.dumps(cell.params), "--queries",
+        args = ["cold", *self.data_args(self.rows_arg(cell.build), cell.threads, cell.system, cell.k,
+                                        base=self.base_of(cell.build)),
+                "--index", str(cell.build.index), "--params", json.dumps(cell.params), "--queries",
                 ",".join(str(q) for q in queries), "--regime", cell.regime, "--cpu-state", cell.cpu_state,
                 "--delay-ms", str(cell.delay_ms), "--split", cell.split, "--warmup-queries",
                 ",".join(str(q) for q in self.warmup_queries(cell))]
@@ -1736,12 +2742,21 @@ class Driver:
             line["extra"]["files_touched_cached"] = after.touched
             line["files_touched"] = touched
 
-        recall = self.recall_for(cell.build.n)
+        recall = self.scorer(cell.build)
 
         if line.get("ids") and recall is not None:
             found = np.asarray([line["ids"]])
-            ties, plain = recall.per_query(np.asarray([line["query_id"]]), found, min(10, cell.k))
-            line.update(recall10=float(ties[0]), recall10_ids_only=float(plain[0]))
+
+            if isinstance(recall, writes.StateRecall):
+                line.update(recall.trial(int(line["query_id"]), found[0], min(10, cell.k)))
+            else:
+                ties, plain = recall.per_query(np.asarray([line["query_id"]]), found, min(10, cell.k))
+                line.update(recall10=float(ties[0]), recall10_ids_only=float(plain[0]))
+
+            stale = self.stale(cell.build, np.asarray([line["query_id"]]), found)
+
+            if stale:
+                line["extra"]["stale"] = stale
 
         moved = self.vm_moved(vm)
 
@@ -1823,7 +2838,8 @@ def _run_logged(cmd: list[str], log: Path, timeout: float) -> bool:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Runs a benchmark suite.")
     p.add_argument("suite")
-    p.add_argument("--only", default="", help="a comma-separated subset of build, warm, cold and refs")
+    p.add_argument("--only", default="",
+                   help="a comma-separated subset of build, stream, latency, maintain, warm, cold and refs")
     p.add_argument("--systems", default="",
                    help="a comma-separated subset of the suite's systems, each a name or name:variant")
     p.add_argument("--groups", default="", help="a comma-separated subset of the cold groups")

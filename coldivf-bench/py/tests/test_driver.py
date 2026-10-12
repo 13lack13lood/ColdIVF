@@ -12,10 +12,12 @@ from unittest import mock
 import numpy as np
 
 from tests import helpers
+from adapters.inproc import LiveRows
 import data
 import driver
 import evictor
 import schema
+import writes
 
 SUITE = """
 phase = "test"
@@ -73,6 +75,176 @@ def write_suite(root: Path, text: str = SUITE, variant: str = "") -> Path:
     path = root / "suite.toml"
     path.write_text(text.format(root=root, variant=variant))
     return path
+
+
+# A write suite on 5,000 rows: the joint and inserts-only ladders, a policy pass, latency runs at S0 and S10, two
+# maintenance actions whose files must match, a fresh build of S10's live rows, and warm and cold entries on states.
+WRITE_SUITE = """
+phase = "writes"
+dataset = "tiny-16-cosine"
+n = 5000
+index_root = "{root}/indexes"
+results_root = "{root}/results"
+seed = 3
+max_attempts = 2
+wait_s = 0.05
+
+[gate]
+mode = "off"
+invalid_vm = []
+
+[writes]
+stream = "{root}/writes/tiny-w.stream"
+batch = 100
+latency_states = ["s0", "s10"]
+latency_calls = 20
+warmup_calls = 5
+durable_calls = 10
+saves = 2
+seed = 1
+probes = 30
+
+[writes.states]
+s1 = {{ inserts = 50, deletes = 50 }}
+s5 = {{ inserts = 250, deletes = 250 }}
+s10 = {{ inserts = 500, deletes = 500 }}
+s1i = {{ inserts = 50, deletes = 0 }}
+s5i = {{ inserts = 250, deletes = 0 }}
+s10i = {{ inserts = 500, deletes = 0 }}
+s10p = {{ inserts = 500, deletes = 500, policy = "compact" }}
+
+[[system]]
+name = "fake"
+adapter = "tests.fake_adapter"
+variant = "{variant}"
+
+  [[system.build]]
+  config_id = "flat"
+  threads = 2
+
+  [[system.build]]
+  config_id = "fresh"
+  data = "{root}/writes/tiny-w-s10-live.base.fbin"
+  threads = 2
+
+  [[system.write]]
+  config_id = "flat"
+  role = "{role}"
+  {states}
+{maintain}
+  [[system.warm]]
+  config_id = "flat"
+  states = "all"
+  split = "test"
+  passes = 1
+  warmup = 4
+  settings = [{{ unused = 1 }}]
+  findability = true
+
+  [[system.warm]]
+  config_id = "fresh"
+  split = "test"
+  passes = 1
+  warmup = 4
+  settings = [{{ unused = 1 }}]
+
+  [[system.cold]]
+  config_id = "flat"
+  states = {cold}
+  trials = 2
+  next = 0
+"""
+
+MAINTAIN = """
+  [[system.maintain]]
+  config_id = "flat"
+  actions = ["compact", "recompact"]
+  threads = 2
+  action_threads = { recompact = 1 }
+  params = { pending = 150 }
+  unsearched = ["recompact"]
+  same_file = { recompact = "compact" }
+"""
+
+FULL_STATES = 'states = ["s1", "s5", "s10", "s1i", "s5i", "s10i", "s10p"]'
+
+# The drift pass: the same rounds on a drift stream, whose inserts are the rows nearest one topic, kept only at D10,
+# with a maintenance action and a fresh build of D10's live rows.
+DRIFT_SUITE = """
+phase = "drift"
+dataset = "tiny-16-cosine"
+n = 5000
+index_root = "{root}/indexes"
+results_root = "{root}/results"
+max_attempts = 2
+wait_s = 0.05
+
+[gate]
+mode = "off"
+invalid_vm = []
+
+[writes]
+stream = "{root}/writes/tiny-d.stream"
+pattern = "drift"
+topics = 4
+hot_topics = 1
+topic_sample = 400
+kmeans_rounds = 3
+batch = 100
+probes = 30
+latency_calls = 0
+warmup_calls = 0
+durable_calls = 0
+
+[writes.states]
+d1 = { inserts = 50, deletes = 50 }
+d5 = { inserts = 250, deletes = 250 }
+d10 = { inserts = 500, deletes = 500 }
+
+[[system]]
+name = "fake"
+adapter = "tests.fake_adapter"
+
+  [[system.build]]
+  config_id = "flat"
+  threads = 2
+
+  [[system.build]]
+  config_id = "fresh"
+  data = "{root}/writes/tiny-d-d10-live.base.fbin"
+  threads = 2
+
+  [[system.write]]
+  config_id = "flat"
+  states = ["d10"]
+
+  [[system.maintain]]
+  config_id = "flat"
+  actions = ["compact"]
+  threads = 2
+
+  [[system.warm]]
+  config_id = "flat"
+  states = ["d10", "d10-compact"]
+  split = "test"
+  passes = 1
+  warmup = 4
+  settings = [{ unused = 1 }]
+  findability = true
+
+  [[system.warm]]
+  config_id = "fresh"
+  split = "test"
+  passes = 1
+  warmup = 4
+  settings = [{ unused = 1 }]
+
+  [[system.cold]]
+  config_id = "flat"
+  states = ["d10"]
+  trials = 2
+  next = 0
+"""
 
 
 class SuiteTest(unittest.TestCase):
@@ -612,6 +784,360 @@ variant = "loaded"
 
         self.assertIn("group=main", out.getvalue())
         self.assertNotIn("group=live", out.getvalue())
+
+
+class KeysTest(unittest.TestCase):
+    """The run keys of a head-to-head suite stay as they were, so a rerun of its suites skips what is done."""
+
+    TEXT = SUITE[:SUITE.index("[[system]]")].replace("{root}", "/nonexistent/keys") + """
+[[system]]
+name = "fake"
+adapter = "tests.fake_adapter"
+variant = "v"
+
+  [[system.build]]
+  config_id = "flat"
+  config = { a = 1 }
+  threads = 2
+
+  [[system.build]]
+  config_id = "small"
+  n = 1000
+
+  [[system.warm]]
+  config_id = "flat"
+  split = "tune"
+  grid = { unused = [1, 2] }
+
+  [[system.cold]]
+  config_id = "flat"
+  regime = "c0"
+  params = { unused = 1 }
+  trials = 2
+  dummy_n = 300
+
+  [[system.cold]]
+  config_id = "small"
+  regime = "c1"
+  trials = 1
+  group = "live"
+"""
+
+    def test_head_to_head_keys_dont_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "suite.toml"
+            path.write_text(self.TEXT.replace('phase = "test"', 'phase = "keys"'))
+            suite = driver.load_suite(path)
+
+        d = driver.Driver.__new__(driver.Driver)
+        d.suite = suite
+        self.assertEqual([d.build_key(b) for b in suite.builds],
+                         ["00e55c46514f90ec39f6", "d4788145d20de4fbe8fc", "93ccd649d730411f9a77"])
+        self.assertEqual([d.warm_key(w, x) for w in suite.warm for x in w.settings],
+                         ["6b6cca30a25dda1ab1e1", "926927d4a5f366cc1fe2"])
+        self.assertEqual([d.cold_key(c, t) for c in suite.cells for t in range(c.trials)],
+                         ["4ab9328b7bb6c8298071", "310cc79ace5b4b29d166", "8b4b076b744ac22cbc13"])
+
+
+class WriteSuiteTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def load(self, **over) -> driver.Suite:
+        fill = {"variant": "", "role": "full", "states": FULL_STATES, "maintain": MAINTAIN,
+                "cold": '["s0", "s10", "s10-compact"]'} | over
+        path = self.root / "suite.toml"
+        path.write_text(WRITE_SUITE.replace("{root}", str(self.root)).format(**fill))
+        return driver.load_suite(path)
+
+    def test_load(self):
+        suite = self.load()
+        system = suite.systems[0]
+        self.assertEqual(suite.writes.rounds, [(50, 50), (200, 200), (250, 250)])
+        self.assertEqual([(j.role, j.states) for j in system.writes],
+                         [("full", ["s1", "s5", "s10", "s1i", "s5i", "s10i", "s10p"])])
+        job = system.maintains[0]
+        self.assertEqual((job.state, job.actions, job.threads_of("compact"), job.threads_of("recompact")),
+                         ("s10", ["compact", "recompact"], 2, 1))
+        # "all" leaves out the unsearched action's state, and findability runs at the ladders' ends and after
+        # maintenance.
+        warm = [w for w in suite.warm if w.build.state]
+        self.assertEqual([w.build.state for w in warm],
+                         ["s0", "s1", "s5", "s10", "s1i", "s5i", "s10i", "s10p", "s10-compact"])
+        self.assertEqual([w.build.state for w in warm if w.findability], ["s10", "s10i", "s10-compact"])
+        s5 = next(w.build for w in warm if w.build.state == "s5")
+        self.assertEqual((s5.n, s5.index, s5.origin.config_id), (5000, self.root / "indexes" / "fake" / "flat-s5",
+                                                                  "flat"))
+        self.assertEqual(suite.builds[1].data, self.root / "writes" / "tiny-w-s10-live.base.fbin")
+        self.assertEqual([c.build.state for c in suite.cells], ["s0", "s10", "s10-compact"])
+        self.assertEqual(driver.default_states(suite.writes, "inserts"), ["s1i", "s5i", "s10i"])
+        self.assertEqual(driver.default_states(suite.writes, "full"), ["s1", "s5", "s10", "s10i"])
+
+    def test_bad_write_entries_fail(self):
+        for over in ({"role": "rebuild"}, {"role": "inserts"}, {"role": "exact"}, {"cold": '["s7"]'},
+                     {"states": 'states = ["s0"]'}, {"maintain": MAINTAIN.replace('unsearched = ["recompact"]',
+                                                                                 'unsearched = ["major"]')}):
+            with self.assertRaises(driver.SuiteError, msg=str(over)):
+                self.load(**over)
+
+        # States need a [writes] table.
+        text = SUITE.replace('  [[system.cold]]\n  config_id = "flat"\n  regime = "c0"',
+                             '  [[system.cold]]\n  config_id = "flat"\n  states = ["s0"]\n  regime = "c0"')
+
+        with self.assertRaises(driver.SuiteError):
+            driver.load_suite(write_suite(self.root, text))
+
+
+class WriteBatchTest(unittest.TestCase):
+    """Runs whole write batches with the test adapter on 5,000 rows: every pass, latency run and maintenance action,
+    then warm and cold searches of every state, all scored against each state's exact truth."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.ds = helpers.make_dataset(self.root / "data", n=5600, nq=30)
+        self.env = mock.patch.dict(os.environ, {"COLDIVF_DATA": str(self.root / "data")})
+        self.env.start()
+        self.quiet = mock.patch.object(driver.Driver, "log", lambda self, msg: None)
+        self.quiet.start()
+
+    def tearDown(self):
+        self.quiet.stop()
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def suite(self, **over) -> driver.Suite:
+        fill = {"variant": "", "role": "full", "states": FULL_STATES, "maintain": MAINTAIN,
+                "cold": '["s0", "s10", "s10-compact"]'} | over
+        path = self.root / "suite.toml"
+        path.write_text(WRITE_SUITE.replace("{root}", str(self.root)).format(**fill))
+        suite = driver.load_suite(path)
+        cfg = suite.writes
+
+        if not cfg.stream.exists():
+            writes.ensure_stream(cfg, self.ds)
+            writes.compute_truths(cfg, self.ds, "numpy", log=lambda m: None)
+            writes.write_copy(cfg, self.ds, "s10")
+
+        return suite
+
+    def batch(self, only: set | None = None, **over) -> driver.Driver:
+        d = driver.Driver(self.suite(**over), only=only)
+        self.assertEqual(d.run(), 0)
+        return d
+
+    def lines(self, name: str = "fake") -> list[dict]:
+        return schema.read(self.root / "results" / "writes" / f"{name}.jsonl")
+
+    def folder(self, name: str, variant: str = "") -> Path:
+        return self.root / "indexes" / ("fake" + (f"-{variant}" if variant else "")) / f"flat-{name}"
+
+    def check_state(self, name: str, variant: str = "") -> None:
+        """A state's files hold exactly the vectors the stream leaves it, the rows in order and the live ids."""
+        cfg = self.suite(variant=variant).writes
+        mask = writes.state_mask(cfg, writes.read_stream(cfg.stream), name)
+        inserts, live = LiveRows.view(self.folder(name, variant))
+        self.assertTrue(np.array_equal(live, mask[: len(live)]), name)
+        self.assertEqual(len(live), cfg.n + cfg.spec(name).inserts, name)
+        self.assertTrue(np.array_equal(np.asarray(inserts), np.asarray(self.ds.base)[cfg.n : len(live)]), name)
+
+    def test_a_whole_write_batch_and_its_resume(self):
+        d = self.batch()
+        lines = self.lines()
+
+        for line in lines + self.lines("batch"):
+            self.assertEqual(schema.validate(line), [], line.get("error"))
+
+        bad = [(x["kind"], x.get("op"), x["status"], x["error"]) for x in lines if x["status"] != "ok"]
+        self.assertEqual(bad, [])
+        self.assertEqual(d.only, driver.READ_PHASES | driver.WRITE_PHASES)
+
+        for name in ("s0", "s1", "s5", "s10", "s1i", "s5i", "s10i", "s10p", "s10-compact", "s10-recompact"):
+            record = writes.read_json(writes.record_path(self.folder(name)))
+            self.assertEqual(record["state"], name)
+            self.assertTrue(self.folder(name).is_dir(), name)
+
+        for name in ("s1", "s5", "s10", "s1i", "s5i", "s10i"):
+            self.check_state(name)
+
+        self.assertEqual(sorted(p.name for p in self.folder("s0").parent.iterdir() if "work" in p.name), [])
+        stream = [x for x in lines if x["kind"] == "write" and x["mode"] == "stream"]
+        ops = {(x["state_from"], x["state_to"]): sorted(y["op"] for y in stream if
+                                                        (y["state_from"], y["state_to"]) == (x["state_from"],
+                                                                                             x["state_to"]))
+               for x in stream}
+        joint, inserts = ["delete", "durable_point", "insert", "sync"], ["durable_point", "insert", "sync"]
+        self.assertEqual(ops, {("s0", "s1"): joint, ("s1", "s5"): joint, ("s5", "s10"): joint,
+                               ("s0", "s1i"): inserts, ("s1i", "s5i"): inserts, ("s5i", "s10i"): inserts,
+                               ("s0", "s10p"): joint})
+        insert = next(x for x in stream if x["op"] == "insert" and x["state_to"] == "s5")
+        self.assertEqual((insert["calls"], insert["rows"], insert["batch"], insert["durability"]),
+                         (2, 200, 100, "process"))
+        self.assertEqual(insert["stream"]["sha256"], schema.file_sha256(d.suite.writes.stream))
+        self.assertEqual((insert["stream"]["role"], insert["state"], insert["n"]), ("full", "s5", 5000))
+        self.assertGreater(insert["open_us"], 0)
+        self.assertEqual(insert["index_identity"], writes.read_json(writes.record_path(self.folder("s1")))["identity"])
+
+        latency = [x for x in lines if x["kind"] == "write" and x["mode"] == "latency"]
+        self.assertEqual(sorted((x["state_from"], x["op"], x["calls"]) for x in latency),
+                         [(s, op, c) for s in ("s0", "s10") for op, c in (("delete", 20), ("insert", 20),
+                                                                           ("insert_sync", 10), ("sync", 10))])
+        self.assertTrue(all(x["state_from"] == x["state_to"] for x in latency))
+        self.assertEqual(list((self.root / "indexes" / "clones.noindex").iterdir()), [])
+
+        maintain = [x for x in lines if x["kind"] == "maintain"]
+        runs = [x for x in maintain if x["state_to"] == "s10p"]
+        self.assertGreater(len(runs), 0)
+        self.assertTrue(all(x["state_from"] == "s10p" and x["action"] == "compact" for x in runs))
+        actions = {x["action"]: x for x in maintain if x["state_from"] == "s10"}
+        self.assertEqual(sorted(actions), ["compact", "recompact"])
+        self.assertEqual((actions["compact"]["threads"], actions["recompact"]["threads"]), (2, 1))
+        self.assertEqual(actions["compact"]["state_to"], "s10-compact")
+        self.assertGreater(actions["compact"]["peak_disk_bytes"], 0)
+        self.assertEqual(actions["recompact"]["extra"]["same_file"]["match"], True)
+
+        warm = [x for x in lines if x["kind"] == "warm"]
+        self.assertEqual(sorted(x["state"] for x in warm),
+                         sorted(["s0", "s1", "s5", "s10", "s1i", "s5i", "s10i", "s10p", "s10-compact", "fresh"]))
+
+        for x in warm:
+            self.assertEqual((x["recall10"], x["dead_returned"]), (1.0, 0.0), x["state"])
+            self.assertEqual(x["recall10_inserted"], None if x["state"] == "s0" else 1.0, x["state"])
+            self.assertEqual(Path(x["gt"]["path"]).name,
+                             f"tiny-w-{d.suite.writes.truth_state(x['state'] if x['state'] != 'fresh' else 's10')}"
+                             f".gt.ibin", x["state"])
+
+        found = {x["state"]: x["extra"].get("findability") for x in warm}
+        self.assertEqual({k for k, v in found.items() if v}, {"s10", "s10i", "s10-compact"})
+        self.assertTrue(all(v["inserted"] == 1.0 and v["base"] == 1.0 for v in found.values() if v))
+
+        cold = [x for x in lines if x["kind"] == "cold"]
+        self.assertEqual(sorted(x["state"] for x in cold), ["s0", "s0", "s10", "s10", "s10-compact", "s10-compact"])
+        self.assertTrue(all(x["recall10"] == 1.0 and x["dead_returned"] == 0.0 for x in cold))
+        self.assertEqual(len({x["run_key"] for x in lines}), len(lines))
+
+        again = self.batch()
+        self.assertEqual(len(self.lines()), len(lines))
+        self.assertGreater(again.resumed, 0)
+
+    def test_a_killed_round_starts_again_from_a_clone_of_the_last_state(self):
+        # The fake dies like a killed process at the insert of row 5100, in round 2 of the joint pass.
+        marker = self.root / "indexes" / "fake-writecrash" / "crash.once"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("5100")
+        self.batch({"build", "stream"}, variant="writecrash")
+        lines = self.lines()
+        failed = [(x["op"], x["state_from"], x["state_to"], x["status"]) for x in lines if x["status"] != "ok"]
+        self.assertEqual(failed, [("session", "s1", "s5", "failed")])
+        self.assertFalse(marker.exists())
+
+        for name in ("s1", "s5", "s10", "s1i", "s5i", "s10i"):
+            self.check_state(name, "writecrash")
+
+        record = writes.read_json(writes.record_path(self.folder("s5", "writecrash")))
+        self.assertEqual(record["from_key"],
+                         writes.read_json(writes.record_path(self.folder("s1", "writecrash")))["index_key"])
+        # The round that worked wrote its lines once, as their first attempts.
+        ok = [x for x in lines if x["kind"] == "write" and x["status"] == "ok" and x["state_to"] == "s5"]
+        self.assertEqual(sorted(x["op"] for x in ok), ["delete", "durable_point", "insert", "sync"])
+        self.assertEqual({x["attempt"] for x in ok}, {1})
+
+    def test_a_state_cut_short_is_made_again_with_the_states_after_it(self):
+        self.batch({"build", "stream"})
+        before = self.lines()
+        s10 = writes.read_json(writes.record_path(self.folder("s10")))
+        # A crash between the state's folder and its record leaves the folder alone.
+        writes.record_path(self.folder("s5")).unlink()
+        self.batch({"build", "stream"})
+        new = self.lines()[len(before):]
+        self.assertEqual(sorted({(x["state_from"], x["state_to"]) for x in new}), [("s1", "s5"), ("s5", "s10")])
+        self.assertEqual({x["attempt"] for x in new if x["state_to"] == "s5"}, {2})
+        self.assertEqual({x["attempt"] for x in new if x["state_to"] == "s10"}, {1})
+        again = writes.read_json(writes.record_path(self.folder("s10")))
+        self.assertNotEqual(again["from_key"], s10["from_key"])
+        self.assertEqual(again["from_key"], writes.read_json(writes.record_path(self.folder("s5")))["index_key"])
+        self.check_state("s10")
+
+    def test_an_inserts_only_system_takes_the_inserts_ladder(self):
+        self.batch({"build", "stream", "latency", "warm"}, variant="inserts", role="inserts", states="", maintain="",
+                   cold='["s0"]')
+        lines = self.lines()
+        bad = [(x["kind"], x.get("op"), x["status"]) for x in lines if x["status"] != "ok"]
+        self.assertEqual(bad, [("write", "delete", "unsupported")] * 2)
+        stream = {(x["state_from"], x["state_to"]) for x in lines if x["kind"] == "write" and x["mode"] == "stream"}
+        self.assertEqual(stream, {("s0", "s1i"), ("s1i", "s5i"), ("s5i", "s10i")})
+        latency = {x["state_from"] for x in lines if x["kind"] == "write" and x["mode"] == "latency"}
+        self.assertEqual(latency, {"s0", "s10i"})
+        warm = {x["state"]: x for x in lines if x["kind"] == "warm"}
+        self.assertEqual(sorted(warm), ["fresh", "s0", "s10i", "s1i", "s5i"])
+        self.assertTrue(all(x["recall10"] == 1.0 for x in warm.values()))
+
+    def test_a_system_whose_sync_rewrites_the_index_saves_once_a_round(self):
+        self.batch({"build", "stream", "latency"}, variant="whole", maintain="", cold='["s0"]')
+        lines = [x for x in self.lines() if x["kind"] == "write"]
+        self.assertEqual({x["status"] for x in lines}, {"ok"})
+        self.assertNotIn("sync", {x["op"] for x in lines if x["mode"] == "stream"})
+        saves = [x for x in lines if x["mode"] == "latency" and x["op"] == "durable_point"]
+        self.assertEqual([x["calls"] for x in saves], [2, 2])
+        self.assertNotIn("insert_sync", {x["op"] for x in lines})
+
+    def test_inserts_numbered_off_their_rows_fail_the_session(self):
+        self.batch({"build", "stream"}, variant="misnumber", maintain="", cold='["s0"]')
+        failed = [x for x in self.lines() if x["status"] != "ok"]
+        self.assertEqual({(x["op"], x["state_to"]) for x in failed}, {("session", "s1"), ("session", "s1i"),
+                                                                     ("session", "s10p")})
+        self.assertTrue(all("not by their rows" in x["error"] for x in failed))
+        self.assertEqual(len(failed), 2 * 3)
+        self.assertFalse(self.folder("s1", "misnumber").exists())
+
+    def test_a_drift_stream_numbers_its_inserts_apart_from_their_rows(self):
+        ds = helpers.make_dataset(self.root / "data", n=7000, nq=30)
+        path = self.root / "drift.toml"
+        path.write_text(DRIFT_SUITE.replace("{root}", str(self.root)))
+        suite = driver.load_suite(path)
+        cfg = suite.writes
+        stream = writes.ensure_stream(cfg, ds)
+        writes.compute_truths(cfg, ds, "numpy", log=lambda m: None)
+        writes.write_copy(cfg, ds, "d10")
+        self.assertFalse(stream.identity)
+        self.assertEqual(driver.Driver(suite).run(), 0)
+        lines = schema.read(self.root / "results" / "drift" / "fake.jsonl")
+        self.assertEqual([(x["kind"], x.get("op"), x["error"]) for x in lines if x["status"] != "ok"], [])
+        self.assertEqual({(x["state_from"], x["state_to"]) for x in lines if x["kind"] == "write"}, {("s0", "d10")})
+        # The fake numbers its inserts itself, which the session checks against the stream's ids, and stores the
+        # vectors of the stream's rows under them.
+        inserts, live = LiveRows.view(self.root / "indexes" / "fake" / "flat-d10")
+        self.assertTrue(np.array_equal(np.asarray(inserts), np.asarray(ds.base)[stream.row_of[5000:]]))
+        self.assertTrue(np.array_equal(live, writes.state_mask(cfg, stream, "d10")[stream.row_of]))
+        warm = {x["state"]: x for x in lines if x["kind"] == "warm"}
+        self.assertEqual(sorted(warm), ["d10", "d10-compact", "fresh"])
+
+        for x in warm.values():
+            self.assertEqual((x["recall10"], x["dead_returned"]), (1.0, 0.0), x["state"])
+
+        self.assertEqual({k: (x["extra"]["findability"]["inserted"], x["extra"]["findability"]["base"])
+                          for k, x in warm.items() if "findability" in x["extra"]},
+                         {"d10": (1.0, 1.0), "d10-compact": (1.0, 1.0)})
+        cold = [x for x in lines if x["kind"] == "cold"]
+        self.assertTrue(cold and all(x["recall10"] == 1.0 and x["state"] == "d10" for x in cold))
+
+    def test_dry_run_lists_the_write_jobs(self):
+        self.batch({"build", "stream"})
+        out = io.StringIO()
+
+        with redirect_stdout(out):
+            driver.Driver(self.suite(), dry_run=True).run()
+
+        text = out.getvalue()
+        self.assertIn("stream fake flat joint: s1 done, s5 done, s10 done", text)
+        self.assertIn("latency fake flat s10: to do", text)
+        self.assertIn("maintain fake flat compact on s10: to do", text)
+        self.assertIn("warm fake flat state=s10-compact", text)
+        self.assertIn("state=s10 group=main", text)
 
 
 if __name__ == "__main__":

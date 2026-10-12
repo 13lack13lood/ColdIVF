@@ -1,0 +1,1661 @@
+# A smoke test of the write benchmark, with the layout of bench-1m-writes.toml at small scale for every system. The base
+# is the first 20,000 rows of cohere10m-768-cosine, and the stream inserts 2,000 rows and deletes 2,000 ids in batches
+# of 100. Latency runs take 20 timed calls of each op, and each cold cell 3 trials. It checks the code, not the machine,
+# so its gate only warns, swap leaves points valid, and builds and maintenance use 4 threads to share the machine.
+#
+# From coldivf-bench/py, make the stream, every state's truth and the copy of S10's live rows, then run one system's
+# whole protocol beside ColdIVF, whose builds come first, since three other systems build on its partitions:
+#   python writes.py prepare ../suites/writes-smoke.toml
+#   driver.py ../suites/writes-smoke.toml --systems coldivf:python,NAME[:VARIANT]
+
+phase = "writes-smoke"
+dataset = "cohere10m-768-cosine"
+n = 20000
+index_root = "data/bench.noindex/writes-smoke"
+truth = "data/writes/cohere10m-768-cosine-wsmoke-s0.gt.ibin"
+seed = 1
+k = 10
+max_attempts = 2
+
+[gate]
+mode = "warn"
+top_samples = 2
+top_interval_s = 2
+invalid_vm = []
+
+[writes]
+stream = "data/writes/cohere10m-768-cosine-wsmoke.stream"
+inserts_from = 20000
+batch = 100
+latency_states = ["s0", "s10"]
+latency_calls = 20
+warmup_calls = 5
+durable_calls = 10
+saves = 2
+reserve_from = 22000
+seed = 1
+probes = 100
+
+# Each state's inserts and deletes since S0, 1%, 5% and 10% of the base, as at 1M.
+[writes.states]
+s1 = { inserts = 200, deletes = 200 }
+s5 = { inserts = 1000, deletes = 1000 }
+s10 = { inserts = 2000, deletes = 2000 }
+s1i = { inserts = 200, deletes = 0 }
+s5i = { inserts = 1000, deletes = 0 }
+s10i = { inserts = 2000, deletes = 0 }
+s10p = { inserts = 2000, deletes = 2000, policy = "auto" }
+
+# ColdIVF through its Python module, with full writes through coldivf.Writer: tl320, two-level clustering with the
+# cluster anchor at 320 vectors per list, 3,195 lists at 1M. Its write entry keeps both ladders and S10p, which makes
+# S10's calls with a maintenance run of kind auto whenever its policy says one is due. Every maintenance action takes
+# the build's 320 vectors per list, since the module's default is 160. The job runs at the module's own 2 threads and
+# throttled, as an app's background job does, and the other actions at 10. The job's file must match the auto run's,
+# since both are a run of kind auto with the same seed, so only the job's run is timed and nothing searches it.
+[[system]]
+name = "coldivf"
+variant = "python"
+adapter = "coldivf_py"
+python = "${COLDIVF_BENCH_VENVS}/venv-coldivf/bin/python3"
+
+  # Its partition goes beside it, for the faiss IVF at 320 per list, FastScan and RaBitQ-Library IVF.
+  [[system.build]]
+  config_id = "tl320"
+  config = { clustering = "two-level", vectors_per_list = 320, anchor = "cluster", export_clusters = true }
+  threads = 4
+  disk_gb = 1
+  timeout_s = 7200
+
+  # Fresh, a build of the copy of S10's live rows. It runs first and saves its partition, since the faiss
+  # IVF at 320 per list, FastScan and RaBitQ-Library IVF build their fresh indexes on it.
+  [[system.build]]
+  config_id = "tl320-fresh"
+  config = { clustering = "two-level", vectors_per_list = 320, anchor = "cluster", export_clusters = true }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  threads = 4
+  disk_gb = 1
+
+  # Fresh-i, a build of S10i's vectors, the first rows of the dataset.
+  [[system.build]]
+  config_id = "tl320-fresh-i"
+  config = { clustering = "two-level", vectors_per_list = 320, anchor = "cluster" }
+  n = 22000
+  threads = 4
+  disk_gb = 1
+  timeout_s = 7200
+
+  [[system.write]]
+  config_id = "tl320"
+  role = "full"
+  threads = 1
+  states = ["s1", "s5", "s10", "s1i", "s5i", "s10i", "s10p"]
+
+  [[system.maintain]]
+  config_id = "tl320"
+  actions = ["fold", "auto", "major", "job"]
+  threads = 4
+  action_threads = { job = 2 }
+  params = { vectors_per_list = 320 }
+  unsearched = ["job"]
+  same_file = { job = "auto" }
+  disk_gb = 1
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "tl320"
+  states = "all"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 128, rerank = 64 }, { nprobe = 64, rerank = 39 }]
+  findability = true
+
+  # The picks' neighbors in the head-to-head grid, so warm latency interpolates to the targets.
+  [[system.warm]]
+  config_id = "tl320"
+  states = ["s10", "s10i", "s10-fold", "s10-auto", "s10-major"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [
+    { nprobe = 96, rerank = 64 },
+    { nprobe = 192, rerank = 64 },
+    { nprobe = 48, rerank = 39 },
+    { nprobe = 96, rerank = 39 },
+  ]
+
+  [[system.cold]]
+  config_id = "tl320"
+  states = "all"
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "coldivf"
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "tl320"
+  states = "all"
+  params = { nprobe = 64, rerank = 39 }
+  trials = 3
+  group = "coldivf"
+  dummy_n = 2000
+
+  # The fresh build tl320-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "tl320-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 128, rerank = 64 }, { nprobe = 64, rerank = 39 }]
+
+  [[system.cold]]
+  config_id = "tl320-fresh"
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "coldivf"
+  dummy = "data/bench.noindex/writes-smoke/coldivf-python/tl320-n20000-s1-dummy2000"
+
+  [[system.cold]]
+  config_id = "tl320-fresh"
+  params = { nprobe = 64, rerank = 39 }
+  trials = 3
+  group = "coldivf"
+  dummy = "data/bench.noindex/writes-smoke/coldivf-python/tl320-n20000-s1-dummy2000"
+
+  # The fresh build tl320-fresh-i, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "tl320-fresh-i"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 128, rerank = 64 }, { nprobe = 64, rerank = 39 }]
+
+  [[system.cold]]
+  config_id = "tl320-fresh-i"
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "coldivf"
+  dummy = "data/bench.noindex/writes-smoke/coldivf-python/tl320-n20000-s1-dummy2000"
+
+  [[system.cold]]
+  config_id = "tl320-fresh-i"
+  params = { nprobe = 64, rerank = 39 }
+  trials = 3
+  group = "coldivf"
+  dummy = "data/bench.noindex/writes-smoke/coldivf-python/tl320-n20000-s1-dummy2000"
+
+  # ColdIVF's cell at S10 and 0.95 in each other system's group, as each head-to-head group held one.
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["s10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "lancedb"
+  dummy_n = 2000
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["s10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "qdrant-edge"
+  dummy_n = 2000
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["s10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "sqlite-vec"
+  dummy_n = 2000
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["s10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "astervec"
+  dummy_n = 2000
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["s10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "usearch"
+  dummy_n = 2000
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["s10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "rabitq-ivf"
+  dummy_n = 2000
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["s10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "rabitq-hnsw"
+  dummy_n = 2000
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["s10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "turbovec"
+  dummy_n = 2000
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["s10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "faiss-ivf"
+  dummy_n = 2000
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["s10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "faiss-ivf-2560"
+  dummy_n = 2000
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["s10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "faiss-fastscan"
+  dummy_n = 2000
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["s10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "faiss-hnsw"
+  dummy_n = 2000
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["s10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "diskann"
+  dummy_n = 2000
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["s10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "symphonyqg"
+  dummy_n = 2000
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["s10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "paimon"
+  dummy_n = 2000
+
+
+# LanceDB's IVF_RQ at 1 bit, with full writes through Table.add and Table.delete, one commit per call. Searches keep
+# Lance's default, which scans the rows it hasn't indexed yet. Its actions are Table.optimize() and
+# Table.optimize(retrain=True). Its cold cells run on Lance's default pool of 10 threads, as in the head-to-head.
+[[system]]
+name = "lancedb"
+adapter = "lancedb"
+python = "${COLDIVF_BENCH_VENVS}/venv-lance13/bin/python3"
+
+  [[system.build]]
+  config_id = "rq1-default"
+  config = { index = "ivf_rq", bits = 1 }
+  threads = 4
+  disk_gb = 6
+  timeout_s = 3600
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "rq1-default-fresh"
+  config = { index = "ivf_rq", bits = 1 }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  threads = 4
+  disk_gb = 6
+  timeout_s = 3600
+
+  [[system.write]]
+  config_id = "rq1-default"
+  role = "full"
+  threads = 1
+
+  [[system.maintain]]
+  config_id = "rq1-default"
+  actions = ["optimize", "retrain"]
+  threads = 4
+  disk_gb = 8
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "rq1-default"
+  states = "all"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobes = 16, refine_factor = 8 }, { nprobes = 12, refine_factor = 4 }]
+  findability = true
+
+  # The picks' neighbors in the head-to-head grid, so warm latency interpolates to the targets.
+  [[system.warm]]
+  config_id = "rq1-default"
+  states = ["s10", "s10i", "s10-optimize", "s10-retrain"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [
+    { nprobes = 12, refine_factor = 8 },
+    { nprobes = 24, refine_factor = 8 },
+    { nprobes = 8, refine_factor = 4 },
+    { nprobes = 16, refine_factor = 4 },
+  ]
+
+  [[system.cold]]
+  config_id = "rq1-default"
+  states = "all"
+  params = { nprobes = 16, refine_factor = 8 }
+  trials = 3
+  group = "lancedb"
+  threads = 10
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "rq1-default"
+  states = "all"
+  params = { nprobes = 12, refine_factor = 4 }
+  trials = 3
+  group = "lancedb"
+  threads = 10
+  dummy_n = 2000
+
+  # The fresh build rq1-default-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "rq1-default-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobes = 16, refine_factor = 8 }, { nprobes = 12, refine_factor = 4 }]
+
+  [[system.cold]]
+  config_id = "rq1-default-fresh"
+  params = { nprobes = 16, refine_factor = 8 }
+  trials = 3
+  group = "lancedb"
+  threads = 10
+  dummy = "data/bench.noindex/writes-smoke/lancedb/rq1-default-n20000-s1-dummy2000"
+
+  [[system.cold]]
+  config_id = "rq1-default-fresh"
+  params = { nprobes = 12, refine_factor = 4 }
+  trials = 3
+  group = "lancedb"
+  threads = 10
+  dummy = "data/bench.noindex/writes-smoke/lancedb/rq1-default-n20000-s1-dummy2000"
+
+
+# qdrant-edge's shard with its head-to-head config, one segment with 8-bit codes in memory, and full writes through
+# upsert_points and delete_points. Its one action, optimize(), rebuilds the whole graph with that config.
+[[system]]
+name = "qdrant-edge"
+adapter = "qdrant_shard"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 12
+  timeout_s = 7200
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "default-fresh"
+  config = {}
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  threads = 4
+  disk_gb = 12
+  timeout_s = 7200
+
+  [[system.write]]
+  config_id = "default"
+  role = "full"
+  threads = 1
+
+  [[system.maintain]]
+  config_id = "default"
+  actions = ["optimize"]
+  threads = 4
+  disk_gb = 12
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "default"
+  states = "all"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ hnsw_ef = 256, oversampling = 2 }, { hnsw_ef = 96, oversampling = 2 }]
+  findability = true
+
+  # The picks' neighbors in the head-to-head grid, so warm latency interpolates to the targets.
+  [[system.warm]]
+  config_id = "default"
+  states = ["s10", "s10i", "s10-optimize"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [
+    { hnsw_ef = 192, oversampling = 2 },
+    { hnsw_ef = 384, oversampling = 2 },
+    { hnsw_ef = 64, oversampling = 2 },
+    { hnsw_ef = 128, oversampling = 2 },
+  ]
+
+  [[system.cold]]
+  config_id = "default"
+  states = "all"
+  params = { hnsw_ef = 256, oversampling = 2 }
+  trials = 3
+  group = "qdrant-edge"
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "default"
+  states = "all"
+  params = { hnsw_ef = 96, oversampling = 2 }
+  trials = 3
+  group = "qdrant-edge"
+  dummy_n = 2000
+
+  # The fresh build default-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "default-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ hnsw_ef = 256, oversampling = 2 }, { hnsw_ef = 96, oversampling = 2 }]
+
+  [[system.cold]]
+  config_id = "default-fresh"
+  params = { hnsw_ef = 256, oversampling = 2 }
+  trials = 3
+  group = "qdrant-edge"
+  dummy = "data/bench.noindex/writes-smoke/qdrant-edge/default-n20000-s1-dummy2000"
+
+  [[system.cold]]
+  config_id = "default-fresh"
+  params = { hnsw_ef = 96, oversampling = 2 }
+  trials = 3
+  group = "qdrant-edge"
+  dummy = "data/bench.noindex/writes-smoke/qdrant-edge/default-n20000-s1-dummy2000"
+
+
+# sqlite-vec's exact scan of float32 rows, with full writes as INSERT and DELETE, one transaction per call. Its recall
+# can't move and a query takes ~438 ms, so its warm runs take 1 pass and skip the findability check.
+[[system]]
+name = "sqlite-vec"
+adapter = "sqlite_vec"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 5
+  timeout_s = 3600
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "default-fresh"
+  config = {}
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  threads = 4
+  disk_gb = 5
+  timeout_s = 3600
+
+  [[system.write]]
+  config_id = "default"
+  role = "full"
+  threads = 1
+
+  [[system.maintain]]
+  config_id = "default"
+  actions = ["vacuum"]
+  threads = 4
+  disk_gb = 5
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "default"
+  states = "all"
+  split = "test"
+  passes = 1
+  warmup = 10
+  settings = [{}]
+
+  [[system.cold]]
+  config_id = "default"
+  states = "all"
+  params = {}
+  trials = 3
+  group = "sqlite-vec"
+  dummy_n = 2000
+
+  # The fresh build default-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "default-fresh"
+  split = "test"
+  passes = 1
+  warmup = 10
+  settings = [{}]
+
+  [[system.cold]]
+  config_id = "default-fresh"
+  params = {}
+  trials = 3
+  group = "sqlite-vec"
+  dummy = "data/bench.noindex/writes-smoke/sqlite-vec/default-n20000-s1-dummy2000"
+
+
+# AsterVec's log-structured merge (LSM) graph with its default caches, and full writes of one id per call. Its durable
+# point is close, timed with the reopen after it. It has no maintenance action, since RocksDB compacts on its own.
+[[system]]
+name = "astervec"
+adapter = "astervec_lsm"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 4
+  timeout_s = 7200
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "default-fresh"
+  config = {}
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  threads = 4
+  disk_gb = 4
+  timeout_s = 7200
+
+  [[system.write]]
+  config_id = "default"
+  role = "full"
+  threads = 1
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "default"
+  states = "all"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ ef = 384 }, { ef = 96 }]
+  findability = true
+
+  # The picks' neighbors in the head-to-head grid, so warm latency interpolates to the targets.
+  [[system.warm]]
+  config_id = "default"
+  states = ["s10", "s10i"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [
+    { ef = 256 },
+    { ef = 512 },
+    { ef = 64 },
+    { ef = 128 },
+  ]
+
+  [[system.cold]]
+  config_id = "default"
+  states = "all"
+  params = { ef = 384 }
+  trials = 3
+  group = "astervec"
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "default"
+  states = "all"
+  params = { ef = 96 }
+  trials = 3
+  group = "astervec"
+  dummy_n = 2000
+
+  # The fresh build default-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "default-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ ef = 384 }, { ef = 96 }]
+
+  [[system.cold]]
+  config_id = "default-fresh"
+  params = { ef = 384 }
+  trials = 3
+  group = "astervec"
+  dummy = "data/bench.noindex/writes-smoke/astervec/default-n20000-s1-dummy2000"
+
+  [[system.cold]]
+  config_id = "default-fresh"
+  params = { ef = 96 }
+  trials = 3
+  group = "astervec"
+  dummy = "data/bench.noindex/writes-smoke/astervec/default-n20000-s1-dummy2000"
+
+
+# usearch's HNSW at M 16 with 16-bit float (f16) rows, with full writes through add and remove on the loaded index. Its
+# durable point saves the whole file to a temporary file and renames it. It has no maintenance action.
+[[system]]
+name = "usearch"
+adapter = "usearch_hnsw"
+
+  [[system.build]]
+  config_id = "f16-m16"
+  config = { dtype = "f16" }
+  threads = 4
+  disk_gb = 3
+  timeout_s = 7200
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "f16-m16-fresh"
+  config = { dtype = "f16" }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  threads = 4
+  disk_gb = 3
+  timeout_s = 7200
+
+  [[system.write]]
+  config_id = "f16-m16"
+  role = "full"
+  threads = 1
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "f16-m16"
+  states = "all"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ expansion_search = 384 }, { expansion_search = 96 }]
+  findability = true
+
+  # The picks' neighbors in the head-to-head grid, so warm latency interpolates to the targets.
+  [[system.warm]]
+  config_id = "f16-m16"
+  states = ["s10", "s10i"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [
+    { expansion_search = 256 },
+    { expansion_search = 512 },
+    { expansion_search = 64 },
+    { expansion_search = 128 },
+  ]
+
+  [[system.cold]]
+  config_id = "f16-m16"
+  states = "all"
+  params = { expansion_search = 384 }
+  trials = 3
+  group = "usearch"
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "f16-m16"
+  states = "all"
+  params = { expansion_search = 96 }
+  trials = 3
+  group = "usearch"
+  dummy_n = 2000
+
+  # The fresh build f16-m16-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "f16-m16-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ expansion_search = 384 }, { expansion_search = 96 }]
+
+  [[system.cold]]
+  config_id = "f16-m16-fresh"
+  params = { expansion_search = 384 }
+  trials = 3
+  group = "usearch"
+  dummy = "data/bench.noindex/writes-smoke/usearch/f16-m16-n20000-s1-dummy2000"
+
+  [[system.cold]]
+  config_id = "f16-m16-fresh"
+  params = { expansion_search = 96 }
+  trials = 3
+  group = "usearch"
+  dummy = "data/bench.noindex/writes-smoke/usearch/f16-m16-n20000-s1-dummy2000"
+
+
+# RaBitQ-Library's IVF at 5 bits on ColdIVF's partition, with full writes through add and remove on the loaded index.
+# Its durable point saves the whole file. Its fresh build takes the partition of ColdIVF's fresh build.
+[[system]]
+name = "rabitq-ivf"
+adapter = "rabitq_ivf"
+
+  [[system.build]]
+  config_id = "cp320-b5"
+  config = { bits = 5 }
+  clusters = "data/bench.noindex/writes-smoke/coldivf-python/tl320-n20000-s1.clusters/partition"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "dummy320-b5"
+  config = { bits = 5, vectors_per_list = 320 }
+  n = 2000
+  threads = 4
+  disk_gb = 1
+  timeout_s = 1800
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "cp320-b5-fresh"
+  config = { bits = 5 }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  clusters = "data/bench.noindex/writes-smoke/coldivf-python/tl320-fresh-n20000-s1.clusters/partition"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.write]]
+  config_id = "cp320-b5"
+  role = "full"
+  threads = 1
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "cp320-b5"
+  states = "all"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 192 }, { nprobe = 64 }]
+  findability = true
+
+  # The picks' neighbors in the head-to-head grid, so warm latency interpolates to the targets.
+  [[system.warm]]
+  config_id = "cp320-b5"
+  states = ["s10", "s10i"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [
+    { nprobe = 128 },
+    { nprobe = 256 },
+    { nprobe = 48 },
+    { nprobe = 96 },
+  ]
+
+  [[system.cold]]
+  config_id = "cp320-b5"
+  states = "all"
+  params = { nprobe = 192 }
+  trials = 3
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/writes-smoke/rabitq-ivf/dummy320-b5-n2000-s1"
+
+  [[system.cold]]
+  config_id = "cp320-b5"
+  states = "all"
+  params = { nprobe = 64 }
+  trials = 3
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/writes-smoke/rabitq-ivf/dummy320-b5-n2000-s1"
+
+  # The fresh build cp320-b5-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "cp320-b5-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 192 }, { nprobe = 64 }]
+
+  [[system.cold]]
+  config_id = "cp320-b5-fresh"
+  params = { nprobe = 192 }
+  trials = 3
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/writes-smoke/rabitq-ivf/dummy320-b5-n2000-s1"
+
+  [[system.cold]]
+  config_id = "cp320-b5-fresh"
+  params = { nprobe = 64 }
+  trials = 3
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/writes-smoke/rabitq-ivf/dummy320-b5-n2000-s1"
+
+
+# RaBitQ-Library's HNSW at M 16 over 4-bit codes, with full writes, a resize to each round's capacity timed as its own
+# op, then add and remove. It reaches only 0.90, so it runs that one setting.
+[[system]]
+name = "rabitq-hnsw"
+adapter = "rabitq_hnsw"
+
+  [[system.build]]
+  config_id = "b4"
+  config = { bits = 4 }
+  threads = 4
+  disk_gb = 2
+  timeout_s = 7200
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "b4-fresh"
+  config = { bits = 4 }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 7200
+
+  [[system.write]]
+  config_id = "b4"
+  role = "full"
+  threads = 1
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "b4"
+  states = "all"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ ef = 128 }]
+  findability = true
+
+  # The picks' neighbors in the head-to-head grid, so warm latency interpolates to the targets.
+  [[system.warm]]
+  config_id = "b4"
+  states = ["s10", "s10i"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ ef = 96 }, { ef = 192 }]
+
+  [[system.cold]]
+  config_id = "b4"
+  states = "all"
+  params = { ef = 128 }
+  trials = 3
+  group = "rabitq-hnsw"
+  dummy_n = 2000
+
+  # The fresh build b4-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "b4-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ ef = 128 }]
+
+  [[system.cold]]
+  config_id = "b4-fresh"
+  params = { ef = 128 }
+  trials = 3
+  group = "rabitq-hnsw"
+  dummy = "data/bench.noindex/writes-smoke/rabitq-hnsw/b4-n20000-s1-dummy2000"
+
+
+# turbovec's 4-bit codes with calibration, built as an IdMapIndex, with full writes through add_with_ids and remove, and
+# sync(path) as its sync. It takes no search setting and stays below 0.90, so it runs its one setting.
+[[system]]
+name = "turbovec"
+variant = "idmap"
+adapter = "turbovec"
+
+  [[system.build]]
+  config_id = "b4-cal"
+  config = { bits = 4, calibrate = 10000 }
+  threads = 4
+  disk_gb = 1
+  timeout_s = 3600
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "b4-cal-fresh"
+  config = { bits = 4, calibrate = 10000 }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  threads = 4
+  disk_gb = 1
+  timeout_s = 3600
+
+  [[system.write]]
+  config_id = "b4-cal"
+  role = "full"
+  threads = 1
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "b4-cal"
+  states = "all"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{}]
+  findability = true
+
+  [[system.cold]]
+  config_id = "b4-cal"
+  states = "all"
+  params = {}
+  trials = 3
+  group = "turbovec"
+  dummy_n = 2000
+
+  # The fresh build b4-cal-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "b4-cal-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{}]
+
+  [[system.cold]]
+  config_id = "b4-cal-fresh"
+  params = {}
+  trials = 3
+  group = "turbovec"
+  dummy = "data/bench.noindex/writes-smoke/turbovec-idmap/b4-cal-n20000-s1-dummy2000"
+
+
+# faiss IVF over 1-bit RaBitQ codes with SQ8 rows to rescore, on ColdIVF's partition at 320 per list, searched through
+# faiss's mapped open as faiss ships it. Writes go to the loaded index, and its durable point writes the whole file.
+[[system]]
+name = "faiss-ivf"
+variant = "shipped"
+adapter = "faiss_ivf"
+
+  [[system.build]]
+  config_id = "cp320-rq1"
+  config = { bits = 1 }
+  clusters = "data/bench.noindex/writes-smoke/coldivf-python/tl320-n20000-s1.clusters/partition"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  # The dummy the cold cells search first. A dummy can't take shared clusters, so it trains its own.
+  [[system.build]]
+  config_id = "dummy320-rq1"
+  config = { vectors_per_list = 320, bits = 1 }
+  n = 2000
+  threads = 4
+  disk_gb = 1
+  timeout_s = 1800
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "cp320-rq1-fresh"
+  config = { bits = 1 }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  clusters = "data/bench.noindex/writes-smoke/coldivf-python/tl320-fresh-n20000-s1.clusters/partition"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.write]]
+  config_id = "cp320-rq1"
+  role = "full"
+  threads = 1
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "cp320-rq1"
+  states = "all"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 96, k_factor = 8, qb = 4 }, { nprobe = 48, k_factor = 4, qb = 4 }]
+  findability = true
+
+  # The picks' neighbors in the head-to-head grid, so warm latency interpolates to the targets.
+  [[system.warm]]
+  config_id = "cp320-rq1"
+  states = ["s10", "s10i"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [
+    { nprobe = 64, k_factor = 8, qb = 4 },
+    { nprobe = 128, k_factor = 8, qb = 4 },
+    { nprobe = 32, k_factor = 4, qb = 4 },
+    { nprobe = 64, k_factor = 4, qb = 4 },
+  ]
+
+  [[system.cold]]
+  config_id = "cp320-rq1"
+  states = "all"
+  params = { nprobe = 96, k_factor = 8, qb = 4 }
+  trials = 3
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/writes-smoke/faiss-ivf-shipped/dummy320-rq1-n2000-s1"
+
+  [[system.cold]]
+  config_id = "cp320-rq1"
+  states = "all"
+  params = { nprobe = 48, k_factor = 4, qb = 4 }
+  trials = 3
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/writes-smoke/faiss-ivf-shipped/dummy320-rq1-n2000-s1"
+
+  # The fresh build cp320-rq1-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "cp320-rq1-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 96, k_factor = 8, qb = 4 }, { nprobe = 48, k_factor = 4, qb = 4 }]
+
+  [[system.cold]]
+  config_id = "cp320-rq1-fresh"
+  params = { nprobe = 96, k_factor = 8, qb = 4 }
+  trials = 3
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/writes-smoke/faiss-ivf-shipped/dummy320-rq1-n2000-s1"
+
+  [[system.cold]]
+  config_id = "cp320-rq1-fresh"
+  params = { nprobe = 48, k_factor = 4, qb = 4 }
+  trials = 3
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/writes-smoke/faiss-ivf-shipped/dummy320-rq1-n2000-s1"
+
+
+# faiss IVF at 2,560 per list on faiss's own k-means, ColdIVF's closest cold rival at 1M, searched through the harness's
+# batched read path. It takes its writes with the same calls as the shipped setup, and each durable point writes the
+# whole file with new list offsets.
+[[system]]
+name = "faiss-ivf"
+variant = "batched"
+adapter = "faiss_ivf"
+
+  [[system.build]]
+  config_id = "vpl2560-rq1"
+  config = { vectors_per_list = 2560, bits = 1 }
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "dummy2560-rq1"
+  config = { vectors_per_list = 2560, bits = 1 }
+  n = 2000
+  threads = 4
+  disk_gb = 1
+  timeout_s = 1800
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "vpl2560-rq1-fresh"
+  config = { vectors_per_list = 2560, bits = 1 }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.write]]
+  config_id = "vpl2560-rq1"
+  role = "full"
+  threads = 1
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  states = "all"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 24, k_factor = 8, qb = 4 }, { nprobe = 12, k_factor = 4, qb = 4 }]
+  findability = true
+
+  # The picks' neighbors in the head-to-head grid, so warm latency interpolates to the targets.
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  states = ["s10", "s10i"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [
+    { nprobe = 16, k_factor = 8, qb = 4 },
+    { nprobe = 32, k_factor = 8, qb = 4 },
+    { nprobe = 8, k_factor = 4, qb = 4 },
+    { nprobe = 16, k_factor = 4, qb = 4 },
+  ]
+
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  states = "all"
+  params = { nprobe = 24, k_factor = 8, qb = 4 }
+  trials = 3
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/writes-smoke/faiss-ivf-batched/dummy2560-rq1-n2000-s1"
+
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  states = "all"
+  params = { nprobe = 12, k_factor = 4, qb = 4 }
+  trials = 3
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/writes-smoke/faiss-ivf-batched/dummy2560-rq1-n2000-s1"
+
+  # The fresh build vpl2560-rq1-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "vpl2560-rq1-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 24, k_factor = 8, qb = 4 }, { nprobe = 12, k_factor = 4, qb = 4 }]
+
+  [[system.cold]]
+  config_id = "vpl2560-rq1-fresh"
+  params = { nprobe = 24, k_factor = 8, qb = 4 }
+  trials = 3
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/writes-smoke/faiss-ivf-batched/dummy2560-rq1-n2000-s1"
+
+  [[system.cold]]
+  config_id = "vpl2560-rq1-fresh"
+  params = { nprobe = 12, k_factor = 4, qb = 4 }
+  trials = 3
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/writes-smoke/faiss-ivf-batched/dummy2560-rq1-n2000-s1"
+
+
+# faiss's RaBitQ FastScan with SQ8 rows to rescore, on ColdIVF's partition, with the same writes as faiss IVF.
+[[system]]
+name = "faiss-fastscan"
+variant = "fastscan"
+adapter = "faiss_ivf"
+
+  [[system.build]]
+  config_id = "cp320-rq1"
+  config = { bits = 1 }
+  clusters = "data/bench.noindex/writes-smoke/coldivf-python/tl320-n20000-s1.clusters/partition"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "dummy320-rq1"
+  config = { vectors_per_list = 320, bits = 1 }
+  n = 2000
+  threads = 4
+  disk_gb = 1
+  timeout_s = 1800
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "cp320-rq1-fresh"
+  config = { bits = 1 }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  clusters = "data/bench.noindex/writes-smoke/coldivf-python/tl320-fresh-n20000-s1.clusters/partition"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.write]]
+  config_id = "cp320-rq1"
+  role = "full"
+  threads = 1
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "cp320-rq1"
+  states = "all"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 96, k_factor = 8, qb = 8 }, { nprobe = 48, k_factor = 4, qb = 8 }]
+  findability = true
+
+  # The picks' neighbors in the head-to-head grid, so warm latency interpolates to the targets.
+  [[system.warm]]
+  config_id = "cp320-rq1"
+  states = ["s10", "s10i"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [
+    { nprobe = 64, k_factor = 8, qb = 8 },
+    { nprobe = 128, k_factor = 8, qb = 8 },
+    { nprobe = 32, k_factor = 4, qb = 8 },
+    { nprobe = 64, k_factor = 4, qb = 8 },
+  ]
+
+  [[system.cold]]
+  config_id = "cp320-rq1"
+  states = "all"
+  params = { nprobe = 96, k_factor = 8, qb = 8 }
+  trials = 3
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/writes-smoke/faiss-fastscan-fastscan/dummy320-rq1-n2000-s1"
+
+  [[system.cold]]
+  config_id = "cp320-rq1"
+  states = "all"
+  params = { nprobe = 48, k_factor = 4, qb = 8 }
+  trials = 3
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/writes-smoke/faiss-fastscan-fastscan/dummy320-rq1-n2000-s1"
+
+  # The fresh build cp320-rq1-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "cp320-rq1-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 96, k_factor = 8, qb = 8 }, { nprobe = 48, k_factor = 4, qb = 8 }]
+
+  [[system.cold]]
+  config_id = "cp320-rq1-fresh"
+  params = { nprobe = 96, k_factor = 8, qb = 8 }
+  trials = 3
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/writes-smoke/faiss-fastscan-fastscan/dummy320-rq1-n2000-s1"
+
+  [[system.cold]]
+  config_id = "cp320-rq1-fresh"
+  params = { nprobe = 48, k_factor = 4, qb = 8 }
+  trials = 3
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/writes-smoke/faiss-fastscan-fastscan/dummy320-rq1-n2000-s1"
+
+
+# faiss's HNSW at M 32 over SQ8 rows, inserts only, since its only delete would be a search filter that still walks the
+# deleted nodes. So it takes the inserts-only ladder, its latency runs take S10i for S10, and it builds Fresh-i too.
+[[system]]
+name = "faiss-hnsw"
+adapter = "faiss_hnsw"
+
+  [[system.build]]
+  config_id = "hnsw32-sq8"
+  config = { m = 32, storage = "sq8", ef_construction = 200 }
+  threads = 4
+  disk_gb = 2
+  timeout_s = 7200
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "hnsw32-sq8-fresh"
+  config = { m = 32, storage = "sq8", ef_construction = 200 }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 7200
+
+  # Fresh-i, a build of S10i's vectors, the first rows of the dataset.
+  [[system.build]]
+  config_id = "hnsw32-sq8-fresh-i"
+  config = { m = 32, storage = "sq8", ef_construction = 200 }
+  n = 22000
+  threads = 4
+  disk_gb = 2
+  timeout_s = 7200
+
+  [[system.write]]
+  config_id = "hnsw32-sq8"
+  role = "inserts"
+  threads = 1
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "hnsw32-sq8"
+  states = "all"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ ef_search = 96 }, { ef_search = 48 }]
+  findability = true
+
+  # The picks' neighbors in the head-to-head grid, so warm latency interpolates to the targets.
+  [[system.warm]]
+  config_id = "hnsw32-sq8"
+  states = ["s10i"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [
+    { ef_search = 64 },
+    { ef_search = 128 },
+    { ef_search = 32 },
+  ]
+
+  [[system.cold]]
+  config_id = "hnsw32-sq8"
+  states = "all"
+  params = { ef_search = 96 }
+  trials = 3
+  group = "faiss-hnsw"
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "hnsw32-sq8"
+  states = "all"
+  params = { ef_search = 48 }
+  trials = 3
+  group = "faiss-hnsw"
+  dummy_n = 2000
+
+  # The fresh build hnsw32-sq8-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "hnsw32-sq8-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ ef_search = 96 }, { ef_search = 48 }]
+
+  [[system.cold]]
+  config_id = "hnsw32-sq8-fresh"
+  params = { ef_search = 96 }
+  trials = 3
+  group = "faiss-hnsw"
+  dummy = "data/bench.noindex/writes-smoke/faiss-hnsw/hnsw32-sq8-n20000-s1-dummy2000"
+
+  [[system.cold]]
+  config_id = "hnsw32-sq8-fresh"
+  params = { ef_search = 48 }
+  trials = 3
+  group = "faiss-hnsw"
+  dummy = "data/bench.noindex/writes-smoke/faiss-hnsw/hnsw32-sq8-n20000-s1-dummy2000"
+
+  # The fresh build hnsw32-sq8-fresh-i, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "hnsw32-sq8-fresh-i"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ ef_search = 96 }, { ef_search = 48 }]
+
+  [[system.cold]]
+  config_id = "hnsw32-sq8-fresh-i"
+  params = { ef_search = 96 }
+  trials = 3
+  group = "faiss-hnsw"
+  dummy = "data/bench.noindex/writes-smoke/faiss-hnsw/hnsw32-sq8-n20000-s1-dummy2000"
+
+  [[system.cold]]
+  config_id = "hnsw32-sq8-fresh-i"
+  params = { ef_search = 48 }
+  trials = 3
+  group = "faiss-hnsw"
+  dummy = "data/bench.noindex/writes-smoke/faiss-hnsw/hnsw32-sq8-n20000-s1-dummy2000"
+
+
+# DiskANN's disk index, rebuild only. It has no write call, so its S0 is its build, scored against every state's truth
+# as well, and its fresh build of S10's live rows is its only write path.
+[[system]]
+name = "diskann"
+adapter = "diskann"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 6
+  timeout_s = 7200
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "default-fresh"
+  config = {}
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  threads = 4
+  disk_gb = 6
+  timeout_s = 7200
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "default"
+  states = ["s0"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ list = 96, beam = 8 }, { list = 48, beam = 8 }]
+
+  [[system.cold]]
+  config_id = "default"
+  states = ["s0"]
+  params = { list = 96, beam = 8 }
+  trials = 3
+  group = "diskann"
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "default"
+  states = ["s0"]
+  params = { list = 48, beam = 8 }
+  trials = 3
+  group = "diskann"
+  dummy_n = 2000
+
+  # The fresh build default-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "default-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ list = 96, beam = 8 }, { list = 48, beam = 8 }]
+
+  [[system.cold]]
+  config_id = "default-fresh"
+  params = { list = 96, beam = 8 }
+  trials = 3
+  group = "diskann"
+  dummy = "data/bench.noindex/writes-smoke/diskann/default-n20000-s1-dummy2000"
+
+  [[system.cold]]
+  config_id = "default-fresh"
+  params = { list = 48, beam = 8 }
+  trials = 3
+  group = "diskann"
+  dummy = "data/bench.noindex/writes-smoke/diskann/default-n20000-s1-dummy2000"
+
+
+# SymphonyQG's graph, rebuild only. Its build holds ~10 GB, so its build, warm runs and cold cells run alone under the
+# 16 GB cap.
+[[system]]
+name = "symphonyqg"
+adapter = "symphonyqg"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 12
+  timeout_s = 7200
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "default-fresh"
+  config = {}
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  threads = 4
+  disk_gb = 12
+  timeout_s = 7200
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "default"
+  states = ["s0"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ ef = 128 }, { ef = 64 }]
+
+  [[system.cold]]
+  config_id = "default"
+  states = ["s0"]
+  params = { ef = 128 }
+  trials = 3
+  group = "symphonyqg"
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "default"
+  states = ["s0"]
+  params = { ef = 64 }
+  trials = 3
+  group = "symphonyqg"
+  dummy_n = 2000
+
+  # The fresh build default-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "default-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ ef = 128 }, { ef = 64 }]
+
+  [[system.cold]]
+  config_id = "default-fresh"
+  params = { ef = 128 }
+  trials = 3
+  group = "symphonyqg"
+  dummy = "data/bench.noindex/writes-smoke/symphonyqg/default-n20000-s1-dummy2000"
+
+  [[system.cold]]
+  config_id = "default-fresh"
+  params = { ef = 64 }
+  trials = 3
+  group = "symphonyqg"
+  dummy = "data/bench.noindex/writes-smoke/symphonyqg/default-n20000-s1-dummy2000"
+
+
+# Paimon's IVF-RQ, rebuild only: the 8-bit build at nprobe 48 for 0.95 and the 4-bit build at nprobe 48 for 0.90.
+[[system]]
+name = "paimon"
+adapter = "paimon"
+
+  [[system.build]]
+  config_id = "b8"
+  config = { bits = 8, train_rows = 20000 }
+  threads = 4
+  disk_gb = 2
+  timeout_s = 7200
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "b8-fresh"
+  config = { bits = 8, train_rows = 20000 }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 7200
+
+  [[system.build]]
+  config_id = "b4"
+  config = { bits = 4, train_rows = 20000 }
+  threads = 4
+  disk_gb = 2
+  timeout_s = 7200
+
+  # Fresh, a build of the copy of S10's live rows.
+  [[system.build]]
+  config_id = "b4-fresh"
+  config = { bits = 4, train_rows = 20000 }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-s10-live.base.fbin"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 7200
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "b8"
+  states = ["s0"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 48 }]
+
+  [[system.cold]]
+  config_id = "b8"
+  states = ["s0"]
+  params = { nprobe = 48 }
+  trials = 3
+  group = "paimon"
+  dummy_n = 2000
+
+  # The fresh build b8-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "b8-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 48 }]
+
+  [[system.cold]]
+  config_id = "b8-fresh"
+  params = { nprobe = 48 }
+  trials = 3
+  group = "paimon"
+  dummy = "data/bench.noindex/writes-smoke/paimon/b8-n20000-s1-dummy2000"
+
+  # Every state at both picks.
+  [[system.warm]]
+  config_id = "b4"
+  states = ["s0"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 48 }]
+
+  [[system.cold]]
+  config_id = "b4"
+  states = ["s0"]
+  params = { nprobe = 48 }
+  trials = 3
+  group = "paimon"
+  dummy_n = 2000
+
+  # The fresh build b4-fresh, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "b4-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 48 }]
+
+  [[system.cold]]
+  config_id = "b4-fresh"
+  params = { nprobe = 48 }
+  trials = 3
+  group = "paimon"
+  dummy = "data/bench.noindex/writes-smoke/paimon/b4-n20000-s1-dummy2000"
+
+
+# The exact reference: the flat scan, whose writes the harness makes. It takes S0 and every state of both ladders, warm
+# only, and its recall must be 1.000 at each.
+[[system]]
+name = "flat"
+adapter = "flat"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 5
+  timeout_s = 1800
+
+  [[system.write]]
+  config_id = "default"
+  role = "exact"
+  threads = 1
+
+  # Every state of both ladders, whose recall must be 1.000, which checks each state's truth.
+  [[system.warm]]
+  config_id = "default"
+  states = "all"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{}]
+  findability = true

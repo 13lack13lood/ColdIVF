@@ -1,9 +1,9 @@
 """The "coldivf-bench/2" result lines, their validator and writer, run keys for resuming, and provenance.
 
 Every line is one JSON object. It holds the common fields, then the fields of its kind, which is build, warm, cold,
-update, ref or batch. Every field of both sets is present in every line, with null for what wasn't measured. Anything
-else a system measures goes under "extra". A line's run key names the measurement it is, so a resumed run skips what is
-done.
+write, maintain, ref or batch. Every field of both sets is present in every line, with null for what wasn't measured.
+Anything else a system measures goes under "extra". A line's run key names the measurement it is, so a resumed run
+skips what is done.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from typing import Any, Callable, Iterable
 import fcntl
 
 SCHEMA = "coldivf-bench/2"
-KINDS = ("build", "warm", "cold", "update", "ref", "batch")
+KINDS = ("build", "warm", "cold", "write", "maintain", "ref", "batch")
 STATUSES = ("ok", "rejected", "invalid", "failed", "unsupported")
 # Statuses that end a measurement. A resumed run repeats the others, up to its limit of attempts.
 FINAL = ("ok", "unsupported")
@@ -58,7 +58,7 @@ COMMON = {
     "build_params": "dict?", "search_params": "dict?", "dataset": "str?", "metric": "str?", "n": "int?",
     "dim": "int?", "base_dtype": "str?", "split": "str?", "gt": "dict?", "machine": "dict", "provenance": "dict",
     "index_identity": "dict?", "gate": "dict", "load_before": "nums?", "load_after": "nums?", "agents_cpu": "dict?",
-    "open_us_batch": "num?", "ref_drift_pct": "num?", "extra": "dict",
+    "open_us_batch": "num?", "ref_drift_pct": "num?", "stream": "dict?", "state": "str?", "extra": "dict",
 }
 
 FIELDS = {
@@ -75,7 +75,7 @@ FIELDS = {
         "recall1": "num?", "recall100": "num?", "recall10_p05": "num?", "recall10_p10": "num?",
         "share_ge_0_9": "num?", "footprint": "int?", "resident_file_bytes": "int?", "memory_total": "int?",
         "dist_evals": "num?", "bytes_scanned": "num?", "swapins_delta": "int?", "compressions_delta": "int?",
-        "overhead_us": "num?", "ids_file": "str?",
+        "overhead_us": "num?", "ids_file": "str?", "dead_returned": "num?", "recall10_inserted": "num?",
     },
     "cold": {
         "regime": "str", "cpu_state": "str?", "delay_ms": "num?", "threads": "int?", "k": "int?", "trial": "int",
@@ -86,12 +86,22 @@ FIELDS = {
         "resident_file_bytes_after": "int?", "lifetime_max_footprint": "int?", "cpu_ms": "num?",
         "cpu_qos_ms": "dict?", "p_share": "num?", "ghz": "num?", "energy_nj": "int?", "server_start_ms": "num?",
         "ids": "ints?", "recall10": "num?", "recall10_ids_only": "num?", "swapins_delta": "int?",
-        "compressions_delta": "int?", "qos": "str?",
+        "compressions_delta": "int?", "qos": "str?", "dead_returned": "num?", "recall10_inserted": "num?",
     },
-    "update": {
-        "epoch": "int", "inserts": "int?", "deletes": "int?", "insert_us_p50": "num?", "insert_us_p99": "num?",
-        "delete_us_p50": "num?", "maintenance_seconds": "num?", "recall10": "num?", "recall10_fresh_build": "num?",
-        "warm_p50_us": "num?", "c0_p50_us": "num?",
+    "write": {
+        "mode": "str", "op": "str", "state_from": "str?", "state_to": "str?", "batch": "int?", "calls": "int?",
+        "rows": "int?", "threads": "int?", "durability": "str?", "open_us": "num?", "open_footprint": "int?",
+        "first_us": "num?", "p50_us": "num?", "p90_us": "num?", "p99_us": "num?", "max_us": "num?", "mean_us": "num?",
+        "rows_per_s": "num?", "cpu_ms": "num?", "cpu_qos_ms": "dict?", "logical_bytes_written": "int?",
+        "disk_bytes_written": "int?", "index_bytes_before": "int?", "index_bytes_after": "int?",
+        "footprint_before": "int?", "footprint_after": "int?", "lifetime_max_footprint": "int?",
+        "swapins_delta": "int?", "compressions_delta": "int?",
+    },
+    "maintain": {
+        "action": "str", "state_from": "str?", "state_to": "str?", "threads": "int?", "params": "dict?",
+        "seconds": "num?", "cpu_seconds": "num?", "open_us": "num?", "footprint_before": "int?",
+        "peak_footprint": "int?", "bytes_read": "int?", "bytes_written": "int?", "peak_disk_bytes": "int?",
+        "index_bytes_before": "int?", "index_bytes_after": "int?", "rows_live": "int?", "durability": "str?",
     },
     "ref": {
         "position": "str", "wave_us_p50": "num?", "coldivf_c0_p50_us": "num?", "wave_trials": "int?",
@@ -109,7 +119,8 @@ OK_NEEDS: dict[str, tuple[tuple[str, ...], ...]] = {
     "build": (("seconds",), ("index_bytes",)),
     "warm": (("p50_us", "qps"), ("queries",)),
     "cold": (("total_us",),),
-    "update": (),
+    "write": (("p50_us", "rows_per_s"),),
+    "maintain": (("seconds",),),
     "ref": (("wave_us_p50", "coldivf_c0_p50_us"),),
     "batch": (),
 }

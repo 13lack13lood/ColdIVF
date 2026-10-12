@@ -1,0 +1,704 @@
+# A smoke test of the drift pass, with the layout of bench-1m-writes-drift.toml at small scale. The base is the first
+# 20,000 rows of cohere10m-768-cosine, and the drift stream inserts the 2,000 rows nearest 2 of the 20 topics that
+# k-means finds among 200,000 later rows, in batches of 100. It checks the code, not the machine, so its gate only
+# warns.
+#
+# From coldivf-bench/py:
+#   python writes.py prepare ../suites/writes-smoke-drift.toml
+#   driver.py ../suites/writes-smoke-drift.toml --systems coldivf:python,NAME[:VARIANT]
+
+phase = "writes-smoke-drift"
+dataset = "cohere10m-768-cosine"
+n = 20000
+index_root = "data/bench.noindex/writes-smoke-drift"
+truth = "data/writes/cohere10m-768-cosine-wsmoke-s0.gt.ibin"
+seed = 1
+k = 10
+max_attempts = 2
+
+[gate]
+mode = "warn"
+top_samples = 2
+top_interval_s = 2
+invalid_vm = []
+
+[writes]
+stream = "data/writes/cohere10m-768-cosine-wsmoke-drift.stream"
+pattern = "drift"
+batch = 100
+reserve_from = 22000
+drift_from = 23300
+drift_rows = 200000
+topics = 20
+hot_topics = 2
+topic_sample = 20000
+kmeans_rounds = 10
+seed = 1
+probes = 100
+
+[writes.states]
+d1 = { inserts = 200, deletes = 200 }
+d5 = { inserts = 1000, deletes = 1000 }
+d10 = { inserts = 2000, deletes = 2000 }
+
+# ColdIVF through its Python module on the drift stream, with the main suite's maintenance actions. Its fresh build
+# saves the partition the faiss IVF at 320 per list, FastScan and RaBitQ-Library IVF build their fresh indexes on.
+[[system]]
+name = "coldivf"
+variant = "python"
+adapter = "coldivf_py"
+python = "${COLDIVF_BENCH_VENVS}/venv-coldivf/bin/python3"
+
+  [[system.build]]
+  config_id = "tl320"
+  config = { clustering = "two-level", vectors_per_list = 320, anchor = "cluster" }
+  threads = 4
+  disk_gb = 1
+  timeout_s = 7200
+
+  # The head-to-head's build again, for the partition the faiss IVF at 320 per list, FastScan and RaBitQ-Library IVF
+  # build on. Nothing searches it.
+  [[system.build]]
+  config_id = "tl320-partition"
+  config = { clustering = "two-level", vectors_per_list = 320, anchor = "cluster", export_clusters = true }
+  threads = 4
+  disk_gb = 1
+  timeout_s = 7200
+
+  # Fresh, a build of the copy of D10's live rows, which saves its partition.
+  [[system.build]]
+  config_id = "tl320-fresh"
+  config = { clustering = "two-level", vectors_per_list = 320, anchor = "cluster", export_clusters = true }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-drift-d10-live.base.fbin"
+  threads = 4
+  disk_gb = 1
+  timeout_s = 7200
+
+  [[system.write]]
+  config_id = "tl320"
+  role = "full"
+  threads = 1
+  states = ["d10"]
+
+  [[system.maintain]]
+  config_id = "tl320"
+  actions = ["fold", "auto", "major", "job"]
+  threads = 4
+  action_threads = { job = 2 }
+  params = { vectors_per_list = 320 }
+  unsearched = ["job"]
+  same_file = { job = "auto" }
+  disk_gb = 1
+
+  # D10 and each maintained state at both picks.
+  [[system.warm]]
+  config_id = "tl320"
+  states = ["d10", "d10-fold", "d10-auto", "d10-major"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 128, rerank = 64 }, { nprobe = 64, rerank = 39 }]
+  findability = true
+
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["d10", "d10-fold", "d10-auto", "d10-major"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "coldivf"
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["d10", "d10-fold", "d10-auto", "d10-major"]
+  params = { nprobe = 64, rerank = 39 }
+  trials = 3
+  group = "coldivf"
+  dummy_n = 2000
+
+  # The fresh build, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "tl320-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 128, rerank = 64 }, { nprobe = 64, rerank = 39 }]
+
+  [[system.cold]]
+  config_id = "tl320-fresh"
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "coldivf"
+  dummy = "data/bench.noindex/writes-smoke-drift/coldivf-python/tl320-n20000-s1-dummy2000"
+
+  [[system.cold]]
+  config_id = "tl320-fresh"
+  params = { nprobe = 64, rerank = 39 }
+  trials = 3
+  group = "coldivf"
+  dummy = "data/bench.noindex/writes-smoke-drift/coldivf-python/tl320-n20000-s1-dummy2000"
+
+  # ColdIVF's cell at D10 and 0.95 in each other system's group.
+
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["d10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "lancedb"
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["d10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "qdrant-edge"
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["d10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "rabitq-ivf"
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["d10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "faiss-ivf"
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["d10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "faiss-ivf-2560"
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "tl320"
+  states = ["d10"]
+  params = { nprobe = 128, rerank = 64 }
+  trials = 3
+  group = "faiss-fastscan"
+  dummy_n = 2000
+
+
+# LanceDB's IVF_RQ at 1 bit, whose optimize adds new rows to the partitions it has and whose retrain trains them again.
+[[system]]
+name = "lancedb"
+adapter = "lancedb"
+python = "${COLDIVF_BENCH_VENVS}/venv-lance13/bin/python3"
+
+  [[system.build]]
+  config_id = "rq1-default"
+  config = { index = "ivf_rq", bits = 1 }
+  threads = 4
+  disk_gb = 6
+  timeout_s = 3600
+
+  # Fresh, a build of the copy of D10's live rows.
+  [[system.build]]
+  config_id = "rq1-default-fresh"
+  config = { index = "ivf_rq", bits = 1 }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-drift-d10-live.base.fbin"
+  threads = 4
+  disk_gb = 6
+  timeout_s = 3600
+
+  [[system.write]]
+  config_id = "rq1-default"
+  role = "full"
+  threads = 1
+  states = ["d10"]
+
+  [[system.maintain]]
+  config_id = "rq1-default"
+  actions = ["optimize", "retrain"]
+  threads = 4
+  disk_gb = 8
+
+  # D10 and each maintained state at both picks.
+  [[system.warm]]
+  config_id = "rq1-default"
+  states = ["d10", "d10-optimize", "d10-retrain"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobes = 16, refine_factor = 8 }, { nprobes = 12, refine_factor = 4 }]
+  findability = true
+
+  [[system.cold]]
+  config_id = "rq1-default"
+  states = ["d10", "d10-optimize", "d10-retrain"]
+  params = { nprobes = 16, refine_factor = 8 }
+  trials = 3
+  group = "lancedb"
+  threads = 10
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "rq1-default"
+  states = ["d10", "d10-optimize", "d10-retrain"]
+  params = { nprobes = 12, refine_factor = 4 }
+  trials = 3
+  group = "lancedb"
+  threads = 10
+  dummy_n = 2000
+
+  # The fresh build, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "rq1-default-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobes = 16, refine_factor = 8 }, { nprobes = 12, refine_factor = 4 }]
+
+  [[system.cold]]
+  config_id = "rq1-default-fresh"
+  params = { nprobes = 16, refine_factor = 8 }
+  trials = 3
+  group = "lancedb"
+  threads = 10
+  dummy = "data/bench.noindex/writes-smoke-drift/lancedb/rq1-default-n20000-s1-dummy2000"
+
+  [[system.cold]]
+  config_id = "rq1-default-fresh"
+  params = { nprobes = 12, refine_factor = 4 }
+  trials = 3
+  group = "lancedb"
+  threads = 10
+  dummy = "data/bench.noindex/writes-smoke-drift/lancedb/rq1-default-n20000-s1-dummy2000"
+
+
+# qdrant-edge's shard with its head-to-head config, whose optimize rebuilds the whole graph.
+[[system]]
+name = "qdrant-edge"
+adapter = "qdrant_shard"
+
+  [[system.build]]
+  config_id = "default"
+  config = {}
+  threads = 4
+  disk_gb = 12
+  timeout_s = 7200
+
+  # Fresh, a build of the copy of D10's live rows.
+  [[system.build]]
+  config_id = "default-fresh"
+  config = {}
+  data = "data/writes/cohere10m-768-cosine-wsmoke-drift-d10-live.base.fbin"
+  threads = 4
+  disk_gb = 12
+  timeout_s = 7200
+
+  [[system.write]]
+  config_id = "default"
+  role = "full"
+  threads = 1
+  states = ["d10"]
+
+  [[system.maintain]]
+  config_id = "default"
+  actions = ["optimize"]
+  threads = 4
+  disk_gb = 12
+
+  # D10 and each maintained state at both picks.
+  [[system.warm]]
+  config_id = "default"
+  states = ["d10", "d10-optimize"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ hnsw_ef = 256, oversampling = 2 }, { hnsw_ef = 96, oversampling = 2 }]
+  findability = true
+
+  [[system.cold]]
+  config_id = "default"
+  states = ["d10", "d10-optimize"]
+  params = { hnsw_ef = 256, oversampling = 2 }
+  trials = 3
+  group = "qdrant-edge"
+  dummy_n = 2000
+
+  [[system.cold]]
+  config_id = "default"
+  states = ["d10", "d10-optimize"]
+  params = { hnsw_ef = 96, oversampling = 2 }
+  trials = 3
+  group = "qdrant-edge"
+  dummy_n = 2000
+
+  # The fresh build, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "default-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ hnsw_ef = 256, oversampling = 2 }, { hnsw_ef = 96, oversampling = 2 }]
+
+  [[system.cold]]
+  config_id = "default-fresh"
+  params = { hnsw_ef = 256, oversampling = 2 }
+  trials = 3
+  group = "qdrant-edge"
+  dummy = "data/bench.noindex/writes-smoke-drift/qdrant-edge/default-n20000-s1-dummy2000"
+
+  [[system.cold]]
+  config_id = "default-fresh"
+  params = { hnsw_ef = 96, oversampling = 2 }
+  trials = 3
+  group = "qdrant-edge"
+  dummy = "data/bench.noindex/writes-smoke-drift/qdrant-edge/default-n20000-s1-dummy2000"
+
+
+# RaBitQ-Library's IVF at 5 bits on ColdIVF's partition, whose lists stay as the build made them.
+[[system]]
+name = "rabitq-ivf"
+adapter = "rabitq_ivf"
+
+  [[system.build]]
+  config_id = "cp320-b5"
+  config = { bits = 5 }
+  clusters = "data/bench.noindex/writes-smoke-drift/coldivf-python/tl320-partition-n20000-s1.clusters/partition"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "dummy320-b5"
+  config = { bits = 5, vectors_per_list = 320 }
+  n = 2000
+  threads = 4
+  disk_gb = 1
+  timeout_s = 1800
+
+  # Fresh, a build of the copy of D10's live rows.
+  [[system.build]]
+  config_id = "cp320-b5-fresh"
+  config = { bits = 5 }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-drift-d10-live.base.fbin"
+  clusters = "data/bench.noindex/writes-smoke-drift/coldivf-python/tl320-fresh-n20000-s1.clusters/partition"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.write]]
+  config_id = "cp320-b5"
+  role = "full"
+  threads = 1
+  states = ["d10"]
+
+  # D10 and each maintained state at both picks.
+  [[system.warm]]
+  config_id = "cp320-b5"
+  states = ["d10"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 192 }, { nprobe = 64 }]
+  findability = true
+
+  [[system.cold]]
+  config_id = "cp320-b5"
+  states = ["d10"]
+  params = { nprobe = 192 }
+  trials = 3
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/writes-smoke-drift/rabitq-ivf/dummy320-b5-n2000-s1"
+
+  [[system.cold]]
+  config_id = "cp320-b5"
+  states = ["d10"]
+  params = { nprobe = 64 }
+  trials = 3
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/writes-smoke-drift/rabitq-ivf/dummy320-b5-n2000-s1"
+
+  # The fresh build, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "cp320-b5-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 192 }, { nprobe = 64 }]
+
+  [[system.cold]]
+  config_id = "cp320-b5-fresh"
+  params = { nprobe = 192 }
+  trials = 3
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/writes-smoke-drift/rabitq-ivf/dummy320-b5-n2000-s1"
+
+  [[system.cold]]
+  config_id = "cp320-b5-fresh"
+  params = { nprobe = 64 }
+  trials = 3
+  group = "rabitq-ivf"
+  dummy = "data/bench.noindex/writes-smoke-drift/rabitq-ivf/dummy320-b5-n2000-s1"
+
+
+# faiss IVF on ColdIVF's partition at 320 per list, searched through faiss's mapped open, whose lists stay as the build
+# made them.
+[[system]]
+name = "faiss-ivf"
+variant = "shipped"
+adapter = "faiss_ivf"
+
+  [[system.build]]
+  config_id = "cp320-rq1"
+  config = { bits = 1 }
+  clusters = "data/bench.noindex/writes-smoke-drift/coldivf-python/tl320-partition-n20000-s1.clusters/partition"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "dummy320-rq1"
+  config = { vectors_per_list = 320, bits = 1 }
+  n = 2000
+  threads = 4
+  disk_gb = 1
+  timeout_s = 1800
+
+  # Fresh, a build of the copy of D10's live rows.
+  [[system.build]]
+  config_id = "cp320-rq1-fresh"
+  config = { bits = 1 }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-drift-d10-live.base.fbin"
+  clusters = "data/bench.noindex/writes-smoke-drift/coldivf-python/tl320-fresh-n20000-s1.clusters/partition"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.write]]
+  config_id = "cp320-rq1"
+  role = "full"
+  threads = 1
+  states = ["d10"]
+
+  # D10 and each maintained state at both picks.
+  [[system.warm]]
+  config_id = "cp320-rq1"
+  states = ["d10"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 96, k_factor = 8, qb = 4 }, { nprobe = 48, k_factor = 4, qb = 4 }]
+  findability = true
+
+  [[system.cold]]
+  config_id = "cp320-rq1"
+  states = ["d10"]
+  params = { nprobe = 96, k_factor = 8, qb = 4 }
+  trials = 3
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/writes-smoke-drift/faiss-ivf-shipped/dummy320-rq1-n2000-s1"
+
+  [[system.cold]]
+  config_id = "cp320-rq1"
+  states = ["d10"]
+  params = { nprobe = 48, k_factor = 4, qb = 4 }
+  trials = 3
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/writes-smoke-drift/faiss-ivf-shipped/dummy320-rq1-n2000-s1"
+
+  # The fresh build, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "cp320-rq1-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 96, k_factor = 8, qb = 4 }, { nprobe = 48, k_factor = 4, qb = 4 }]
+
+  [[system.cold]]
+  config_id = "cp320-rq1-fresh"
+  params = { nprobe = 96, k_factor = 8, qb = 4 }
+  trials = 3
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/writes-smoke-drift/faiss-ivf-shipped/dummy320-rq1-n2000-s1"
+
+  [[system.cold]]
+  config_id = "cp320-rq1-fresh"
+  params = { nprobe = 48, k_factor = 4, qb = 4 }
+  trials = 3
+  group = "faiss-ivf"
+  dummy = "data/bench.noindex/writes-smoke-drift/faiss-ivf-shipped/dummy320-rq1-n2000-s1"
+
+
+# faiss IVF at 2,560 per list on its own k-means, searched through the harness's batched read path.
+[[system]]
+name = "faiss-ivf"
+variant = "batched"
+adapter = "faiss_ivf"
+
+  [[system.build]]
+  config_id = "vpl2560-rq1"
+  config = { vectors_per_list = 2560, bits = 1 }
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "dummy2560-rq1"
+  config = { vectors_per_list = 2560, bits = 1 }
+  n = 2000
+  threads = 4
+  disk_gb = 1
+  timeout_s = 1800
+
+  # Fresh, a build of the copy of D10's live rows.
+  [[system.build]]
+  config_id = "vpl2560-rq1-fresh"
+  config = { vectors_per_list = 2560, bits = 1 }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-drift-d10-live.base.fbin"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.write]]
+  config_id = "vpl2560-rq1"
+  role = "full"
+  threads = 1
+  states = ["d10"]
+
+  # D10 and each maintained state at both picks.
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  states = ["d10"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 24, k_factor = 8, qb = 4 }, { nprobe = 12, k_factor = 4, qb = 4 }]
+  findability = true
+
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  states = ["d10"]
+  params = { nprobe = 24, k_factor = 8, qb = 4 }
+  trials = 3
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/writes-smoke-drift/faiss-ivf-batched/dummy2560-rq1-n2000-s1"
+
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  states = ["d10"]
+  params = { nprobe = 12, k_factor = 4, qb = 4 }
+  trials = 3
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/writes-smoke-drift/faiss-ivf-batched/dummy2560-rq1-n2000-s1"
+
+  # The fresh build, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "vpl2560-rq1-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 24, k_factor = 8, qb = 4 }, { nprobe = 12, k_factor = 4, qb = 4 }]
+
+  [[system.cold]]
+  config_id = "vpl2560-rq1-fresh"
+  params = { nprobe = 24, k_factor = 8, qb = 4 }
+  trials = 3
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/writes-smoke-drift/faiss-ivf-batched/dummy2560-rq1-n2000-s1"
+
+  [[system.cold]]
+  config_id = "vpl2560-rq1-fresh"
+  params = { nprobe = 12, k_factor = 4, qb = 4 }
+  trials = 3
+  group = "faiss-ivf-2560"
+  dummy = "data/bench.noindex/writes-smoke-drift/faiss-ivf-batched/dummy2560-rq1-n2000-s1"
+
+
+# faiss's RaBitQ FastScan with SQ8 rows to rescore, on ColdIVF's partition.
+[[system]]
+name = "faiss-fastscan"
+variant = "fastscan"
+adapter = "faiss_ivf"
+
+  [[system.build]]
+  config_id = "cp320-rq1"
+  config = { bits = 1 }
+  clusters = "data/bench.noindex/writes-smoke-drift/coldivf-python/tl320-partition-n20000-s1.clusters/partition"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "dummy320-rq1"
+  config = { vectors_per_list = 320, bits = 1 }
+  n = 2000
+  threads = 4
+  disk_gb = 1
+  timeout_s = 1800
+
+  # Fresh, a build of the copy of D10's live rows.
+  [[system.build]]
+  config_id = "cp320-rq1-fresh"
+  config = { bits = 1 }
+  data = "data/writes/cohere10m-768-cosine-wsmoke-drift-d10-live.base.fbin"
+  clusters = "data/bench.noindex/writes-smoke-drift/coldivf-python/tl320-fresh-n20000-s1.clusters/partition"
+  threads = 4
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.write]]
+  config_id = "cp320-rq1"
+  role = "full"
+  threads = 1
+  states = ["d10"]
+
+  # D10 and each maintained state at both picks.
+  [[system.warm]]
+  config_id = "cp320-rq1"
+  states = ["d10"]
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 96, k_factor = 8, qb = 8 }, { nprobe = 48, k_factor = 4, qb = 8 }]
+  findability = true
+
+  [[system.cold]]
+  config_id = "cp320-rq1"
+  states = ["d10"]
+  params = { nprobe = 96, k_factor = 8, qb = 8 }
+  trials = 3
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/writes-smoke-drift/faiss-fastscan-fastscan/dummy320-rq1-n2000-s1"
+
+  [[system.cold]]
+  config_id = "cp320-rq1"
+  states = ["d10"]
+  params = { nprobe = 48, k_factor = 4, qb = 8 }
+  trials = 3
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/writes-smoke-drift/faiss-fastscan-fastscan/dummy320-rq1-n2000-s1"
+
+  # The fresh build, as a head-to-head build is searched.
+  [[system.warm]]
+  config_id = "cp320-rq1-fresh"
+  split = "test"
+  passes = 1
+  warmup = 100
+  settings = [{ nprobe = 96, k_factor = 8, qb = 8 }, { nprobe = 48, k_factor = 4, qb = 8 }]
+
+  [[system.cold]]
+  config_id = "cp320-rq1-fresh"
+  params = { nprobe = 96, k_factor = 8, qb = 8 }
+  trials = 3
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/writes-smoke-drift/faiss-fastscan-fastscan/dummy320-rq1-n2000-s1"
+
+  [[system.cold]]
+  config_id = "cp320-rq1-fresh"
+  params = { nprobe = 48, k_factor = 4, qb = 8 }
+  trials = 3
+  group = "faiss-fastscan"
+  dummy = "data/bench.noindex/writes-smoke-drift/faiss-fastscan-fastscan/dummy320-rq1-n2000-s1"
