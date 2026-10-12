@@ -1,5 +1,7 @@
 # Benchmark Harness
 
+### Disclaimer: This is a very AI generated page.
+
 This folder runs ColdIVF and other vector indexes through one driver, so every system is built, warmed and timed cold
 the same way. The driver reads a suite file, starts one adapter process per job, and appends JSON lines (JSONL) to
 `results/bench/<phase>/<system>.jsonl`. A rerun of a suite skips everything already measured.
@@ -519,6 +521,7 @@ the full vectors in 4 KiB sectors, the two product quantization (PQ) files and `
 | `alpha`, `saturate` | DiskANN's pruning parameter, 1.2 by default, and whether pruned lists are filled back up, off by default |
 | `metric` | `l2` by default. A metric other than the dataset's ranks alike only on unit vectors, which the build checks |
 | `build_ram_gb` | The memory DiskANN plans its build for, 7 by default. A build that needs more is split into overlapping shards |
+| `build_pq_bytes` | Bytes per vector of the PQ codes the graph is built on, eg. 192, or none to build it on the full vectors, the default. A build on codes holds only them in memory. Searches still rank by the `pq_bytes` codes and rerank by the full vectors |
 | `list`, `beam` | A search's list size and beam width. Both are required |
 | `cache_nodes` | The nodes nearest the entry point kept in memory from the open on. 10,000 in C1 and none elsewhere by default |
 
@@ -544,6 +547,12 @@ read of each file, which the driver counts in `files_touched`. Nothing stays cac
 either, so the pool reader's rerun first runs the query once with its prefill switch on, which asks for each sector
 with `F_RDADVISE` and leaves it in the page cache. The timed rerun then reads them from there through the same reader,
 and the adapter drops them again after it, as the pool reader would leave them. `extra.rerun_prefilled` marks it.
+
+A warm run in mode "whole" reads every file first, as for every system. Mode "pq" is the warm state of an index larger
+than memory, eg. 10M vectors on a 36 GB machine, as DiskANN serves one: the open holds the PQ files in memory, the
+adapter drops the index file's cached pages, and every search then reads its sectors from the disk. Only the pool
+reader runs it, since its reads leave the page cache as it is, while the advise reader's fill it and the stock reader
+copies the whole file.
 
 ## usearch Adapter
 

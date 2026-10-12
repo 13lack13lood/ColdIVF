@@ -9,9 +9,6 @@
 # - qdrant-edge: warm, it needs ~39 GB, its 7.7 GB of codes in memory plus 30.7 GB of originals, more than the whole
 #   36 GB. Its shard is 40.4 GB (4.04 GB at 1M), more than the free disk held, and it takes ~112 GB of disk while it
 #   builds with its write-ahead log.
-# - DiskANN: a build in one piece holds all 30.7 GB of rows and a 2.6 GB graph in memory, over the 16 GB a job may use.
-#   A build in shards within that adds shard files to its 41.9 GB disk index (4.19 GB at 1M), more than the free disk
-#   held.
 # - SymphonyQG: ~65 GB in memory to serve (6.53 GB at 1M), and ~101 GB to build (10.1 GB at 1M).
 # - AsterVec: its bulk build holds every float32 row in memory, ~47 GB (4.73 GB at 1M).
 # - RaBitQ-Library's hierarchical navigable small world (HNSW) graph: ~7 GB of its own (0.71 GB at 1M), but its build
@@ -31,6 +28,11 @@
 # FastScan index and RaBitQ-Library build on ColdIVF's partition, saved beside its index folder, so they run no k-means
 # and compare on the same lists. LanceDB's table holds its own copy of the 30.7 GB of rows, so it runs last and alone.
 # The disk had room for it beside ColdIVF's index, so its batch has a ColdIVF cell too.
+#
+# DiskANN ran after the rest, from bench-10m-diskann.toml, whose entries are copied into its section at the end. A build
+# on its full vectors in one piece would hold ~36 GiB, over the 16 GB a job may use, so its graph is built in one piece
+# on 192-byte PQ codes, and its searches use 96-byte codes and the full vectors as at 1M. Its 41.9 GB index is larger
+# than this Mac's memory, so its warm runs leave the sectors on the disk, in its warm mode pq.
 #
 # ColdIVF's own cells and its test-split warm entries run first, from coldivf-bench/py:
 #   driver.py ../suites/bench-10m.toml --systems coldivf: --groups main --only warm,cold,refs
@@ -577,6 +579,20 @@ python = "${COLDIVF_BENCH_VENVS}/venv-coldivf/bin/python3"
   trials = 100
   group = "faiss-ivf-ondisk-2560"
   dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
+  # ColdIVF's 0.95 point in DiskANN's group, so DiskANN's batch holds a ColdIVF cell.
+  [[system.build]]
+  config_id = "tl640-vs-diskann"
+  index = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1"
+
+  [[system.cold]]
+  config_id = "tl640-vs-diskann"
+  params = { nprobe = 192, rerank = 39 }
+  split = "test"
+  trials = 100
+  group = "diskann"
+  dummy = "data/bench.noindex/bench-10m/coldivf/tl640-n10000000-s1-dummy200000"
+
 
 
 
@@ -3454,4 +3470,170 @@ python = "${COLDIVF_BENCH_VENVS}/venv-lance13/bin/python3"
   settings = [
     { nprobes = 32, refine_factor = 16 },
     { nprobes = 128, refine_factor = 16 },
+  ]
+
+
+# DiskANN's disk index, a graph of degree 64 built with a list of 100 in one piece on 192-byte PQ codes, with 96-byte PQ
+# codes in memory for searches, read by the pool reader. The beam width sets how many sectors a search reads per round
+# trip, so the grid takes widths 2 to 16. Its lists run from 16, as the 1M grid's do, to 1,024, past the 1M grid's 432.
+# Lists 16 to 40 came after the first 40 settings had run, since list 48 already reached recall@10 0.93.
+#   cell flags: --config bpq192 --group diskann --dummy-n 50000
+[[system]]
+name = "diskann"
+adapter = "diskann"
+
+  [[system.build]]
+  config_id = "bpq192"
+  config = { degree = 64, build_list = 100, pq_bytes = 96, build_pq_bytes = 192, build_ram_gb = 12.0 }
+  threads = 10
+  disk_gb = 44
+  timeout_s = 21600
+
+  [[system.warm]]
+  config_id = "bpq192"
+  split = "tune"
+  mode = "pq"
+  grid = { list = [16, 24, 32, 40, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024], beam = [2, 4, 8, 16] }
+  passes = 3
+  warmup = 1000
+  timeout_s = 7200
+
+  # 0.90 screen 1 of 3: recall@10 0.9108, warm p50 1763 us
+  [[system.cold]]
+  config_id = "bpq192"
+  params = { list = 32, beam = 8 }
+  split = "tune"
+  trials = 30
+  group = "diskann"
+  dummy_n = 50000
+
+  # 0.90 screen 2 of 3: recall@10 0.9050, warm p50 1890 us
+  [[system.cold]]
+  config_id = "bpq192"
+  params = { list = 32, beam = 4 }
+  split = "tune"
+  trials = 30
+  group = "diskann"
+  dummy_n = 50000
+
+  # 0.90 screen 3 of 3: recall@10 0.9290, warm p50 1940 us
+  [[system.cold]]
+  config_id = "bpq192"
+  params = { list = 40, beam = 8 }
+  split = "tune"
+  trials = 30
+  group = "diskann"
+  dummy_n = 50000
+
+  # 0.95 screen 1 of 3: recall@10 0.9570, warm p50 2358 us
+  [[system.cold]]
+  config_id = "bpq192"
+  params = { list = 64, beam = 16 }
+  split = "tune"
+  trials = 30
+  group = "diskann"
+  dummy_n = 50000
+
+  # 0.95 screen 2 of 3: recall@10 0.9528, warm p50 2445 us
+  [[system.cold]]
+  config_id = "bpq192"
+  params = { list = 64, beam = 8 }
+  split = "tune"
+  trials = 30
+  group = "diskann"
+  dummy_n = 50000
+
+  # 0.95 screen 3 of 3: recall@10 0.9714, warm p50 2806 us
+  [[system.cold]]
+  config_id = "bpq192"
+  params = { list = 96, beam = 16 }
+  split = "tune"
+  trials = 30
+  group = "diskann"
+  dummy_n = 50000
+
+  # 0.95 verdict, the fastest cold of 3: recall@10 0.9570, warm p50 2358 us, C0 p50 148.78 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "bpq192"
+  params = { list = 64, beam = 16 }
+  split = "test"
+  trials = 100
+  group = "diskann"
+  dummy_n = 50000
+
+  [[system.warm]]
+  config_id = "bpq192"
+  split = "test"
+  mode = "pq"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { list = 64, beam = 16 },
+  ]
+
+  [[system.warm]]
+  config_id = "bpq192"
+  split = "test"
+  mode = "pq"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { list = 64, beam = 16 },
+  ]
+
+  [[system.warm]]
+  config_id = "bpq192"
+  split = "test"
+  mode = "pq"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { list = 64, beam = 16 },
+  ]
+
+  # 0.90 verdict, the fastest cold of 3: recall@10 0.9108, warm p50 1763 us, C0 p50 148.35 ms in 30 tune trials
+  [[system.cold]]
+  config_id = "bpq192"
+  params = { list = 32, beam = 8 }
+  split = "test"
+  trials = 30
+  group = "diskann"
+  dummy_n = 50000
+
+  [[system.warm]]
+  config_id = "bpq192"
+  split = "test"
+  mode = "pq"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { list = 32, beam = 8 },
+  ]
+
+  [[system.warm]]
+  config_id = "bpq192"
+  split = "test"
+  mode = "pq"
+  threads = 6
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { list = 32, beam = 8 },
+  ]
+
+  [[system.warm]]
+  config_id = "bpq192"
+  split = "test"
+  mode = "pq"
+  threads = 12
+  qps_seconds = 10
+  qps_repeats = 3
+  warmup = 1000
+  settings = [
+    { list = 32, beam = 8 },
   ]

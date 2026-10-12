@@ -91,11 +91,15 @@ fn every_reader_finds_the_same_neighbors() {
         threads: 2,
         seed: 3,
         ram_gb: 1.0,
+        build_pq_bytes: 0,
     };
     let meta = builder::build(&spec).unwrap();
     assert_eq!(meta["rows"], ROWS);
     assert_eq!(meta["dim"], DIM);
     assert_eq!(meta["metric"], "l2");
+    assert_eq!(meta["build_pq_bytes"], 0);
+    // Only a build on PQ codes trains a quantizer of its own.
+    assert!(!spec.out.join("index_build_pq_pivots.bin").exists());
 
     for file in builder::files(&spec.out).unwrap() {
         assert!(Path::new(&file).exists(), "{file}");
@@ -219,8 +223,17 @@ fn a_bad_spec_is_refused_before_any_work() {
         threads: 1,
         seed: 1,
         ram_gb: 1.0,
+        build_pq_bytes: 0,
     };
     assert_eq!(builder::check(&good).unwrap(), DIM);
+    assert_eq!(
+        builder::check(&Spec {
+            build_pq_bytes: DIM,
+            ..good.clone()
+        })
+        .unwrap(),
+        DIM
+    );
 
     for bad in [
         Spec {
@@ -247,6 +260,10 @@ fn a_bad_spec_is_refused_before_any_work() {
             ram_gb: f64::NAN,
             ..good.clone()
         },
+        Spec {
+            build_pq_bytes: DIM + 1,
+            ..good.clone()
+        },
     ] {
         assert_eq!(
             builder::check(&bad).unwrap_err().kind(),
@@ -260,4 +277,54 @@ fn a_bad_spec_is_refused_before_any_work() {
     for m in ["l2", "ip", "cosine", "cosine-normalized"] {
         assert_eq!(builder::metric_name(builder::metric(m).unwrap()), m);
     }
+}
+
+#[test]
+fn a_graph_built_on_pq_codes_finds_the_neighbors() {
+    let dir = Scratch(std::env::temp_dir().join(format!("diskann3-pq-build-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&dir.0);
+    std::fs::create_dir_all(dir.0.join("index")).unwrap();
+    let mut rng = Rng(11);
+    let rows: Vec<Vec<f32>> = (0..ROWS).map(|_| rng.unit()).collect();
+    let base = dir.0.join("base.fbin");
+    write_base(&base, &rows);
+    let spec = Spec {
+        base,
+        rows: ROWS,
+        out: dir.0.join("index"),
+        degree: 16,
+        list: 50,
+        pq_bytes: 8,
+        alpha: None,
+        saturate: false,
+        metric: Metric::L2,
+        threads: 2,
+        seed: 3,
+        ram_gb: 1.0,
+        build_pq_bytes: DIM,
+    };
+    let meta = builder::build(&spec).unwrap();
+    assert_eq!(meta["build_pq_bytes"], DIM);
+    assert!(spec.out.join("index_build_pq_pivots.bin").exists());
+    prepare_runtime().unwrap();
+    let pool = ReadPool::global();
+    pool.reserve(4).unwrap();
+    let options = Options {
+        reader: Reader::Pool,
+        metric: Metric::L2,
+        threads: 1,
+        cache_nodes: 0,
+    };
+    let index = Index::open(&builder::prefix(&spec.out).unwrap(), &options, pool).unwrap();
+    let queries: Vec<Vec<f32>> = (0..30).map(|_| rng.unit()).collect();
+    let hits: usize = queries
+        .iter()
+        .map(|q| {
+            let truth = exact(&rows, q);
+            let found = index.search(q, K, 50, 4).unwrap();
+            found.ids.iter().filter(|id| truth.contains(id)).count()
+        })
+        .sum();
+    let recall = hits as f64 / (queries.len() * K) as f64;
+    assert!(recall >= 0.9, "recall {recall}");
 }

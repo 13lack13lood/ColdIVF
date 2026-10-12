@@ -21,6 +21,11 @@ at open. C1 keeps 10,000 unless the settings say otherwise, and the other regime
 The pool reader's reads skip the page cache, so a trial's stats name the bytes it read of each file, which mincore can't
 see. It leaves nothing cached for a rerun of the first query either, so its rerun first fills the cache through
 F_RDADVISE.
+
+A warm run in mode "whole" reads every file first, as for every system. Mode "pq" is the warm state of an index larger
+than memory, as DiskANN serves one: the open holds the PQ files in memory, the index file's cached pages are dropped,
+and every search reads its sectors from the disk. Only the pool reader runs it, since its reads leave the page cache as
+it is, while the advise reader's fill it.
 """
 
 from __future__ import annotations
@@ -63,6 +68,7 @@ BUILD = {
     "saturate": (False, "--saturate"),
     "metric": ("l2", "--metric"),
     "build_ram_gb": (7.0, "--ram-gb"),
+    "build_pq_bytes": (None, "--build-pq-bytes"),
 }
 SEARCH = ("list", "beam", "cache_nodes")
 
@@ -197,15 +203,22 @@ def files_of(path: Path | str, reader: str = "pool") -> list[dict]:
 
 
 def last_json(stdout: bytes) -> dict:
-    """The last JSON object a program printed, one per line, past anything else it printed."""
+    """The last JSON object a program printed at the end of a line, past anything else it printed. Other text may come
+    before it on its line, eg. the dots that DiskANN's merge of shards prints to stdout without a newline."""
     for line in reversed(stdout.decode(errors="replace").splitlines()):
         line = line.strip()
+        start = line.find("{")
 
-        if line.startswith("{"):
+        while start >= 0:
             try:
-                return json.loads(line)
+                found = json.loads(line[start:])
             except ValueError:
-                continue
+                found = None
+
+            if isinstance(found, dict):
+                return found
+
+            start = line.find("{", start + 1)
 
     raise RuntimeError("the build tool printed no report")
 
@@ -514,6 +527,21 @@ class DiskANN(Adapter):
         size = Path(disk).stat().st_size
         dropped = evictor.drop_loaded([{"path": disk, "ranges": [{"offset": 0, "length": size, "loaded": True}]}])
         return rerun, extra | {"rerun_prefilled": True, "rerun_bytes_dropped": dropped}
+
+    def warm_up(self, handle: Handle, ctx: ServeContext) -> None:
+        """Mode "whole" reads every file, as the base class does. Mode "pq" drops the cached pages of the index file,
+        so the searches read every sector from the disk, and keeps what the open holds, the PQ files and the header."""
+        if ctx.mode != "pq":
+            super().warm_up(handle, ctx)
+            return
+
+        if self.reader != "pool":
+            raise Unsupported(f"DiskANN's warm mode pq needs the pool reader, whose reads skip the page cache, not "
+                              f"the {self.reader} reader")
+
+        disk = handle.folder / DISK_FILE
+        evictor.drop_loaded([{"path": str(disk), "ranges": [{"offset": 0, "length": disk.stat().st_size,
+                                                             "loaded": True}]}])
 
     def files(self, path: Path) -> list[dict]:
         return files_of(path, self.reader)

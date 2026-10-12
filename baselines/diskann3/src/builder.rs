@@ -48,6 +48,10 @@ pub struct Spec {
     pub seed: u64,
     /// The memory DiskANN may plan for. A build that needs more is split into overlapping shards.
     pub ram_gb: f64,
+    /// Bytes per vector of the PQ codes the graph is built on, or 0 to build it on the full vectors. A build on PQ
+    /// codes holds only the codes in memory, so it needs less memory than one on the full vectors. Searches still
+    /// rank by the `pq_bytes` codes and rerank by the full vectors in the index file.
+    pub build_pq_bytes: usize,
 }
 
 /// The prefix of the index files in folder `dir`.
@@ -113,6 +117,13 @@ pub fn check(spec: &Spec) -> Result<usize, Error> {
         ));
     }
 
+    if spec.build_pq_bytes > width {
+        return bad(format!(
+            "the build's PQ codes take 1 to {width} bytes per vector, or 0 for the full vectors, not {}",
+            spec.build_pq_bytes
+        ));
+    }
+
     if spec.ram_gb.is_nan() || spec.ram_gb <= 0.0 {
         return bad(format!(
             "the build's memory budget must be positive, not {} GiB",
@@ -129,9 +140,13 @@ pub fn build(spec: &Spec) -> Result<Value, Error> {
     let start = Instant::now();
     let storage = PrefixStorage::new(&spec.base, spec.rows)?;
     let invalid = |e: String| Error::new(ErrorKind::InvalidInput, e);
+    let quantization = match spec.build_pq_bytes {
+        0 => QuantizationType::FP,
+        num_chunks => QuantizationType::PQ { num_chunks },
+    };
     let params = DiskIndexBuildParameters::new(
         MemoryBudget::try_from_gb(spec.ram_gb).map_err(|e| invalid(e.to_string()))?,
-        QuantizationType::FP,
+        quantization,
         NumPQChunks::new_with(spec.pq_bytes, width).map_err(|e| invalid(e.to_string()))?,
     );
     let config = Builder::new_with(
@@ -172,6 +187,7 @@ pub fn build(spec: &Spec) -> Result<Value, Error> {
         "saturate": spec.saturate,
         "seed": spec.seed,
         "build_ram_gb": spec.ram_gb,
+        "build_pq_bytes": spec.build_pq_bytes,
         "build_seconds": start.elapsed().as_secs_f64(),
     });
     let text = serde_json::to_string_pretty(&meta).map_err(Error::other)?;

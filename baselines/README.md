@@ -35,6 +35,8 @@ searcher makes several. So searches go through one of these readers, passed to `
 | `stock` | DiskANN's own reader, built once per index and shared. It copies the whole file at open, so it serves only as a control |
 
 An index is a folder holding `index_disk.index`, `index_pq_pivots.bin`, `index_pq_compressed.bin` and `meta.json`.
+`--build-pq-bytes N` builds the graph on N-byte PQ codes of the rows instead of the full vectors, which holds only the
+codes in memory, and adds the build's own codebooks, `index_build_pq_pivots.bin`. Searches don't use them.
 
 ```
 diskann3 build --data cohere-768-cosine.base.fbin --rows 50000 --out INDEX --threads 4

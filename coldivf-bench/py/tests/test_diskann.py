@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -8,8 +9,9 @@ import numpy as np
 
 from tests import helpers
 from adapters import diskann
-from adapters.base import BuildContext, Unsupported
+from adapters.base import BuildContext, ServeContext, Unsupported
 import data
+import evictor
 
 # A report of the build tool, trimmed to the fields the adapter reads.
 REPORT = {
@@ -36,6 +38,11 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(flags[flags.index("--degree") + 1], "32")
         self.assertEqual(flags[flags.index("--alpha") + 1], "1.3")
         self.assertEqual(flags[flags.index("--saturate") + 1], "true")
+
+    def test_a_build_on_pq_codes_passes_its_bytes(self):
+        flags = diskann.build_flags(diskann.build_config({"build_pq_bytes": 768}))
+        self.assertEqual(flags[flags.index("--build-pq-bytes") + 1], "768")
+        self.assertNotIn("--build-pq-bytes", diskann.build_flags(diskann.build_config({})))
 
     def test_unknown_build_settings_are_refused(self):
         with self.assertRaises(Unsupported):
@@ -128,6 +135,62 @@ class FilesTest(unittest.TestCase):
             diskann.files_of(self.dir)
 
 
+@unittest.skipUnless(evictor.MACOS, "eviction through msync is written for macOS")
+class WarmModeTest(unittest.TestCase):
+    """The warm modes on an index folder of cached files: "whole" reads the index file, and "pq" drops its pages and
+    keeps the PQ files the open holds."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        sizes = {"index_pq_pivots.bin": 100, "index_pq_compressed.bin": 16 * evictor.PAGE,
+                 "index_disk.index": 64 * evictor.PAGE, "meta.json": 30}
+
+        for name, size in sizes.items():
+            (self.dir / name).write_bytes(os.urandom(size))
+            (self.dir / name).read_bytes()
+
+        self.handle = diskann.Handle(ptr=None, dim=0, points=0, threads=1, opened={}, folder=self.dir)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def ctx(self, mode: str) -> ServeContext:
+        return ServeContext(index=self.dir, dataset=None, rows=1, k=10, metric="l2", threads=1, variant="",
+                            mode=mode)
+
+    def cached(self, name: str) -> int:
+        """The cached pages of the file past its first two, which another process may read back into the cache
+        after a new mapping."""
+        held = evictor.HeldMap(self.dir / name)
+
+        try:
+            return held.resident(2 * evictor.PAGE)[0]
+        finally:
+            held.close()
+
+    def test_mode_pq_drops_the_cached_sectors_and_keeps_the_pq_files(self):
+        diskann.DiskANN().warm_up(self.handle, self.ctx("pq"))
+        self.assertEqual(self.cached("index_disk.index"), 0)
+        self.assertEqual(self.cached("index_pq_compressed.bin"), 14)
+
+    def test_mode_whole_reads_the_index_file(self):
+        adapter = diskann.DiskANN()
+        adapter.warm_up(self.handle, self.ctx("pq"))
+        adapter.warm_up(self.handle, self.ctx("whole"))
+        self.assertEqual(self.cached("index_disk.index"), 62)
+
+    def test_mode_pq_needs_the_pool_reader(self):
+        for variant in ("advise", "stock"):
+            adapter = diskann.DiskANN()
+            adapter.variant = variant
+
+            with self.assertRaises(Unsupported, msg=variant):
+                adapter.warm_up(self.handle, self.ctx("pq"))
+
+        self.assertGreater(self.cached("index_disk.index"), 0)
+
+
 class ReportTest(unittest.TestCase):
     def test_build_fields(self):
         fields = diskann.build_fields(REPORT, 50000)
@@ -150,6 +213,16 @@ class ReportTest(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             diskann.last_json(b"no report here\n")
+
+    def test_the_report_follows_the_dots_a_sharded_build_prints(self):
+        # DiskANN's merge of shards prints a dot every 499,999 nodes to stdout with no newline, so the report shares
+        # their line.
+        out = b"...................." + json.dumps(REPORT).encode() + b"\n"
+        self.assertEqual(diskann.last_json(out)["seconds"], 12.5)
+        self.assertEqual(diskann.last_json(b"..{not json {\"event\": \"build\"}\n"), {"event": "build"})
+
+        with self.assertRaises(RuntimeError):
+            diskann.last_json(b"....{not json\n")
 
     def test_search_stats(self):
         info = diskann.SearchInfo(hops=12, ios=48, cmps=3000, results=10, reads=48, read_calls=12,
@@ -251,6 +324,24 @@ class LiveTest(unittest.TestCase):
         truth = np.asarray(self.ds.truth(3000).ids)[:, :10]
         hits = sum(len(set(f) & set(t)) for f, t in zip(found["pool"], truth))
         self.assertGreater(hits / truth.size, 0.9)
+
+    def test_warm_mode_pq_reads_the_sectors_from_the_disk(self):
+        found, fields = {}, {}
+
+        for mode in ("whole", "pq"):
+            with tempfile.TemporaryDirectory() as ids:
+                got, err = self.run_adapter("warm", *self.common(), "--index", str(self.index), "--grid",
+                                            json.dumps([{"list": 50, "beam": 4}]), "--split", "all", "--mode", mode,
+                                            "--ids-dir", ids, "--passes", "1", "--warmup", "5")
+                settings = [m for m in got if m["event"] == "setting"]
+                self.assertEqual(len(settings), 1, err)
+                found[mode], fields[mode] = np.load(settings[0]["ids_file"]), settings[0]["fields"]
+
+        np.testing.assert_array_equal(found["whole"], found["pq"])
+        # Mode whole leaves the index file cached, and mode pq leaves its sectors on the disk.
+        disk = (self.index / diskann.DISK_FILE).stat().st_size
+        self.assertGreaterEqual(fields["whole"]["resident_file_bytes"], disk)
+        self.assertLess(fields["pq"]["resident_file_bytes"], disk // 2)
 
     def test_qps_through_the_batch_call(self):
         with tempfile.TemporaryDirectory() as ids:

@@ -20,12 +20,24 @@ use serde_json::{Map, Value, json};
 
 const USAGE: &str = "usage:
   diskann3 build --data BASE.fbin --rows N --out DIR [--degree 64] [--list 100] [--pq-bytes 96] [--alpha A]
-                 [--saturate false] [--metric l2] [--threads 1] [--seed 1] [--ram-gb 7]
+                 [--saturate false] [--metric l2] [--threads 1] [--seed 1] [--ram-gb 7] [--build-pq-bytes 0]
   diskann3 search --index DIR --queries QUERIES.fbin [--truth TRUTH.ibin] [--count 100] [--k 10] [--list 100]
                   [--beam 4] [--reader pool|advise|stock] [--cache-nodes 0] [--threads 1]";
 
 const BUILD_FLAGS: &[&str] = &[
-    "data", "rows", "out", "degree", "list", "pq-bytes", "alpha", "saturate", "metric", "threads", "seed", "ram-gb",
+    "data",
+    "rows",
+    "out",
+    "degree",
+    "list",
+    "pq-bytes",
+    "alpha",
+    "saturate",
+    "metric",
+    "threads",
+    "seed",
+    "ram-gb",
+    "build-pq-bytes",
 ];
 const SEARCH_FLAGS: &[&str] = &[
     "index",
@@ -112,6 +124,7 @@ fn build(f: &Flags) -> Result<(), Error> {
         threads,
         seed: f.get("seed", Some(1))?,
         ram_gb: f.get("ram-gb", Some(7.0))?,
+        build_pq_bytes: f.get("build-pq-bytes", Some(0))?,
     };
     builder::check(&spec)?;
     std::fs::create_dir_all(&spec.out)?;
