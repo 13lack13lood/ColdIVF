@@ -1,11 +1,19 @@
 # ColdIVF
 
-A read-optimized vector index in Rust, built for cold reads: it answers a query against an index that isn't in memory by fetching only the data that query needs in a few batched disk reads.
+A read-optimized vector index in Rust, built for cold reads.
 
 ## Contents
 
 - [Usage](#usage)
 - [Design](#design)
+  - [Optimizations Overview](#optimizations-overview)
+  - [File Layout](#file-layout)
+  - [Cold Queries](#cold-queries)
+  - [Encoding](#encoding)
+  - [Build](#build)
+  - [Warm Queries](#warm-queries)
+  - [Writes and Maintenance](#writes-and-maintenance)
+  - [Collections and Calibration](#collections-and-calibration)
 - [Benchmarks](#benchmarks)
   - [1M Vectors](#1m-vectors)
     - [Cold First Query](#cold-first-query)
@@ -17,13 +25,16 @@ A read-optimized vector index in Rust, built for cold reads: it answers a query 
     - [Warm Query](#warm-query-1)
     - [Memory and Build](#memory-and-build-1)
     - [Not Run at 10M](#not-run-at-10m)
-- [Caveats](#caveats)
+- [Caveats / Observations](#caveats--observations)
+- [Disclosure](#disclosure)
+- [License](#license)
+- [Contribution](#contribution)
 
 ## Usage
 
 ### Python
 
-`coldivf-python` builds the `coldivf` module with [maturin](https://www.maturin.rs). Vectors need 128 to 4,080 dimensions.
+[`coldivf-python`](coldivf-python) builds the `coldivf` module with [maturin](https://www.maturin.rs). Vectors need 128 to 4,080 dimensions.
 
 ```
 cd coldivf-python
@@ -35,9 +46,18 @@ import coldivf
 
 coldivf.build("index.coldivf", vectors)  # a 2-D float32 array, one vector per row, whose ids are the row numbers
 index = coldivf.Index("index.coldivf")
-index.prepare()  # when the query text arrives, so the index's tables load while the embedding runs
+index.prepare()  # when the query text arrives, thus the index's tables load while the embedding runs
 ids, scores = index.search(query, 10, nprobe=96, rerank=35)
+
+with coldivf.Writer("index.coldivf") as writer:  # one writer per index at a time
+    writer.insert(1_000_000, vector)  # adds or replaces, and searches in this process see it at once
+    writer.insert_many(ids, vectors)  # a 2-D float32 array, one vector per id
+    writer.delete(42)
+    writer.sync()  # the changes so far survive a power loss
+    writer.compact()  # folds the changes into a new data file
 ```
+
+[`writer.begin_compact()`](coldivf-python/src/module.rs#L464) returns the same run as a job for another thread, thus searches go on while it writes.
 
 ### Rust
 
@@ -50,7 +70,7 @@ coldivf = { git = "https://github.com/13lack13lood/ColdIVF.git" }
 use std::path::Path;
 
 use coldivf::{Anchor, BuildParams, Builder, Clustering, Index, LeafOrder, Limits, Metric, SearchCtx, SearchParams,
-              VectorSource};
+              VectorSource, Writer};
 
 // The vectors to index, one per row. A row's id is its row number.
 struct Rows {
@@ -88,7 +108,7 @@ fn run(rows: &Rows, query: &[f32]) -> std::io::Result<()> {
 
     let index = Index::open(path)?;
     let mut ctx = SearchCtx::new(Limits { max_k: 10, max_nprobe: 96, max_rerank: 35 });
-    // Call prepare when the query text arrives, so the cluster tables load while the embedding runs.
+    // Call prepare when the query text arrives, thus the cluster tables load while the embedding runs.
     index.prepare(&mut ctx)?;
     let params = SearchParams { k: 10, nprobe: 96, rerank: 35, reach: None };
 
@@ -98,124 +118,343 @@ fn run(rows: &Rows, query: &[f32]) -> std::io::Result<()> {
 
     Ok(())
 }
+
+fn write(path: &Path, vector: &[f32]) -> std::io::Result<()> {
+    let mut writer = Writer::open(path)?; // one writer per index at a time
+    writer.insert(1_000_000, vector)?; // adds or replaces, and searches in this process see it at once
+    writer.delete(42)?;
+    writer.sync()?; // the changes so far survive a power loss
+    writer.compact() // folds the changes into a new data file
+}
 ```
 
-`Writer::open(path)` takes inserts and deletes, which searches see at once, and `calibrate` picks the cheapest `nprobe` and `rerank` for a recall target.
+[`writer.begin_compact(&params)`](coldivf/src/lib.rs#L751) returns the same run as a [`Job`](coldivf/src/maintain/job.rs#L199) for another thread. Then [`writer.finish_compact(done)`](coldivf/src/lib.rs#L802) commits what the job wrote. [`calibrate`](coldivf/src/lib.rs#L1132) picks the cheapest [`nprobe`](coldivf/src/lib.rs#L389), [`rerank`](coldivf/src/lib.rs#L391) and [`reach`](coldivf/src/lib.rs#L394) for a recall target.
 
 ## Design
 
-ColdIVF is an inverted-file (IVF) index in one file. It splits the vectors into clusters and gathers nearby clusters into groups. It keeps a compact code of each vector inside its cluster, and a more precise copy of each vector beside the codes. A cold query reads only the clusters it needs and the copies of its best candidates, in two batches of reads, so it never loads the whole index.
+ColdIVF is an IVF index in one file. It splits the vectors into clusters and gathers nearby clusters into groups. It keeps a compact 1-bit code of each vector inside its cluster. A more precise copy of each vector sits beside the codes. A cold query reads only the clusters it needs and then the copies of its best candidates, in two batches. Thus it never loads the whole index.
+
+### Optimizations Overview
+
+A cold query is fast because it reads little and reads it all at once. These are ColdIVF's main optimizations, each explained in its section below:
+
+| Optimization | What It Does |
+|---|---|
+| [1-bit codes](#encoding) | Searches score based on 1-bit codes and read the 8-bit copies only for their final candidates. Thus, a cold query reads under 1% of the index. |
+| [Batched reads](#cold-queries) | A cold query reads in two batches, its clusters and then its candidates' rows. Each batch goes to the disk at once, through `F_RDADVISE` on macOS and `io_uring` on Linux. |
+| [Cluster order](#build) | Nearby clusters sit next to each other in the file, thus a query's clusters merge into about 1/2 as many reads. |
+| [Small routing tables](#file-layout) | Each cluster's center is stored as 4-bit values, 1/8 of its size as 32-bit floats. Thus the tables that routing reads are under 0.2% of the index. Each center scores with one integer dot product. |
+| [Reading during the embedding](#cold-queries) | [`prepare`](coldivf/src/lib.rs#L215) starts reading the cluster tables when the query text arrives, thus they load while the embedding model runs. |
+| [SIMD scan](#cold-queries) | The SIMD scan turns every 4 bits of a 1-bit code into one table lookup. One instruction does the lookups for 16 vectors on NEON, AVX2 and AVX-512. Each range is scanned as it arrives, while the other reads are still in flight. |
+| [One table per query](#encoding) | Each cluster's center is folded into its vectors' stored numbers, thus one lookup table built from the query serves every cluster. |
+| [Page-aligned rows](#file-layout) | No 8-bit row crosses a page, thus each candidate costs one page read. A fixed [`rerank`](coldivf/src/lib.rs#L391) count then gives the second batch one small, known size. |
+| [Bounded build memory](#build) | The build streams the vectors through a scratch file and writes the index a part at a time. Thus, besides fixed-size buffers, its memory grows by only about 1% of the vectors' size. |
+| [Writes beside reads](#writes-and-maintenance) | Inserts and deletes go to a log and to blocks that the same kernels scan. Maintenance writes a new file in the background, and readers move to it without a lock. |
 
 ### File Layout
 
-The file holds these sections, in order. Each section after the rotation starts on a 16 KiB boundary.
+The file holds these sections, in order. Each section after the rotation starts on a 16 KiB boundary. Every number in the file is little-endian.
 
-| Section | What It Holds |
-|---|---|
-| Header | The first 4 KiB. It starts with the format's magic number and version and a byte-order mark. Then come the dimension, the dimension rounded up to a multiple of 64, and the counts of vectors, clusters and groups. Next are the metric, whether the 1-bit codes are measured from the mean or from each cluster's center, the page size, the rows per page, the build's seed and the number of maintenance runs since the build. Last come each section's offset, length and 32-bit cyclic redundancy check (CRC32), then the header's own CRC32. That CRC32 also tells the file apart from any other, so a log written for another file is ignored. |
-| Rotation | The round count, the dimension and the random sign flips of the fast rotation that every vector and query goes through, 1 bit per dimension in each of 3 rounds. The rest of the rotation follows from the dimension, so it takes no bytes. Then the mean of the vectors at build, as 32-bit floats. Every row, center and query is measured from it, and maintenance never changes it. At 768 dimensions the section takes 8 + 288 + 3,072 = 3,368 bytes. |
-| Centers | Each group's center as an 8-bit row like a vector's, without the id, 776 bytes at 768 dimensions. Searches skip these rows, and a fold copies them as they are. Then each cluster's center, rotated and measured from the mean, as 4-bit values, 384 bytes at 768 dimensions. Then arrays with one value per cluster: the lowest value and the step that decode each center, its squared length before rounding, which routing uses, and its 16-bit group. |
-| Extents | 16 bytes per cluster: where its codes start, how many vectors it holds and the position of its first vector. |
-| Codes | Each cluster's 1-bit codes in blocks of 32 vectors, cluster after cluster. A block holds the codes, 96 bytes per vector at 768 dimensions, interleaved for the single instruction, multiple data (SIMD) scan. Then come 4 numbers per vector: 3 that turn its code into a distance estimate, and an error bound. A block takes 3,584 bytes at 768 dimensions. |
-| Rows | An 8-bit copy of every vector, for rescoring candidates. The rows follow the vectors' positions, so a cluster's rows sit together. At 768 dimensions a row holds 768 values of the vector's offset from the mean, one scale, the squared length of the offset as it decodes and the id, 784 bytes in all. Rows never cross a page, so each 4 KiB page holds 5. The page size is a build setting, and 4 KiB suits both 16 KiB-page Macs and 4 KiB-page PCs. |
-| Ids | Each vector's id, 8 bytes, in position order. A writer reads them to find the row of an id it deletes or replaces. Then one deleted bit per vector. Every file leaves these bits at 0, since deletes stay in the log until maintenance drops their vectors. Searches take the ids from the rows instead. |
-| Trailer | Only in a file that maintenance wrote, after the ids, with its own magic number and CRC32. It holds what maintenance keeps between runs: each cluster's region and the counts that tell when a run is due. |
+#### Header
 
-At 768 dimensions that comes to 946.4 bytes per vector at 1M vectors and 942.7 at 10M. The 8-bit rows take 819.2 of them, 86.6% and 86.9%, since 5 rows of 784 bytes share each 4 KiB page. The codes take 117.6 and 114.8, more than the 112 bytes per vector of a full block, since each cluster's last block is partly empty. Routing reads the cluster tables: the 4-bit centers with their numbers and groups, and the extents, but not the group rows. They take 414 bytes per cluster, 1.32 MB for the 3,195 clusters of the 1M index.
+The header takes the first 4 KiB of the file. Its fields use the first 324 bytes.
+
+<details>
+<summary>Header fields</summary>
+
+| Field | Bytes | What It Means |
+|---|---|---|
+| Magic number | 8 | Marks the file as a ColdIVF index |
+| Version | 4 | The format version |
+| Byte-order mark | 4 | Reads 0x04030201 in a file written in the other byte order |
+| Dimension | 4 | Each vector's dimension |
+| Padded dimension | 4 | The dimension rounded up to a multiple of 64 |
+| Vectors | 8 | The vector count |
+| Clusters | 4 | The cluster count |
+| Groups | 4 | The count of groups of nearby clusters |
+| Metric | 1 | 1 for cosine, 0 for L2 |
+| Anchor | 1 | What the 1-bit codes are measured from: 1 for each cluster's center, 0 for the mean |
+| Encodings | 3 | The encoding of the 1-bit codes, rows and centers sections, 1 byte each |
+| Reserved | 3 | Unused |
+| Page size | 4 | No row crosses a page of this size |
+| Line size | 4 | Each cluster's 1-bit codes start on a multiple of this |
+| Block | 4 | The vectors per block of 1-bit codes |
+| Row bytes | 4 | The size of one 8-bit row |
+| Rows per page | 4 | The rows that fit in one page |
+| Seed | 8 | The build's random seed |
+| Error bound width | 4 | The width of RaBitQ's error bound, which searches don't use |
+| Section table | 168 | Each section's offset, length, kind and CRC32, 24 bytes each |
+| Model id | 64 | Room for the id of the embedding model, unused for now |
+| Maintenance runs | 8 | The maintenance runs since the build |
+| Header CRC32 | 4 | The CRC32 of the 320 bytes before it |
+
+</details>
+<br>
+
+Each section's kind in the section table is its place in the file, 1 to 7. The header's entry has a CRC32 of 0, since the header has its own.
+
+The change log beside the index records this CRC32. Thus an open replays a log only onto the file it was written for, and ignores a log from any other file.
+
+#### Rotation
+
+The rotation section holds the sign flips of the fast rotation that every vector and query goes through. The rest of the rotation follows from the dimension, thus it takes no bytes. The section also holds the mean that every row, center and query is measured from. It starts right after the header, at byte 4,096, and takes 3,368 bytes at 768 dimensions.
+
+<details>
+<summary>Rotation fields</summary>
+
+| Field | Bytes | What It Means |
+|---|---|---|
+| Rounds | 4 | The rotation's round count |
+| Dimension | 4 | The rotation's dimension, which must match the header's |
+| Round 1 sign bits | 96 | 1 bit per dimension. Bit $k$ of byte $b$ is set when the round flips the sign of value $8b + k$ |
+| Round 2 sign bits | 96 | The same for round 2 |
+| Round 3 sign bits | 96 | The same for round 3 |
+| Padding | 0 | Pads the sign bits with 0s to a multiple of 4 bytes |
+| Mean | 3,072 | The mean of the vectors at build, after scaling them to length 1 for cosine, as one 32-bit float per dimension. Maintenance never changes it |
+
+</details>
+<br>
+
+The sign bits come from the SplitMix64 random number generator, seeded with the header's seed. Thus the same seed always gives the same rotation.
+
+#### Centers
+
+The centers section holds the group centers, then the cluster centers, the numbers that decode them and each cluster's group. Clusters are numbered by their place in the file.
+
+<details>
+<summary>Centers fields</summary>
+
+| Field | Bytes | What It Means |
+|---|---|---|
+| Group rows | 776 per group | Each group's center as an 8-bit row like a vector's but without the id, 776 bytes each, by group number. Searches skip them |
+| Cluster centers | 384 per cluster | Each cluster's center, rotated and measured from the mean, as 4-bit values from 0 to 15, 384 bytes each |
+| Lowest values | 4 per cluster | Each center's lowest value, a 32-bit float |
+| Steps | 4 per cluster | Each center's highest value minus its lowest, divided by 15. Value $k$ decodes to $\text{lowest} + k \cdot \text{step}$ |
+| Squared lengths | 4 per cluster | Each rotated center's squared length before its values were rounded, which routing uses |
+| Groups | 2 per cluster | Each cluster's group, a 16-bit number |
+
+</details>
+<br>
+
+A center's values take 32 bytes for each chunk of 64 dimensions, numbered 0 to 63 within the chunk. For each $i$ from 0 to 15, byte $i$ holds dimension $i$ in its low half and dimension $i + 16$ in its high half. Byte $i + 16$ holds dimensions $i + 32$ and $i + 48$ the same way. We pair dimension $i$ with dimension $i + 16$ so that each 16-byte load splits into two runs of 16 consecutive dimensions. Masking the bytes keeps the low halves, dimensions 0 to 15, and shifting them keeps the high halves, dimensions 16 to 31. Thus each run lines up with 16 consecutive values of the query for one integer dot product instruction, with no reordering.
+
+Routing uses the stored squared length. The scan instead needs the one that the values decode to. The index works it out once, when it builds or loads the tables.
+
+The file order starts with the group nearest the mean, as [Build](#build) explains. Thus cluster 0, the first cluster in the file, always belongs to that group. During maintenance, a fold keeps the row of each group that still holds a cluster. Minor and major runs make new group rows.
+
+#### Extents
+
+Each cluster has 16 bytes in the extents section, in file order. They tell where its blocks are in the 1-bit codes section and which positions its vectors take.
+
+<details>
+<summary>Extent fields</summary>
+
+| Field | Bytes | What It Means |
+|---|---|---|
+| Codes offset | 8 | Where the cluster's blocks start, in bytes from the start of the 1-bit codes section |
+| Vector count | 4 | The cluster's vector count |
+| First position | 4 | The position of the cluster's first vector. Its vectors take the positions from there up |
+
+</details>
+<br>
+
+Each cluster's blocks follow the previous cluster's. A block's size is always a multiple of the header's line size, 128, thus no padding is needed between clusters.
+
+#### 1-Bit Codes
+
+The 1-bit codes section holds each cluster's codes in blocks of 32 vectors, cluster after cluster. A block holds the codes, interleaved for the SIMD scan, then 4 numbers per vector as 32-bit floats.
+
+<details>
+<summary>Block fields</summary>
+
+| Field | Bytes | What It Means |
+|---|---|---|
+| 1-bit codes | 3,072 | 16 bytes for each set of 4 dimensions, 192 sets |
+| Added terms | 128 | Each vector's squared distance from its cluster's decoded center, with the center's part of the estimate folded in |
+| Multipliers | 128 | The estimate's factor for the code's dot product with the rotated query |
+| Bit counts | 128 | The bits that each vector's code sets |
+| Error bounds | 128 | Each vector's error bound, which searches don't use |
+
+</details>
+<br>
+
+In each set, byte $i$ holds the set's 4 bits of vector $i$ in its low half and of vector $16 + i$ in its high half. The set's first dimension takes the lowest bit.
+
+Let $P$ be the rotation, $\mu$ the mean, $d$ the dimension and $q$ the query. For a vector $o$ whose cluster's 4-bit values decode to the center $\hat{c}$, let $r = P(o - \hat{c})$ and $L = \lVert r \rVert$. Let $\alpha$ be the sum of $r$'s absolute values divided by $L\sqrt{d}$. Bit $i$ of the code is 1 where $r_i > 0$. The vector $\bar{x}$ holds $1/\sqrt{d}$ for each 1 bit and $-1/\sqrt{d}$ for each 0 bit. Then:
+- The multiplier is $m = -2L / \alpha$.
+- The added term is $a = L^2 - m \langle \bar{x}, P(\hat{c} - \mu) \rangle$, thus it can be negative.
+- The error bound is the one from [RaBitQ](https://arxiv.org/abs/2405.12497), with the header's error bound width, 1.9.
+- The scan's estimate of $\lVert q - o \rVert^2$ is $a + \lVert q - \hat{c} \rVert^2 + m \langle \bar{x}, P(q - \mu) \rangle$. It gets $\langle \bar{x}, P(q - \mu) \rangle$ from the query's 4-bit values, through its table lookups and the bit count.
+
+With the mean anchor, $\hat{c}$ is the mean, thus the added term is $L^2$.
+
+A cluster's last block can be partly empty. Each empty slot has no bits set, an added term of infinity and 0 for its other numbers, thus it never ranks.
+
+#### Rows
+
+The rows section holds an 8-bit copy of every vector, for rescoring candidates. The rows follow the vectors' positions, thus a cluster's rows sit together.
+
+<details>
+<summary>Row fields</summary>
+
+| Field | Bytes | What It Means |
+|---|---|---|
+| Values | 768 | The vector's offset from the mean, not rotated, as integers from −127 to 127 |
+| Scale | 4 | The offset's largest absolute value divided by 127, thus the row decodes to the mean plus the scale times the values |
+| Squared length | 4 | The squared length of the offset as it decodes, the scale squared times the sum of the values squared |
+| Id | 8 | The vector's id, given at build time |
+| Padding | 0 | Pads the row with 0s to a multiple of 8 bytes |
+
+</details>
+<br>
+
+Rows never cross a page, thus each 4 KiB page holds 5 rows in its first 3,920 bytes. Each page ends in 176 zero bytes. Position $p$'s row is row $p \bmod 5$ of page $\lfloor p / 5 \rfloor$. The page size is a build setting, and 4 KiB suits both 16 KiB-page Macs and 4 KiB-page PCs.
+
+#### Ids
+
+A writer reads the ids section to find the row of an id it deletes or replaces. Searches take the ids from the rows instead.
+
+<details>
+<summary>Ids fields</summary>
+
+| Field | Bytes | What It Means |
+|---|---|---|
+| Ids | 8 per vector | Each vector's id, 8 bytes each, in position order |
+| Deleted bits | 1 bit per vector | One bit per position, 64 to each 8-byte word |
+
+</details>
+<br>
+
+Every file leaves the deleted bits at 0, since deletes stay in the log until maintenance drops their vectors. The build keeps each cluster's vectors in input order.
+
+#### Trailer
+
+Only a file that maintenance wrote has a trailer. It holds what maintenance keeps between runs: each cluster's region and the counts that tell when a run is due. It starts on the first 16 KiB boundary after the ids and ends the file. Every section ends before it, thus a reader that doesn't know about trailers still reads the file the same way.
+
+<details>
+<summary>Trailer fields</summary>
+
+| Field | Bytes | What It Means |
+|---|---|---|
+| Magic number | 8 | Marks the trailer |
+| Version | 4 | The trailer's format version |
+| Clusters | 4 | The cluster count, which must match the header's |
+| Regions | 4 | The region count |
+| Clusters per region | 4 | Clusters per region when the regions were made, a 32-bit float |
+| Vectors at the last major run | 8 | The vector count at the last major run, or at the build if none has run |
+| Inserts since then | 8 | The inserts since that run. One that replaced a vector counts as an insert only |
+| Deletes since then | 8 | The deletes since that run |
+| Changes since the last pass | 8 | Inserts plus deletes since the last major run or global pass. A replacement counts twice, as an insert and as the row it hides |
+| Cluster regions | 4 per cluster | Each cluster's region, 4 bytes each, in file order |
+| Cluster counts | 4 per cluster | Each cluster's vector count when its region was last clustered, 4 bytes each |
+| Region counts | 8 per region | Each region's vector count when it was last clustered, 8 bytes each |
+| Region changes | 8 per region | Each region's inserts plus deletes since it was last clustered, 8 bytes each. A replacement counts as an insert and as the row it hides |
+| Trailer CRC32 | 4 | The CRC32 of every byte of the trailer before it |
+
+</details>
+<br>
+
+A global pass is an option of minor runs that moves every vector to its nearest cluster. It is off by default.
+
+#### Size per Vector
+
+At 768 dimensions, each vector effectively takes 939.3 bytes. Its 8-bit row takes 784 bytes, and each 4 KiB page holds 5 rows. Thus each row takes 819.2 bytes with the page's padding. Its 1-bit code takes 112 bytes, and each 3,584-byte block holds 32 codes. Its id takes 8 bytes, and its deleted bit 1/8 of a byte. A cluster of $n$ vectors takes $\lceil n/32 \rceil$ blocks, since its last block can be partly empty. Each cluster also adds 414 bytes to the cluster tables, which routing reads. Its 4-bit center takes 384 bytes, its lowest value, step, squared length and group take 14 bytes, and its extent takes 16 bytes.
 
 ### Cold Queries
 
 A cold query runs in seven steps:
-1. Opening the index reads the first 16 KiB, the header and the rotation, in one read. Up to 2,806 dimensions, both fit in that read. It checks their CRC32s and that every section is in place and the right size. Searches skip the other sections' CRC32s, and `verify` checks them all. It then maps the whole file into memory without reading it. Every later read goes through the file handle it opened, so all of them see the same file even if a rebuild renames a new one over the index. On Linux each search context also opens that file again with direct I/O for its batches.
-2. `prepare`, called when the query text arrives, asks the operating system to start reading the cluster tables, with `F_RDADVISE` on macOS and `posix_fadvise` on Linux. It also sets up the query's buffers. The tables then load while the embedding model runs. The first search reads them, by then mostly from memory, and keeps them for later searches.
-3. Routing picks the clusters to read. It rotates the query and stores it as 8-bit values from −127 to 127 with one scale. Each center is stored as 4-bit values from 0 to 15 with its own lowest value and step. So the query's distance to a center takes one integer dot product of the two, plus a few multiplications with the center's lowest value, step and squared length. On Arm CPUs, NEON's `sdot` computes that dot product 16 values at a time. On x86 CPUs, the Advanced Vector Extensions (AVX) do it 32 values at a time with AVX2's `vpmaddubsw` and 64 with AVX-512's `vpdpbusd`. The dot product is a whole number, so every CPU gets the same route scores. Every center is scored this way, and a heap keeps the `nprobe` nearest. With `reach` set, routing also applies the pruning rule of [SPANN](https://arxiv.org/abs/2111.08566): it keeps only the clusters whose distance is at most (1 + `reach`) times the nearest one's. A query deep inside one cluster then reads only the few clusters around it, while a query between clusters still reads up to `nprobe`.
-4. The chosen clusters are read in one batch. They're sorted by their position in the file. Each becomes the byte range of its blocks, rounded out to whole pages, 16 KiB on macOS and 4 KiB on Linux. Ranges that touch or overlap merge into one read. The build puts nearby clusters next to each other in the file, so many of a query's clusters merge. Every range then goes to the disk at once, so the solid-state drive (SSD) works on all of them together instead of one after another:
-   - On macOS, `F_RDADVISE` tells the kernel to start reading each range. Then `pread` takes the ranges in file order, and by then most of them have arrived. If the file system refuses the hints, eg. FAT32 (File Allocation Table), the index reads on the thread pool that other systems use.
-   - On Linux, all the reads go into one `io_uring` submission, and the ranges come back in the order they finish. They use direct I/O, which skips the page cache. So each search context keeps its own cache of up to 16 MiB of the pages it has read twice. Without `io_uring`, the index falls back to `posix_fadvise` hints and `pread`.
-   - Other systems, eg. Windows, read the ranges on a pool of up to 16 threads, and the scan starts once all of them are in. On Windows the reads through one handle still run one at a time.
-5. The scan estimates each vector's distance from its 1-bit code as each range comes in, while the other reads are still in flight. It works like [FastScan](https://dl.acm.org/doi/10.14778/2856318.2856324): instead of testing the bits one at a time, it turns every 4 bits of a code into one table lookup, and SIMD does 16, 32 or 64 lookups in one instruction.
-   - For the scan, the rotated query is also stored as 4-bit values from 0 to 15. Each set of 4 dimensions gets a table with one entry for each of the 16 patterns that 4 code bits can take. An entry is the sum of the query's values over the dimensions whose bit the pattern sets, a whole number of at most 60.
-   - A block interleaves the codes of 32 vectors. For each set of 4 dimensions, 16 bytes hold those 4 bits of each of the 32 vectors, vector i in the low half of byte i and vector 16 + i in its high half.
-   - One lookup instruction then finds the table entries of 16 vectors: `tbl` on NEON for one set of 4 dimensions at a time, and `vpshufb` for 2 sets on AVX2 and 4 on AVX-512.
-   - The sums stay exact. An entry is at most 60, so the kernels add the lookups of 4 sets in single bytes, at most 240, before they widen them to 16 bits. A vector's total stays below 2^16, since the dimension is at most 4,080.
-   - Three fused multiply-adds then turn each sum and 3 of the vector's 4 numbers, all but the error bound, into its distance estimate. They run in the same order on every CPU, so every kernel returns exactly the same estimates.
-   - The scan keeps the best `rerank` candidates so far, or the best `k` if `k` is larger. A vector stays a candidate only if its estimate beats the worst of them.
+1. Opening the index reads the first 16 KiB, the header and the rotation, in one read. Up to 2,806 dimensions, both fit in that read. It checks their CRC32s and that every section is in place and the right size. Searches skip the other sections' CRC32s, and [`verify`](coldivf/src/lib.rs#L352) checks them all. It then maps the whole file into memory without reading it. Every later read goes through the file handle it opened. Thus, all of them see the same file, even if a rebuild renames a new one over the index. On Linux, each search context also opens that file again with direct I/O for its batches.
+2. [`prepare`](coldivf/src/lib.rs#L215) is called when the query text arrives. It asks the operating system to start reading the cluster tables, with `F_RDADVISE` on macOS and `posix_fadvise` on Linux. Thus the tables load while the embedding model runs. [`prepare`](coldivf/src/lib.rs#L215) also sets up the query's buffers. The first search reads the tables, by then mostly from memory, and keeps them for later searches.
+3. Routing picks the clusters to read. It rotates the query and stores it as 8-bit values from −127 to 127 with one scale. Each center is stored as 4-bit values from 0 to 15 with its own lowest value and step. Thus, the query's distance to a center takes one integer dot product of the two, plus a few multiplications with the center's lowest value, step and squared length. On Arm, NEON's `sdot` computes that dot product 16 values at a time. On x86, AVX does it 32 values at a time with AVX2's `vpmaddubsw`, and 64 with AVX-512's `vpdpbusd`. The dot product is a whole number, thus every CPU gets the same route scores. Every center is scored this way, and a heap keeps the [`nprobe`](coldivf/src/lib.rs#L389) nearest. With [`reach`](coldivf/src/lib.rs#L394) set, routing also applies the pruning rule of [SPANN](https://arxiv.org/abs/2111.08566). It keeps only the clusters whose distance is at most $(1 + \text{reach})$ times the nearest one's. Hence, a query deep inside one cluster reads only the few clusters around it. A query between clusters still reads up to [`nprobe`](coldivf/src/lib.rs#L389).
+4. The chosen clusters are read in one batch, sorted by their position in the file. Each becomes the byte range of its blocks, rounded out to whole pages, 16 KiB on macOS and 4 KiB on Linux. Ranges that touch or overlap merge into one read. Since the build places nearby clusters next to each other in the file, many of a query's clusters merge. Every range then goes to the disk at once. Thus, the SSD works on all of them together instead of one after another:
+   - On macOS, `F_RDADVISE` tells the kernel to start reading each range. Then `pread` takes the ranges in file order, and by then most of them have arrived. If the file system refuses the hints, eg. FAT32, the index reads on the thread pool that other systems use.
+   - On Linux, all the reads go into one `io_uring` submission. The ranges come back in the order they finish. The reads use direct I/O, which skips the page cache. Thus, each search context keeps its own cache of up to 16 MiB of the pages it has read twice. Without `io_uring`, the index falls back to `posix_fadvise` hints and `pread`.
+   - Other systems, eg. Windows, read the ranges on a pool of up to 16 threads. The scan starts once all the ranges are in. On Windows, the reads through one handle still run one at a time.
+5. The scan estimates each vector's distance from its 1-bit code. It works on each range as it arrives, while the other reads are still in flight. As in [FastScan](https://dl.acm.org/doi/10.14778/2856318.2856324), it turns every 4 bits of a code into one table lookup instead of testing each bit. SIMD then does 16, 32 or 64 lookups in one instruction.
+   - For the scan, the rotated query is also stored as 4-bit values from 0 to 15. Each set of 4 dimensions gets a table with one entry for each of the 16 patterns of its 4 code bits. An entry is the sum of the query's values over the dimensions whose bit the pattern sets. It is a whole number of at most 60.
+   - A block interleaves the codes of 32 vectors. For each set of 4 dimensions, 16 bytes hold those 4 bits of each of the 32 vectors. Byte i holds the bits of vector i in its low half and of vector 16 + i in its high half.
+   - One lookup instruction then finds the table entries of 16 vectors. On NEON, `tbl` handles one set of 4 dimensions at a time. On AVX2 and AVX-512, `vpshufb` handles 2 and 4 sets, respectively.
+   - The sums stay exact. Since each entry is at most 60, the kernels add the lookups of 4 sets in single bytes, at most 240. Then they widen these sums to 16 bits. A vector's total stays below $2^{16}$, since the dimension is at most 4,080.
+   - Three fused multiply-adds then turn each vector's sum into its distance estimate. They use 3 of the vector's 4 numbers, all but the error bound. They run in the same order on every CPU, thus every kernel returns exactly the same estimates.
+   - The scan keeps the best max([`rerank`](coldivf/src/lib.rs#L391), [`k`](coldivf/src/lib.rs#L385)) candidates so far. A vector stays a candidate only if its estimate beats the worst of them.
 
-   The index picks its kernels once, when it opens, by what the CPU supports: NEON with its dot-product instructions, AVX2 with fused multiply-adds, AVX-512 with its Vector Neural Network Instructions (VNNI), or portable scalar code.
-6. When the scan ends, a second batch reads the candidates' 8-bit rows. Since 5 rows fill each 4 KiB page, a vector's position gives its row's page and its place in that page. So the batch reads one page per candidate, and a single page for candidates that share one. On macOS each page rounds out to a 16 KiB read. The 1-bit codes also come with an error bound, as in [RaBitQ](https://arxiv.org/abs/2405.12497). ColdIVF stores it but doesn't use it. Instead it rescores a fixed number of candidates, `rerank`, so this batch has one small, known size.
-7. Each candidate is rescored from its row without decoding it. Its squared distance is ‖q − μ‖² + n2 − 2 · scale · ⟨q − μ, c⟩. Here q − μ is the query's offset from the mean, and c, scale and n2 are the row's values, scale and stored squared length. Deleted rows drop out, and the best `k` come back with the ids stored in their rows. For cosine, the build, each insert and each query first scale their vectors to length 1, and the score is 1 minus half the squared distance.
+   The index picks its kernels once, when it opens, by what the CPU supports. It uses NEON with its dot-product instructions, AVX2 with fused multiply-adds, AVX-512 with VNNI, or a portable scalar kernel.
+6. When the scan ends, a second batch reads the candidates' 8-bit rows. Since 5 rows fill each 4 KiB page, a vector's position gives its row's page and its place in that page. Thus, the batch reads one page per candidate, and a single page for candidates that share one. On macOS, each page rounds out to a 16 KiB read. The 1-bit codes also come with an error bound, as in [RaBitQ](https://arxiv.org/abs/2405.12497). ColdIVF stores it but doesn't use it. Instead it rescores a fixed number of candidates, [`rerank`](coldivf/src/lib.rs#L391), thus this batch has one small, known size.
+7. Each candidate is rescored from its row without decoding it. Let $c$, $s$ and $n_2$ be the row's values, scale and stored squared length. Then the candidate's squared distance is $\lVert q - \mu \rVert^2 + n_2 - 2s \langle q - \mu, c \rangle$, where $q - \mu$ is the query's offset from the mean. Deleted rows drop out, and the best [`k`](coldivf/src/lib.rs#L385) come back with the ids stored in their rows. For cosine, the build, each insert and each query first scale their vectors to length 1. For a squared distance $\delta$, the cosine score is then $1 - \delta / 2$.
 
-Recall@10 is the share of a query's true 10 nearest neighbors that a search finds. At 1M vectors, a cold query at recall@10 0.95 uses `nprobe` 128 and `rerank` 64. Its 128 clusters come in a median of 59.5 reads. It reads 8.22 MB and takes 7.83 ms at the median, as [Cold First Query](#cold-first-query) shows.
+Recall@10 is the share of a query's true 10 nearest neighbors that a search finds. At 1M vectors, a cold query at recall@10 0.95 uses [`nprobe`](coldivf/src/lib.rs#L389) 128 and [`rerank`](coldivf/src/lib.rs#L391) 64. Its 128 clusters come in a median of 59.5 reads. It reads 8.22 MB and takes 7.83 ms at the median, as [Cold First Query](#cold-first-query) shows.
 
-`search` is `route`, then `fetch`, then `Fetched::search`, and an application can call them apart. On macOS and Linux `fetch` returns while the cluster reads run, so it can start them from a guessed query before the final embedding is ready. `Fetched::prefetch_rows` then starts reading the rows of the guess's best candidates. `Fetched::search` ranks only the fetched clusters for the final query, and reads only the row pages that the guess missed.
+[`search`](coldivf/src/lib.rs#L232) is [`route`](coldivf/src/lib.rs#L255), then [`fetch`](coldivf/src/lib.rs#L295), then [`Fetched::search`](coldivf/src/lib.rs#L557). An application can also call them separately. On macOS and Linux, [`fetch`](coldivf/src/lib.rs#L295) returns while the cluster reads run. Thus, the application can start them from a guessed query before the final embedding is ready. [`Fetched::prefetch_rows`](coldivf/src/lib.rs#L551) then starts reading the rows of the guess's best candidates. [`Fetched::search`](coldivf/src/lib.rs#L557) ranks only the fetched clusters for the final query. It reads only the row pages that the guess missed.
 
 ### Encoding
 
-Each vector first goes through a fast random rotation. It spreads the vector's values evenly over all the dimensions, so that keeping 1 bit per dimension loses as little as possible. The usual version needs a dimension that is a power of two. It runs 3 rounds of random sign flips, each followed by a Walsh-Hadamard transform. That transform makes every output a sum of all the inputs, each added or subtracted. ColdIVF changes each round so that it works for any dimension d:
+Each vector first goes through a fast random rotation. It spreads the vector's values evenly over all the dimensions, so that keeping 1 bit per dimension loses as little as possible. The usual version needs a dimension that is a power of two. It runs 3 rounds of random sign flips, each followed by a Walsh-Hadamard transform. That transform makes every output a sum of all the inputs, each added or subtracted. We change each round so that it works for any dimension d:
 - It flips the signs of the values that the build's seed picks.
-- It splits the values into parts whose sizes are the powers of two that add up to d, largest first, eg. 512 and 256 for 768. It applies a Walsh-Hadamard transform to each part, scaled by 1/√b for a part of b values.
-- It reorders the values with a fixed stride, so the next round mixes them across the parts. Output j takes input (j · stride) mod d. The stride is the smallest odd number of 7 or more that shares no factor with d, eg. 7 for 768.
+- It splits the values into parts whose sizes are the powers of two that add up to $d$, largest first, eg. 512 and 256 for 768. It applies a Walsh-Hadamard transform to each part, scaled by $1/\sqrt{b}$ for a part of $b$ values.
+- It reorders the values with a fixed stride, thus the next round mixes them across the parts. Output $j$ takes input $(j \cdot s) \bmod d$ for a stride $s$. The stride is the smallest odd number of 7 or more that shares no factor with $d$, eg. 7 for 768.
 
-Every step keeps lengths and dot products, so the rotation changes no distance. It costs O(d log d) per vector and needs no padding. It runs 3 rounds, since with 2 rounds some values of a 768-dimension vector spread over only about 700 of the 768 outputs.
+Every step keeps lengths and dot products, thus the rotation changes no distance. It costs $O(d \log d)$ per vector and needs no padding. With 2 rounds, some values of a 768-dimension vector spread over only about 700 of the 768 outputs. Thus we use 3 rounds.
 
-As in [RaBitQ](https://arxiv.org/abs/2405.12497), a vector's 1-bit code keeps the sign of each value of its rotated offset from its cluster's center, 96 bytes at 768 dimensions. With it come 4 numbers: 3 that turn a sum over the bits into a distance estimate, and an error bound. ColdIVF measures the code from the center ĉ that the cluster's 4-bit values decode to, rather than the exact center. With P the rotation and μ the mean, the estimate needs the code's dot product with P(q − ĉ) = P(q − μ) − P(ĉ − μ). The first part is the same for every cluster. The second depends only on the vector and its center, so it is folded once into one of the vector's 4 numbers. So one lookup table, built once from the query, serves every cluster, and each cluster only adds the query's exact squared distance from its center. Routing's estimate of that distance takes one integer dot product, and the exact one takes 4. Each query value goes to 32-bit fixed point, and each dot product multiplies one of its 4 bytes with the center's 4-bit values. So every CPU gets the same distance. The center sits nearer the vector than the mean of all the vectors, so the estimate is more accurate and fewer candidates need rescoring.
+As in [RaBitQ](https://arxiv.org/abs/2405.12497), a vector's 1-bit code keeps the sign of each value of its rotated offset from its cluster's center. The code takes 96 bytes at 768 dimensions. It comes with 4 numbers: 3 that turn a sum over the bits into a distance estimate, and an error bound.
+
+We measure the 1-bit code from the center $\hat{c}$ that the cluster's 4-bit values decode to, rather than from the exact center. With $P$ the rotation and $\mu$ the mean, the estimate needs the code's dot product with $P(q - \hat{c}) = P(q - \mu) - P(\hat{c} - \mu)$. The first part is the same for every cluster. Since the second depends only on the vector and its center, it is folded once into one of the vector's 4 numbers. Thus, one lookup table, built once from the query, serves every cluster, and each cluster only adds the query's exact squared distance from its center. Routing's estimate of that distance takes one integer dot product, and the exact one takes 4. Each query value goes to 32-bit fixed point. Each dot product multiplies one of its 4 bytes with the center's 4-bit values. Thus, every CPU gets the same distance. Since the center sits nearer the vector than the mean of all the vectors, the estimate is more accurate. As a result, fewer candidates need rescoring.
 
 The 8-bit rows hold each vector's offset from the mean, not rotated, as values from −127 to 127. Each vector has one scale, its offset's largest absolute value divided by 127.
 
 ### Build
 
-The build clusters the vectors with k-means, 20 rounds of Lloyd's algorithm from random starting vectors, run as matrix products. It aims for an average of `vectors_per_list` vectors per cluster, and the benchmarks set it to 320 at 1M and 640 at 10M. A group is a set of nearby clusters. A flat build, the default, makes n / `vectors_per_list` clusters for n vectors, rounded up, then finds `parents` groups with k-means over the cluster centers.
+The build clusters the vectors with k-means. It runs 20 rounds of [Lloyd's algorithm](https://en.wikipedia.org/wiki/Lloyd%27s_algorithm) from random starting vectors, as matrix products. It aims for an average of [`vectors_per_list`](coldivf/src/lib.rs#L69) vectors per cluster. We set [`vectors_per_list`](coldivf/src/lib.rs#L69) to 320 at 1M and 640 at 10M in the benchmarks. A group is a set of nearby clusters. Let $v$ be [`vectors_per_list`](coldivf/src/lib.rs#L69). The default flat build makes $\lceil n / v \rceil$ clusters for $n$ vectors. Then it finds [`parents`](coldivf/src/lib.rs#L71) groups with k-means over the cluster centers.
 
-With `Clustering::TwoLevel`, which both benchmark indexes use, it first finds the groups. There are `parents` of them or the square root of n / `vectors_per_list`, whichever is larger. k-means finds them from a sample of 256 vectors per group. Both benchmark indexes have 128 groups, the `parents` they were built with, since the square root is 55 at 1M and 125 at 10M. It sorts the vectors into their nearest group and runs k-means inside each group. Each group gets its own vector count / `vectors_per_list` clusters, rounded up, so the 1M index has 3,195 clusters rather than 3,125, and the 10M index 15,687 rather than 15,625. Then each vector moves to its nearest cluster among those of its 4 nearest groups. The build repeats that move 2 more times, each time after it moves every center to the mean of its vectors.
+With [`Clustering::TwoLevel`](coldivf/src/lib.rs#L112), which both benchmark indexes use, the build finds the groups first. Their count is the larger of [`parents`](coldivf/src/lib.rs#L71) and $\sqrt{n / v}$. k-means finds them from a sample of 256 vectors per group. We built both indexes with [`parents`](coldivf/src/lib.rs#L71) set to 128. Since the square root is 55 at 1M and 125 at 10M, both have 128 groups. Then the build sorts each vector into its nearest group and runs k-means inside each group. A group of $n_g$ vectors gets $\lceil n_g / v \rceil$ clusters. Thus the 1M index has 3,195 clusters rather than 3,125, and the 10M index 15,687 rather than 15,625. Then each vector moves to its nearest cluster among those of its 4 nearest groups. The build repeats that move 2 more times. Before each one, it moves every center to the mean of its vectors.
 
-The groups also set the clusters' order in the file. A greedy walk visits the group centers, starting at the one nearest the mean and always stepping to the nearest one not yet visited. Inside each group the same walk orders its clusters, starting from the one nearest the last cluster placed. Nearby clusters then sit next to each other in the file, so a query's clusters merge into fewer reads.
+The groups also set the clusters' order in the file. A greedy walk visits the group centers, starting at the one nearest the mean. Each step goes to the nearest center not yet visited. Inside each group, the same walk orders the clusters, starting from the one nearest the last cluster placed. Nearby clusters then sit next to each other in the file, thus a query's clusters merge into fewer reads.
 
-Once the clusters are set, the build reads the vectors twice more, once for the mean and once to encode each vector into a scratch file on disk, 900 bytes per vector at 768 dimensions. Before that, flat k-means reads them 21 times, and two-level clustering 7 times. Two-level clustering also copies them into a temporary file next to the index, a group after another, so that k-means can read each group's vectors in one run. Then the build writes the index a part at a time. Each part is a run of whole clusters whose encoded vectors take at most 256 MiB. Besides the part it is writing, it holds only 8 bytes per vector and the centers in memory. Two-level clustering holds more: 20 bytes per vector and a 256 MiB copy of the vectors in each pass that reassigns them. While k-means runs inside a group, it also holds all of that group's vectors, eg. about 443 MB for the largest group at 10M. Over the whole build, its memory peaked at [359 MB at 1M](#memory-and-build) and [0.84 GB at 10M](#memory-and-build-1).
+Flat k-means reads the vectors 21 times, and two-level clustering 7 times. Two-level clustering also copies them into a temporary file next to the index. It writes them one group after another, so that k-means can read each group's vectors in one run. Once the clusters are set, the build reads the vectors twice more. One pass finds the mean. The other encodes each vector into a scratch file on disk, 900 bytes per vector at 768 dimensions. Then the build writes the index a part at a time. Each part is a run of whole clusters whose encoded vectors take at most 256 MiB. Besides the part it is writing, the build holds only 8 bytes per vector and the centers in memory. Two-level clustering holds 20 bytes per vector instead. In each pass that reassigns the vectors, it also holds a 256 MiB copy of them. While k-means runs inside a group, it holds all of that group's vectors too. At 10M, the largest group's vectors take about 443 MB. The whole build's memory peaked at [359 MB at 1M](#memory-and-build) and [0.84 GB at 10M](#memory-and-build-1).
 
-It writes to a temporary file, the header last, with a sync to disk before and after the header. Then it renames the file over the index, so a crash never leaves a half-written index. Once maintenance has run, it instead commits the file as a maintenance run does, with an empty log. It writes the same bytes for any number of threads, since its seeds are fixed, its sums add up in a fixed order, and ties go to the lower id.
+The build writes the index to a temporary file, with the header last. It syncs to disk before and after writing the header. Then it renames the file over the index, thus a crash never leaves a half-written index. Once maintenance has run, it instead commits the file as a maintenance run does, with an empty log. The build's seeds are fixed, its sums add up in a fixed order, and ties go to the lower id. Thus it writes the same bytes for any number of threads.
 
 ### Warm Queries
 
-`warm_up` starts a low-priority thread that reads the codes section into the operating system's cache. It reads in file order, 4 MiB at a time, with `MADV_POPULATE_READ` on Linux 5.14 and later, and with read hints elsewhere. When it finishes, the index marks itself warm. Searches then scan the clusters in place through the memory map instead of reading them, and read only their candidates' rows, in one batch. On macOS a memory-pressure warning clears the mark, and searches go back to reading the clusters from disk.
+[`warm_up`](coldivf/src/lib.rs#L333) starts a low-priority thread that reads the 1-bit codes section into the operating system's cache. It reads in file order, 4 MiB at a time. It uses `MADV_POPULATE_READ` on Linux 5.14 and later, and read hints elsewhere. When it finishes, the index marks itself warm. Searches then scan the clusters in place through the memory map instead of reading them. They read only their candidates' rows, in one batch. On macOS, a memory-pressure warning clears the mark, and searches go back to reading the clusters from disk.
 
 ### Writes and Maintenance
 
-A `Writer` logs each insert and delete beside the index. Each record carries its length and a CRC32. `Writer::sync` makes the log survive a power loss, with `F_FULLFSYNC` on macOS. One writer holds an index at a time, through a lock file, and a second one fails with `WouldBlock`.
+A [`Writer`](coldivf/src/lib.rs#L601) logs each insert and delete beside the index. Each record carries its length and a CRC32. [`Writer::sync`](coldivf/src/lib.rs#L709) makes the log survive a power loss, with `F_FULLFSYNC` on macOS. A lock file lets only one writer hold an index at a time. A second writer fails with `WouldBlock`.
 
-An insert goes to its nearest cluster, gets its 1-bit code and 8-bit row, and joins the pending inserts in memory. An insert with an id that the index already holds replaces that vector. Each cluster's pending inserts sit in blocks of 32 like the file's, so the same kernels scan them. An insert near a query may sit in a cluster just outside the query's `nprobe` nearest. So a search with inserts pending also scans the inserts of the 256 nearest clusters. Each delete marks the row or the pending insert that holds its id, and marked ones never become candidates.
+An insert goes to its nearest cluster, where it gets its 1-bit code and 8-bit row. Then it joins the pending inserts in memory. An insert with an id that the index already holds replaces that vector. Each cluster's pending inserts sit in blocks of 32 like the file's, thus the same kernels scan them. An insert near a query may sit in a cluster just outside the query's [`nprobe`](coldivf/src/lib.rs#L389) nearest. Thus, a search with inserts pending also scans the inserts of the 256 nearest clusters. Each delete marks the row or the pending insert that holds its id. Marked rows and inserts never become candidates.
 
-Every search of the index in this process sees a change as soon as it is logged. A search loads the changes once, as a snapshot, without a lock, so it sees them as they were when it began. Opening the index replays its log, so another process sees the changes when it next opens the index. Its `prepare` and `refresh` only look for a newer data file that maintenance committed, so through them it sees the changes once a run commits them.
+Every search in the writer's process sees a change as soon as it is logged. A search loads the changes once, as a snapshot, without a lock. Thus it sees them as they were when it began. Opening the index replays its log, thus another process sees the changes when it next opens the index. In that process, [`prepare`](coldivf/src/lib.rs#L215) and [`refresh`](coldivf/src/lib.rs#L204) only look for a newer data file that maintenance committed. As a result, they pick up the changes once a run commits them.
 
-Maintenance folds the changes into a new data file. The index keeps no full-precision copy of the vectors, so a run clusters their decoded 8-bit rows, copies every row as it is and keeps the mean and the rotation. A vector whose cluster or center changed gets its code measured again from its row. A run is due once the pending inserts reach 5% of the vectors or take 32 MiB of memory. It is also due once the deleted rows reach 5% of the vectors, or once searches scan 5% more than they would with every change folded in. The inserts since the last major run also make one due once they reach 25% of the vector count at that run. A run is one of three kinds:
+Maintenance folds the changes into a new data file. Since the index keeps no full-precision copy of the vectors, a run clusters their decoded 8-bit rows. It copies every row as it is and keeps the mean and the rotation. A vector whose cluster or center changed gets its 1-bit code measured again from its row. A run is due once the pending inserts reach 5% of the vectors or take 32 MiB of memory. It is also due once the deleted rows reach 5% of the vectors, or once searches scan 5% more than they would with every change folded in. The inserts since the last major run also make one due once they reach 25% of the vector count at that run. A run is one of three kinds:
 - A fold keeps every cluster that still has vectors, and its center. It drops the deleted vectors and adds each insert to the cluster it was routed to.
-- A minor run clusters again every region that is due, most changed first. A region is a set of nearby clusters, and the number of regions is about the square root of the cluster count. The first run makes them with k-means over the cluster centers, apart from the build's groups, and the file's trailer keeps them. A region is due once its inserts and deletes since it was last clustered reach 10% of the vectors it had then, or once it shrinks by 20%. It is also due once one of its clusters grows past 8 times the mean cluster size or loses half its vectors. k-means runs over a region's 8-bit rows, and then each of its vectors moves to its nearest cluster in the whole file. Like the rebalancing of [SPFresh](https://arxiv.org/abs/2410.14452), it also checks the vectors of the 16 clusters outside the region nearest each new cluster, and moves those that are nearer a new cluster than their own.
+- A minor run clusters each due region again, most changed first. A region is a set of nearby clusters. The region count is about the square root of the cluster count. The first run makes the regions with k-means over the cluster centers, separately from the build's groups. The file's trailer keeps them. A region is due once its inserts and deletes since it was last clustered reach 10% of the vectors it had then. It is also due once it has shrunk by 20% since then. Similarly, it is due once one of its clusters grows past 8 times the mean cluster size or loses 1/2 of its vectors. k-means runs over a region's 8-bit rows. Then each of the region's vectors moves to its nearest cluster in the whole file. Like the rebalancing of [SPFresh](https://arxiv.org/abs/2410.14452), the run also checks the vectors of the 16 clusters outside the region nearest each new cluster. It moves those that are nearer a new cluster than their own.
 - A major run clusters every vector again.
 
-A due run is major once the inserts since the last major run reach that 25%. Otherwise it is minor when a region is due, and a fold when none is.
+A due run is major once the inserts since the last major run reach that 25%. Otherwise, it is minor when a region is due, and a fold when none is.
 
-`Writer::begin_compact` starts a due run as a job, which the application runs on any thread. A due run still waits 1 hour after the last run ended, or 10 times that run's length if that is longer. It also waits while one more run would take what runs wrote in the last 24 hours past twice the data file's size. The job's own threads run at low priority. A job writes in bursts of at most 2 MiB, each once no search has run for 100 ms. It ends each burst with a sync, so the drive is idle again by the next search. Once no search has run for 2 s, bursts grow to 16 MiB and run back to back. The job saves its progress every 64 MiB so that it can resume.
+[`Writer::begin_compact`](coldivf/src/lib.rs#L751) starts a due run as a job, which the application runs on any thread. A due run still waits 1 hour after the last run ended. If 10 times that run's length is longer, it waits that long instead. It also waits while one more run would push what runs wrote in the last 24 hours past twice the data file's size. The job's own threads run at low priority. A job writes in bursts of at most 2 MiB. Each burst starts once no search has run for 100 ms. The job ends each burst with a sync, thus the drive is idle again by the next search. Once no search has run for 2 s, bursts grow to 16 MiB and run back to back. The job saves its progress every 64 MiB so that it can resume.
 
-Changes made while a job runs stay in the old log, and its commit moves them to the new one. The first run makes a folder, `name.d`. From then on it holds each generation of the index, a data file and its log, and two root slots that name the current generation. A commit syncs the new files and the folder, then writes and syncs the slot that doesn't name the current generation. A crash before that write leaves the old generation current with every change. A slot that a crash tore fails its CRC32, so the other one stays current. Searches load the current generation without a lock, and an old generation is freed once no search holds it.
+Changes made while a job runs stay in the old log. The job's commit moves them to the new log. The first run makes a folder, `name.d`. From then on, the folder holds each generation of the index, a data file and its log. It also holds two root slots that name the current generation. A commit syncs the new files and the folder. Then it writes and syncs the slot that doesn't name the current generation. A crash before that write leaves the old generation current with every change. A slot that a crash tore fails its CRC32, thus the other one stays current. Searches load the current generation without a lock. An old generation is freed once no search holds it.
 
 ### Collections and Calibration
 
-`Collections` searches several index files as one. Every file's clusters go into one ranking. Each file measures the query from its own mean, with its own rotation. A route score still estimates the squared distance from the query to a center, so the scores of different files compare. The files must share a dimension and a metric. The nearest `nprobe` clusters overall are read in one batch across all the cold files, while warm files scan in place. On macOS and Linux the files' reads overlap. On other systems, eg. Windows, and on Mac file systems that refuse read hints, each file's reads run in turn. The best `rerank` candidates overall get one more batch of row reads. Each file rescores its own share, and then the hits merge. So `nprobe`, `rerank` and `reach` count across all the files. A search over several files costs a few batched reads instead of one cold query per file.
+[`Collections`](coldivf/src/lib.rs#L569) searches several index files as one. Every file's clusters go into one ranking. Each file measures the query from its own mean, with its own rotation. A route score still estimates the squared distance from the query to a center. Thus the scores of different files are comparable. The files must share a dimension and a metric. The nearest [`nprobe`](coldivf/src/lib.rs#L389) clusters overall are read in one batch across all the cold files. Warm files scan their clusters in place. On macOS and Linux, the files' reads overlap. On other systems, eg. Windows, each file's reads run in turn. They also run in turn on Mac file systems that refuse read hints. The best [`rerank`](coldivf/src/lib.rs#L391) candidates overall get one more batch of row reads. Each file rescores its own share, and then the hits merge. Thus, [`nprobe`](coldivf/src/lib.rs#L389), [`rerank`](coldivf/src/lib.rs#L391) and [`reach`](coldivf/src/lib.rs#L394) count across all the files. A search over several files costs a few batched reads instead of one cold query per file.
 
-`calibrate` picks the cheapest `nprobe`, `rerank` and `reach` that meet a recall target on sample queries with known neighbors. The target is a mean recall@10, or a share of queries that each reach a recall@10. Every setting reads the first clusters of one route, so one search per query measures 38 `nprobe` values and 28 `rerank` values. It scans the query's clusters nearest first and keeps a copy of the best 2,048 candidates after each `nprobe` it measures. Rescoring each copy, best estimate first, then gives the recall at every `rerank` depth on the way. A second search per query measures settings with a `reach` from 0.01 to 0.6, each reading at most 1.5 times the clusters of the cheapest fixed setting that met the target on half the queries. A setting's cost is the bytes it reads: its clusters' blocks plus one read page per rescored candidate, eg. 16 KiB on macOS. It tests the settings as [Learn then Test](https://arxiv.org/abs/2110.01052) does. It sorts them by how well they did on half the sample queries. Then it tests them in that order on the other half and stops at the first that fails. Of those that passed, it returns the cheapest, which meets the target with 90% confidence. A setting with a `reach` wins only when the cheapest fixed one costs at least 1.1 times as much.
+[`calibrate`](coldivf/src/lib.rs#L1132) picks the cheapest [`nprobe`](coldivf/src/lib.rs#L389), [`rerank`](coldivf/src/lib.rs#L391) and [`reach`](coldivf/src/lib.rs#L394) that meet a recall target on sample queries with known neighbors. The target is a mean recall@10, or a share of queries that each reach a recall@10. Every setting reads the first clusters of the same route. Thus one search per query measures 38 [`nprobe`](coldivf/src/lib.rs#L389) values and 28 [`rerank`](coldivf/src/lib.rs#L391) values. It scans the query's clusters nearest first. After each [`nprobe`](coldivf/src/lib.rs#L389) it measures, it keeps a copy of the best 2,048 candidates. Rescoring each copy, best estimate first, then gives the recall at every [`rerank`](coldivf/src/lib.rs#L391) depth on the way. A second search per query measures settings with a [`reach`](coldivf/src/lib.rs#L394) from 0.01 to 0.6. Each reads at most 1.5 times the clusters of the cheapest fixed setting that met the target on 1/2 of the queries. A setting's cost is the bytes it reads. These are its clusters' blocks plus one read page per rescored candidate, eg. 16 KiB on macOS. [`calibrate`](coldivf/src/lib.rs#L1132) tests the settings as [Learn then Test](https://arxiv.org/abs/2110.01052) does. It sorts them by how well they did on 1/2 of the sample queries. Then it tests them in that order on the remaining queries and stops at the first that fails. Of those that passed, it returns the cheapest, which meets the target with 90% confidence. A setting with a [`reach`](coldivf/src/lib.rs#L394) wins only when the cheapest fixed one costs at least 1.1 times as much.
 
 ## Benchmarks
 
-The data is [Cohere 10M](https://github.com/zilliztech/VectorDBBench) from VectorDBBench, 10M Cohere embeddings of 768 dimensions with 1,000 queries, from `https://assets.zilliz.com/benchmark/cohere_large_10m/`, with every vector scaled to length 1 for cosine. The 1M results use its first 1M rows.
+The data is [Cohere 10M](https://github.com/zilliztech/VectorDBBench) from VectorDBBench, 10M Cohere embeddings of 768 dimensions with 1,000 queries. It can be downloaded [here](https://assets.zilliz.com/benchmark/cohere_large_10m/). Every vector is scaled to length 1 for cosine.
 
-Every system ran on one Apple M3 Pro with 36 GB of memory and a 512 GB SSD, one at a time, at its cheapest setting that reaches each recall@10 target on 500 tuning queries, measured on 500 held-out queries. A cold query is a fresh process with the index dropped from the cache, and a warm one runs with every index file read into memory first. [coldivf-bench/py/README.md](coldivf-bench/py/README.md) describes the protocol.
+The systems ran one at a time on an Apple M3 Pro with 36 GB of memory and a 512 GB SSD. For each recall@10 target, every system ran at its cheapest setting that reaches the target on 500 tuning queries. We then measured that setting on 500 held-out queries. A cold query runs in a fresh process with the index dropped from the cache. A warm query runs with every index file read into memory first. [coldivf-bench/py/README.md](coldivf-bench/py/README.md) describes the protocol. In the system names, HNSW is a graph index and SQ8 is an 8-bit vector encoding.
 
 ## 1M Vectors
 
-The first 1M rows of Cohere 10M.
+The 1M results use the first 1M rows of Cohere 10M.
 
 ### Cold First Query
 
-ColdIVF has the fastest cold first query, 7.8 ms at recall@10 0.95 and 6.1 ms at 0.90. faiss with batched reads, a read path this harness added to faiss, comes within 10 to 13%, and every other system takes 2.7 to 580 times as long.
+ColdIVF has **the fastest cold first query**, 7.8 ms at recall@10 0.95 and 6.1 ms at 0.90. The next system, faiss with batched reads, comes within 10 to 13%. We added that read path to faiss for these benchmarks. Every other system takes 2.7 to 580 times as long.
 
 Each dot is a system's median and its line runs to the p99, on a log scale.
 
@@ -270,41 +509,39 @@ Each dot is a system's median and its line runs to the p99, on a log scale.
 <details>
 <summary>Every configuration, at each target</summary>
 
-### Disclaimer: This section is very AI generated.
-
-Every configuration each system ran, from `coldivf-bench/py/headtohead.py`, with ColdIVF's binaries as a control.
+These tables list every configuration each system ran, from [`coldivf-bench/py/headtohead.py`](coldivf-bench/py/headtohead.py), with ColdIVF's binaries as a control. They give throughput in QPS.
 
 **Recall@10 0.90**
 
-| System | Setting | Test Recall@10 | Warm p50 ms | QPS on 6 Threads | QPS on 12 Threads | QPS Method | C0 p50 ms | C0 p99 ms | C0 Trials (Queries) | C0 p50 at Exactly the Target ms |
-|---|---|---|---|---|---|---|---|---|---|---|
-| ColdIVF, binaries | nprobe 64, rerank 39 | 0.9212 | 0.205 | 20,101 | 20,159 | threads | 5.46 | 6.55 | 100 (50) | - |
-| ColdIVF | nprobe 64, rerank 39 | 0.9214 | 0.208 | 20,287 | 19,247 | threads | 6.12 | 7.86 | 100 (50) | - |
-| faiss IVF, batched reads, 2,560 per list | nprobe 12, k_factor 4 | 0.9048 | 1.10 | 4,606 | 6,027 | processes | 6.89 | 9.23 | 30 (30) | - |
-| faiss IVF, batched reads, 320 per list | nprobe 48, k_factor 4 | 0.9114 | 0.853 | 5,331 | 6,146 | processes | 8.54 | 11.7 | 30 (30) | - |
-| faiss IVF, on-disk lists, 2,560 per list | nprobe 12, k_factor 4 | 0.9048 | 1.11 | 5,175 | 5,822 | batch call | 13.7 | 37.5 | 30 (30) | - |
-| faiss IVF, on-disk lists, 320 per list | nprobe 48, k_factor 4 | 0.9114 | 0.996 | 6,485 | 7,980 | batch call | 16.3 | 54.1 | 30 (30) | - |
-| LanceDB IVF_RQ | nprobes 12, refine 4 | 0.9314 | 6.51 | 1,402 | 1,406 | threads | 18.7 | 44.6 | 30 (30) | - |
-| Paimon 4-bit | nprobe 48 | 0.9172 | 13.0 | 491 | 640 | batch call | 22.0 | 24.1 | 30 (30) | - |
-| DiskANN | list 48, beam 8 | 0.9186 | 0.450 | 7,334 | 9,330 | batch call | 22.5 | 25.8 | 30 (30) | - |
-| Paimon 8-bit | nprobe 24 | 0.9106 | 14.4 | 419 | 530 | batch call | 23.0 | 26.5 | 30 (30) | - |
-| faiss IVF, parallel, 320 per list | nprobe 48, k_factor 4 | 0.9114 | 0.736 | 4,745 | 3,636 | batch call | 32.2 | 37.8 | 30 (30) | - |
-| faiss IVF as shipped, 320 per list | nprobe 48, k_factor 4 | 0.9114 | 0.734 | 6,952 | 9,011 | batch call | 39.3 | 47.3 | 30 (30) | - |
-| faiss IVF, HNSW quantizer, 320 per list | nprobe 48, k_factor 4 | 0.9090 | 0.668 | 8,224 | 10,011 | batch call | 50.7 | 59.7 | 30 (30) | - |
-| RaBitQ-Library IVF 5-bit | nprobe 64 | 0.9178 | 0.476 | 11,240 | 14,270 | batch call | 126 | 133 | 30 (30) | - |
-| faiss FastScan + SQ8 | nprobe 48, k_factor 4 | 0.9108 | 0.565 | 8,841 | 11,843 | batch call | 171 | 180 | 30 (30) | - |
-| RaBitQ-Library IVF 9-bit | nprobe 48 | 0.9062 | 0.407 | 13,243 | 16,375 | batch call | 215 | 228 | 30 (30) | - |
-| RaBitQ-Library HNSW 4-bit | ef 128 | 0.9142 | 0.160 | 33,319 | 45,149 | batch call | 221 | 237 | 30 (30) | - |
-| AsterVec (warm 12 threads invalid) | ef 96 | 0.9200 | 4.23 | 991 | 870 | processes | 483 | 532 | 30 (30) | - |
-| faiss HNSW32-SQ8 | ef 48 | 0.9228 | 0.288 | 12,199 | 18,112 | batch call | 553 | 610 | 30 (30) | - |
-| usearch HNSW f16 | expansion 96 | 0.9204 | 0.601 | 7,698 | 10,749 | batch call | 584 | 849 | 30 (30) | - |
-| qdrant-edge (warm 12 threads invalid) | hnsw_ef 96, oversampling 2 | 0.9184 | 0.350 | 11,543 | 10,668 | processes | 1,004 | 1,048 | 30 (30) | - |
-| SymphonyQG | ef 64 | 0.9202 | 0.059 | 82,839 | 101,958 | batch call | 1,607 | 1,664 | 30 (30) | - |
-| sqlite-vec | none | 1.0000 | 438 | 3 | 2 | processes | 1,930 | 2,014 | 30 (30) | - |
-| flat scan | none | 1.0000 | 37.5 | 36 | 37 | threads | 3,537 | 3,668 | 30 (30) | - |
-| usearch HNSW i8 | not reached, best tune recall@10 0.8568 at expansion 1024 | | | | | | | | | |
-| turbovec 4-bit | not reached, best tune recall@10 0.8720 at none | | | | | | | | | |
-| turbovec 4-bit, calibrated | not reached, best tune recall@10 0.8988 at none | | | | | | | | | |
+| System | Setting | Test Recall@10 | Warm p50 ms | QPS on 6 Threads | QPS on 12 Threads | QPS Method | Cold p50 ms | Cold p99 ms | Cold Trials (Queries) |
+|---|---|---|---|---|---|---|---|---|---|
+| ColdIVF, binaries | nprobe 64, rerank 39 | 0.9212 | 0.205 | 20,101 | 20,159 | threads | 5.46 | 6.55 | 100 (50) |
+| ColdIVF | nprobe 64, rerank 39 | 0.9214 | 0.208 | 20,287 | 19,247 | threads | 6.12 | 7.86 | 100 (50) |
+| faiss IVF, batched reads, 2,560 per list | nprobe 12, k_factor 4 | 0.9048 | 1.10 | 4,606 | 6,027 | processes | 6.89 | 9.23 | 30 (30) |
+| faiss IVF, batched reads, 320 per list | nprobe 48, k_factor 4 | 0.9114 | 0.853 | 5,331 | 6,146 | processes | 8.54 | 11.7 | 30 (30) |
+| faiss IVF, on-disk lists, 2,560 per list | nprobe 12, k_factor 4 | 0.9048 | 1.11 | 5,175 | 5,822 | batch call | 13.7 | 37.5 | 30 (30) |
+| faiss IVF, on-disk lists, 320 per list | nprobe 48, k_factor 4 | 0.9114 | 0.996 | 6,485 | 7,980 | batch call | 16.3 | 54.1 | 30 (30) |
+| LanceDB IVF_RQ | nprobes 12, refine 4 | 0.9314 | 6.51 | 1,402 | 1,406 | threads | 18.7 | 44.6 | 30 (30) |
+| Paimon 4-bit | nprobe 48 | 0.9172 | 13.0 | 491 | 640 | batch call | 22.0 | 24.1 | 30 (30) |
+| DiskANN | list 48, beam 8 | 0.9186 | 0.450 | 7,334 | 9,330 | batch call | 22.5 | 25.8 | 30 (30) |
+| Paimon 8-bit | nprobe 24 | 0.9106 | 14.4 | 419 | 530 | batch call | 23.0 | 26.5 | 30 (30) |
+| faiss IVF, parallel, 320 per list | nprobe 48, k_factor 4 | 0.9114 | 0.736 | 4,745 | 3,636 | batch call | 32.2 | 37.8 | 30 (30) |
+| faiss IVF as shipped, 320 per list | nprobe 48, k_factor 4 | 0.9114 | 0.734 | 6,952 | 9,011 | batch call | 39.3 | 47.3 | 30 (30) |
+| faiss IVF, HNSW quantizer, 320 per list | nprobe 48, k_factor 4 | 0.9090 | 0.668 | 8,224 | 10,011 | batch call | 50.7 | 59.7 | 30 (30) |
+| RaBitQ-Library IVF 5-bit | nprobe 64 | 0.9178 | 0.476 | 11,240 | 14,270 | batch call | 126 | 133 | 30 (30) |
+| faiss FastScan + SQ8 | nprobe 48, k_factor 4 | 0.9108 | 0.565 | 8,841 | 11,843 | batch call | 171 | 180 | 30 (30) |
+| RaBitQ-Library IVF 9-bit | nprobe 48 | 0.9062 | 0.407 | 13,243 | 16,375 | batch call | 215 | 228 | 30 (30) |
+| RaBitQ-Library HNSW 4-bit | ef 128 | 0.9142 | 0.160 | 33,319 | 45,149 | batch call | 221 | 237 | 30 (30) |
+| AsterVec (warm 12 threads invalid) | ef 96 | 0.9200 | 4.23 | 991 | 870 | processes | 483 | 532 | 30 (30) |
+| faiss HNSW32-SQ8 | ef 48 | 0.9228 | 0.288 | 12,199 | 18,112 | batch call | 553 | 610 | 30 (30) |
+| usearch HNSW f16 | expansion 96 | 0.9204 | 0.601 | 7,698 | 10,749 | batch call | 584 | 849 | 30 (30) |
+| qdrant-edge (warm 12 threads invalid) | hnsw_ef 96, oversampling 2 | 0.9184 | 0.350 | 11,543 | 10,668 | processes | 1,004 | 1,048 | 30 (30) |
+| SymphonyQG | ef 64 | 0.9202 | 0.059 | 82,839 | 101,958 | batch call | 1,607 | 1,664 | 30 (30) |
+| sqlite-vec | none | 1.0000 | 438 | 3 | 2 | processes | 1,930 | 2,014 | 30 (30) |
+| flat scan | none | 1.0000 | 37.5 | 36 | 37 | threads | 3,537 | 3,668 | 30 (30) |
+| usearch HNSW i8 | not reached, best tune recall@10 0.8568 at expansion 1024 | | | | | | | | |
+| turbovec 4-bit | not reached, best tune recall@10 0.8720 at none | | | | | | | | |
+| turbovec 4-bit, calibrated | not reached, best tune recall@10 0.8988 at none | | | | | | | | |
 
 | System | Setting | Open and First Query: Process + Index Pages | Warm Mode | Warm: Process + Cached Pages | Build Minutes | Build Peak | Build Malloc Cache | Index Size | Bytes per Vector |
 |---|---|---|---|---|---|---|---|---|---|
@@ -335,7 +572,7 @@ Every configuration each system ran, from `coldivf-bench/py/headtohead.py`, with
 
 **Recall@10 0.95**
 
-| System | Setting | Test Recall@10 | Warm p50 ms | QPS on 6 Threads | QPS on 12 Threads | QPS Method | C0 p50 ms | C0 p99 ms | C0 Trials (Queries) | C0 p50 at Exactly the Target ms |
+| System | Setting | Test Recall@10 | Warm p50 ms | QPS on 6 Threads | QPS on 12 Threads | QPS Method | Cold p50 ms | Cold p99 ms | Cold Trials (Queries) | Cold p50 at Exactly the Target ms |
 |---|---|---|---|---|---|---|---|---|---|---|
 | ColdIVF, binaries | nprobe 128, rerank 64 | 0.9608 | 0.345 | 12,151 | 11,588 | threads | 7.18 | 9.09 | 300 (50) | 6.81 |
 | ColdIVF | nprobe 128, rerank 64 | 0.9610 | 0.348 | 12,209 | 11,305 | threads | 7.83 | 10.1 | 300 (50) | 7.51 |
@@ -394,9 +631,9 @@ Every configuration each system ran, from `coldivf-bench/py/headtohead.py`, with
 
 ### ColdIVF's Cold First Query in Each Setup
 
-Against itself, on Cohere 1M through its release binaries, ColdIVF's first query takes 5.8 to 7.5 ms in every setup, and reading its file another way takes 3.4 to 32 times as long.
+These runs compare ColdIVF with itself, through its release binaries on Cohere 1M. Its first query takes 5.8 to 7.5 ms in every setup. The controls, which read its file another way, take 3.4 to 32 times as long.
 
-Each dot is a system's median and its line runs to the p99, on a log scale.
+Each dot is a setup's median and its line runs to the p99, on a log scale.
 
 ![Dots at the cold first query's p50 with lines to the p99 for ColdIVF in each setup: through the driver, its own harness on a prewarmed and an idle core, after a search of another index, with thread-pool reads, and the lazy map and whole-file controls](docs/charts/cold-coldivf-dark.svg)
 
@@ -405,13 +642,13 @@ Each dot is a system's median and its line runs to the p99, on a log scale.
 
 | System | Setting | Recall@10 | Trials | Cold p50 | Cold p95 | Cold p99 | p50 Against ColdIVF |
 |---|---|---|---|---|---|---|---|
-| **ColdIVF with thread-pool reads, prewarmed core**<br>Reads its clusters with blocking reads on a pool of threads, instead of the read hints its default reader issues from the calling thread. | nprobe 96, rerank 35 | 0.951 | 99 | 5.84 ms | 6.88 ms | 8.17 ms | 0.93x |
-| **ColdIVF, through the driver**<br>The benchmark driver runs ColdIVF's cold binary as it runs every system, a fresh process per trial with the index dropped from the cache. | nprobe 96, rerank 35 | 0.951 | 100 | 6.26 ms | 7.93 ms | 30.3 ms | 1.00x |
-| **ColdIVF, own harness, prewarmed core**<br>ColdIVF's own cold binary, which drops the index from the cache and times the open and the first search. The core spins for 150 ms first, so the query starts at full speed on a performance core. | nprobe 96, rerank 35 | 0.951 | 300 | 6.48 ms | 8.04 ms | 9.02 ms | 1.03x |
-| **ColdIVF after a search of another index, prewarmed core**<br>The process first searches a separate 50K-vector index, as an app that has searched before would, so its code and reader are warm. | nprobe 96, rerank 35 | 0.951 | 100 | 6.78 ms | 8.31 ms | 9.56 ms | 1.08x |
-| **ColdIVF, own harness, idle core**<br>As the own harness, but the core sleeps 200 ms first, so the query can start slow or on an efficiency core. | nprobe 96, rerank 35 | 0.951 | 300 | 7.09 ms | 8.92 ms | 30.8 ms | 1.13x |
+| **ColdIVF with thread-pool reads, prewarmed core**<br>Reads its clusters with blocking reads on a pool of threads. Its default reader instead issues read hints from the calling thread. | nprobe 96, rerank 35 | 0.951 | 99 | 5.84 ms | 6.88 ms | 8.17 ms | 0.93x |
+| **ColdIVF, through the driver**<br>The benchmark driver runs ColdIVF's cold binary as it runs every system. Each trial is a fresh process with the index dropped from the cache. | nprobe 96, rerank 35 | 0.951 | 100 | 6.26 ms | 7.93 ms | 30.3 ms | 1.00x |
+| **ColdIVF, own harness, prewarmed core**<br>ColdIVF's own cold binary, which drops the index from the cache and times the open and the first search. The core spins for 150 ms first, thus the query starts at full speed on a performance core. | nprobe 96, rerank 35 | 0.951 | 300 | 6.48 ms | 8.04 ms | 9.02 ms | 1.03x |
+| **ColdIVF after a search of another index, prewarmed core**<br>The process first searches a separate 50K-vector index, as an application that has searched before would. Thus its program code and reader are warm. | nprobe 96, rerank 35 | 0.951 | 100 | 6.78 ms | 8.31 ms | 9.56 ms | 1.08x |
+| **ColdIVF, own harness, idle core**<br>ColdIVF's own harness, but the core sleeps 200 ms first, thus the query can start slowly or on an efficiency core. | nprobe 96, rerank 35 | 0.951 | 300 | 7.09 ms | 8.92 ms | 30.8 ms | 1.13x |
 | **ColdIVF after a search of another index, idle core**<br>The search of another index first, then the query from an idle core. | nprobe 96, rerank 35 | 0.951 | 100 | 7.49 ms | 9.15 ms | 10.1 ms | 1.20x |
-| **ColdIVF's file, lazily mapped, prewarmed core (control)**<br>A control that searches the same file through a memory map, which reads each page when the search first touches it, instead of in batches. | nprobe 128, rerank 29 | 0.957 | 100 | 24.6 ms | 38.5 ms | 67.4 ms | 3.53x |
+| **ColdIVF's file, lazily mapped, prewarmed core (control)**<br>A control that searches the same file through a memory map. The map reads each page when the search first touches it, instead of in batches. | nprobe 128, rerank 29 | 0.957 | 100 | 24.6 ms | 38.5 ms | 67.4 ms | 3.53x |
 | **ColdIVF's file, lazily mapped, idle core (control)**<br>The same lazy map, with the query from an idle core. | nprobe 128, rerank 29 | 0.957 | 100 | 25.6 ms | 33.5 ms | 57.3 ms | 3.41x |
 | **ColdIVF's file read whole at open, prewarmed core (control)**<br>A control that reads the whole 953 MB file into memory at open, then searches it. | nprobe 96, rerank 35 | 0.951 | 100 | 198 ms | 202 ms | 206 ms | 31.78x |
 
@@ -419,7 +656,7 @@ Each dot is a system's median and its line runs to the p99, on a log scale.
 
 ### Warm Query
 
-Warm, ColdIVF is second at recall@10 0.95 and third at 0.90, behind only graphs held in memory, SymphonyQG and, at 0.90, RaBitQ HNSW, and ahead of every other inverted-file and disk index.
+On warm queries, ColdIVF is second at recall@10 0.95 and third at 0.90. Only graphs held in memory rank above it: SymphonyQG at both targets and RaBitQ-Library's HNSW graph at 0.90. It is ahead of every other inverted-file and disk index.
 
 Each dot is a system's median at 1 thread and its line runs to the p99, on a log scale.
 
@@ -427,9 +664,11 @@ Each dot is a system's median at 1 thread and its line runs to the p99, on a log
 
 ![Dots at each system's warm-query p50 at 1 thread with lines to the p99 at recall@10 0.90 on 1M vectors, one row per system, with ColdIVF in blue](docs/charts/warm-1m-90-dark.svg)
 
-The next chart ranks the systems by queries per second on the 6 performance cores.
+Each dot is a system's queries per second on 6 threads, on a log scale. The columns give the values on 6 and 12 threads.
 
-![Ranked lists of each system's queries per second on 6 threads at recall@10 0.90 and 0.95 on 1M vectors, with ColdIVF in blue](docs/charts/qps-1m-dark.svg)
+![Dots at each system's queries per second on 6 threads at recall@10 0.95 on 1M vectors, with columns for 6 and 12 threads, one row per system, with ColdIVF in blue](docs/charts/qps-1m-95-dark.svg)
+
+![Dots at each system's queries per second on 6 threads at recall@10 0.90 on 1M vectors, with columns for 6 and 12 threads, one row per system, with ColdIVF in blue](docs/charts/qps-1m-90-dark.svg)
 
 <details>
 <summary>Warm query at 1M, by system</summary>
@@ -456,13 +695,13 @@ The next chart ranks the systems by queries per second on the 6 performance core
 
 ### Memory and Build
 
-ColdIVF's open and first query add 16 MB, the second least, and warm it holds 1.0 GB, about the size of its index.
+ColdIVF's open and first query add 16 MB, the second least. When warm, ColdIVF holds 1.0 GB, about the size of its index.
 
-Light grey is process memory and dark grey the index's pages in the page cache, with ColdIVF in blue.
+Light gray is process memory and dark gray is the index's pages in the page cache. ColdIVF is in blue.
 
 ![Each system's memory at 1M vectors, what the open and the first cold query add and what a warm index holds, as process memory and cached index pages](docs/charts/memory-1m-dark.svg)
 
-ColdIVF's build peaks at 359 MB, less than every system but the two exact scans, and its index takes 946 bytes per vector.
+ColdIVF's build peaks at 359 MB, less than every system except the two exact scans. Its index takes 946 bytes per vector.
 
 ![Each system's build peak and index bytes per vector at 1M vectors](docs/charts/build-1m-dark.svg)
 
@@ -492,11 +731,11 @@ ColdIVF's build peaks at 359 MB, less than every system but the two exact scans,
 
 ## 10M Vectors
 
-All 10M rows of Cohere 10M, for every system that fits in this Mac's memory.
+Every system that fits in this Mac's memory ran on all 10M rows of Cohere 10M.
 
 ### Cold First Query
 
-ColdIVF has the fastest cold first query, 7.9 ms at recall@10 0.90 and 11.2 ms at 0.95. The next system, faiss with batched reads, takes 2.4 and 2.1 times as long, LanceDB 3.7 and 2.8 times, and the rest up to 680 times.
+ColdIVF has **the fastest cold first query**, 7.9 ms at recall@10 0.90 and 11.2 ms at 0.95. The next system, faiss with batched reads, takes 2.4 and 2.1 times as long. LanceDB takes 3.7 and 2.8 times as long, and the rest up to 680 times.
 
 Each dot is a system's median and its line runs to the p99, on a log scale.
 
@@ -539,11 +778,11 @@ Each dot is a system's median and its line runs to the p99, on a log scale.
 <details>
 <summary>Every configuration, at each target</summary>
 
-Every configuration each system ran, from `coldivf-bench/py/headtohead.py`, with ColdIVF's binaries as a control.
+These tables list every configuration each system ran, from [`coldivf-bench/py/headtohead.py`](coldivf-bench/py/headtohead.py), with ColdIVF's binaries as a control.
 
 **Recall@10 0.90**
 
-| System | Setting | Test Recall@10 | Warm p50 ms | QPS on 6 Threads | QPS on 12 Threads | QPS Method | C0 p50 ms | C0 p99 ms | C0 Trials (Queries) | C0 p50 at Exactly the Target ms |
+| System | Setting | Test Recall@10 | Warm p50 ms | QPS on 6 Threads | QPS on 12 Threads | QPS Method | Cold p50 ms | Cold p99 ms | Cold Trials (Queries) | Cold p50 at Exactly the Target ms |
 |---|---|---|---|---|---|---|---|---|---|---|
 | ColdIVF, binaries | nprobe 64, rerank 29 | 0.9070 | 0.417 | 11,061 | 12,006 | threads | 7.02 | 8.40 | 100 (50) | 6.93 |
 | ColdIVF | nprobe 64, rerank 29 | 0.9070 | 0.418 | 11,340 | 11,605 | threads | 7.89 | 9.17 | 100 (50) | 7.56 |
@@ -589,7 +828,7 @@ Every configuration each system ran, from `coldivf-bench/py/headtohead.py`, with
 
 **Recall@10 0.95**
 
-| System | Setting | Test Recall@10 | Warm p50 ms | QPS on 6 Threads | QPS on 12 Threads | QPS Method | C0 p50 ms | C0 p99 ms | C0 Trials (Queries) | C0 p50 at Exactly the Target ms |
+| System | Setting | Test Recall@10 | Warm p50 ms | QPS on 6 Threads | QPS on 12 Threads | QPS Method | Cold p50 ms | Cold p99 ms | Cold Trials (Queries) | Cold p50 at Exactly the Target ms |
 |---|---|---|---|---|---|---|---|---|---|---|
 | ColdIVF, binaries | nprobe 192, rerank 39 | 0.9534 | 0.809 | 4,977 | 4,866 | threads | 10.4 | 12.7 | 300 (50) | 9.83 |
 | ColdIVF | nprobe 192, rerank 39 | 0.9534 | 0.816 | 5,325 | 4,938 | threads | 11.2 | 13.1 | 300 (50) | 10.6 |
@@ -636,7 +875,7 @@ Every configuration each system ran, from `coldivf-bench/py/headtohead.py`, with
 
 ### Warm Query
 
-ColdIVF answers warm queries second fastest at both targets, behind faiss HNSW, a graph held in memory, and it serves the most queries per second of any system at 0.90.
+ColdIVF answers warm queries second fastest at both targets, behind faiss HNSW, a graph held in memory. On 6 threads at 0.90, ColdIVF serves the most queries per second of any system.
 
 Each dot is a system's median at 1 thread and its line runs to the p99, on a log scale.
 
@@ -644,9 +883,11 @@ Each dot is a system's median at 1 thread and its line runs to the p99, on a log
 
 ![Dots at each system's warm-query p50 at 1 thread with lines to the p99 at recall@10 0.90 on 10M vectors, one row per system, with ColdIVF in blue](docs/charts/warm-10m-90-dark.svg)
 
-The next chart ranks the systems by queries per second on the 6 performance cores.
+Each dot is a system's queries per second on 6 threads, on a log scale. The columns give the values on 6 and 12 threads.
 
-![Ranked lists of each system's queries per second on 6 threads at recall@10 0.90 and 0.95 on 10M vectors, with ColdIVF in blue](docs/charts/qps-10m-dark.svg)
+![Dots at each system's queries per second on 6 threads at recall@10 0.95 on 10M vectors, with columns for 6 and 12 threads, one row per system, with ColdIVF in blue](docs/charts/qps-10m-95-dark.svg)
+
+![Dots at each system's queries per second on 6 threads at recall@10 0.90 on 10M vectors, with columns for 6 and 12 threads, one row per system, with ColdIVF in blue](docs/charts/qps-10m-90-dark.svg)
 
 <details>
 <summary>Warm query at 10M, by system</summary>
@@ -668,13 +909,13 @@ The next chart ranks the systems by queries per second on the 6 performance core
 
 ### Memory and Build
 
-ColdIVF's open and first query add 20 MB at recall@10 0.90, the least of any system, and 47 MB at 0.95, and warm it holds 9.5 GB, about the size of its index.
+ColdIVF's open and first query add 20 MB at recall@10 0.90, the least of any system. At 0.95, they add 47 MB. When warm, ColdIVF holds 9.5 GB, about the size of its index.
 
-Light grey is process memory and dark grey the index's pages in the page cache, with ColdIVF in blue.
+Light gray is process memory and dark gray is the index's pages in the page cache. ColdIVF is in blue.
 
 ![Each system's memory at 10M vectors, what the open and the first cold query add and what a warm index holds, as process memory and cached index pages](docs/charts/memory-10m-dark.svg)
 
-ColdIVF's build peaks at 0.84 GB, the lowest here, and its index takes 943 bytes per vector.
+ColdIVF's build peaks at 0.84 GB, the lowest here. Its index takes 943 bytes per vector.
 
 ![Each system's build peak and index bytes per vector at 10M vectors](docs/charts/build-10m-dark.svg)
 
@@ -698,14 +939,31 @@ ColdIVF's build peaks at 0.84 GB, the lowest here, and its index takes 943 bytes
 
 ### Not Run at 10M
 
-The other systems took too much memory to run at 10M on this Mac's 36 GB: qdrant-edge, SymphonyQG, AsterVec, RaBitQ HNSW, sqlite-vec, the flat scan, and faiss HNSW, RaBitQ-Library IVF and usearch over full-precision rows.
+The other systems took too much memory to run at 10M on this Mac's 36 GB. They are qdrant-edge, SymphonyQG, AsterVec, RaBitQ-Library HNSW, sqlite-vec and the flat scan, plus faiss HNSW, RaBitQ-Library IVF and usearch over full-precision rows.
 
-## Caveats
+## Caveats / Observations
 
-- ColdIVF runs through its Python module, as every other system runs through its binding, and its release binaries ran beside each system as a control.
-- faiss with batched reads is a read path this harness added to faiss. faiss's own setups take 2.7 times ColdIVF's cold time or more at 1M, and 3.1 times or more at 10M.
-- ColdIVF was tuned on Cohere 1M, which shares 9.8% of the 1M set's rows, and its own setups above ran on Cohere 1M.
-- ColdIVF doesn't reach recall@10 0.99, so the comparisons stop at 0.95.
-- LanceDB's warm memory leaves its table on disk, and at 10M the build peaks of the systems other than ColdIVF, turbovec and DiskANN include memory that macOS kept after it was freed.
-- DiskANN's 10M index is 41.9 GB, more than this Mac's memory, so its warm queries read from the SSD and its warm memory is its process alone.
-- DiskANN's 10M graph was built on 192-byte product quantization (PQ) codes, since a build on its full vectors doesn't fit the 16 GB each job may use. On the first 1M rows its recall@10 came within 0.004 of the full-vector build's.
+- ColdIVF runs through its Python module, just as every other system runs through its binding. Its release binaries ran beside each system as a control.
+- faiss with batched reads is a read path that we added to faiss. At 1M, faiss's own setups take at least 2.2 times ColdIVF's cold time. At 10M, they take at least 2.8 times.
+- ColdIVF was tuned on Cohere 1M, which shares 9.8% of the first 1M rows of Cohere 10M. Its own setups above also ran on Cohere 1M.
+- ColdIVF doesn't reach recall@10 0.99, thus the comparisons stop at 0.95.
+- LanceDB's warm memory leaves its table on disk. At 10M, the build peaks include memory that macOS kept after it was freed. The exceptions are ColdIVF, turbovec and DiskANN.
+- DiskANN's 10M index is 41.9 GB, more than this Mac's memory. Thus, its warm queries read from the SSD and its warm memory is its process alone.
+- Since a full-vector DiskANN build at 10M doesn't fit the 16 GB each job may use, its graph was built on 192-byte PQ codes. On the first 1M rows, a PQ build's recall@10 came within 0.004 of the full-vector build's.
+- ColdIVF gains little from 12 threads over 6, likely because of the test Mac. Its queries per second change by −7.4% to +2.3% from 6 to 12 threads, and those of its release binaries by −4.6% to +8.5%. The M3 Pro has 6 performance cores and 6 slower efficiency cores, thus threads 7 to 12 run on the efficiency cores. Every core shares the memory bandwidth, and each warm ColdIVF query reads ~2.2 MB of 1-bit codes at 1M and recall@10 0.90. Thus the extra threads add memory traffic but little throughput. The graph indexes held in memory, eg. faiss HNSW and SymphonyQG, gain 23% to 54%, since they wait on memory latency more than on bandwidth. We haven't profiled this, nor run it on a machine with 12 equal cores.
+- Some p99s spike well above the p95. The most common spike is a stall of ~25 ms in a cold query's reads, eg. ColdIVF through the driver has a p95 of 7.93 ms but a p99 of 30.3 ms. The stall matches macOS's 25 ms throttle window for lower-priority disk I/O, thus macOS's I/O throttling is its likely cause. It hit 3.5% of the trials of faiss IVF with prefetch threads, and 1% to 4% of ColdIVF's trials in its own harness. Other slow trials vary more widely, and their causes weren't studied. Since each setting ran only 21 to 300 trials, its p99 is set by its slowest few trials. Future work is to rerun these benchmarks to a more rigorous standard, with more trials and the throttling traced.
+
+## Disclosure
+
+- ColdIVF is a fun personal project that I have been working on.
+- The results weren't measured with full scientific rigor. They are my general findings.
+- Most of the ideas are my own, combined with the papers and other people's work that this README cites.
+- The implementation was written in part with Claude Code.
+
+## License
+
+Licensed under either the [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0) or the [MIT License](https://opensource.org/license/mit), at your option.
+
+## Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

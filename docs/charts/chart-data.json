@@ -4233,1343 +4233,2423 @@
    }
   },
   {
-   "id": "qps-1m",
+   "id": "qps-1m-95",
    "kind": "h2h-qps",
-   "title": "Queries per second at 1M vectors, 6 threads",
-   "unit": "queries per second",
+   "title": "Queries per second at 1M vectors, recall@10 0.95",
    "dataset": "cohere10m-768-cosine",
    "n": 1000000,
+   "unit": "queries per second",
+   "target_recall10": 0.95,
    "preliminary": false,
-   "not_reached_text": "Not reached",
-   "layout": {
-    "label_w": 276.0,
-    "plot_w": 372.0,
-    "value_w": 60.0
-   },
-   "subtitle": "The first 1M rows of cohere10m-768-cosine (Cohere 10M, 768 dimensions, cosine, 1,000 queries), on one Apple M3 Pro with 36 GB of memory. Each panel ranks the systems by queries per second on 6 threads, the M3 Pro's performance cores, at their pick for one recall@10 target, the median of 3 runs of 10 s each. Higher is faster. The panels share one log scale.",
-   "footer": "SymphonyQG, RaBitQ HNSW 4-bit, RaBitQ IVF 9-bit, faiss HNSW SQ8, faiss FastScan, faiss graph route, usearch HNSW f16, DiskANN, Paimon 4-bit and Paimon 8-bit search through a call for a batch of queries that releases Python's lock. qdrant-edge, AsterVec and sqlite-vec search from 6 processes, and ColdIVF, LanceDB IVF_RQ and flat scan from 6 threads in one process. ColdIVF's module has no batch call.",
-   "boards": [
+   "legend": [
+    "ColdIVF",
+    "Other systems"
+   ],
+   "subtitle": "The first 1M rows of cohere10m-768-cosine (Cohere 10M, 768 dimensions, cosine, 1,000 queries), on one Apple M3 Pro with 36 GB of memory. Each dot is a system's queries per second on 6 threads, the M3 Pro's performance cores, with every index read into memory first. The columns give them on 6 threads and on 12, as many as the M3 Pro has cores. Each is the median of 3 runs of 10 s each, which keep no time per query, so a dot has no line to a p99. Each system runs at its pick for recall@10 0.95, whose recall over the 500 test queries at 1 thread is 0.953 to 1.000. Higher is faster. Log scale.",
+   "footer": "SymphonyQG, faiss HNSW SQ8, RaBitQ IVF 9-bit, faiss FastScan, DiskANN, faiss graph route, usearch HNSW f16 and Paimon 8-bit search through a call for a batch of queries that releases Python's lock. qdrant-edge, AsterVec and sqlite-vec search from 6 processes, and ColdIVF, LanceDB IVF_RQ and flat scan from 6 threads in one process. ColdIVF's module has no batch call.",
+   "notes": [
+    "Each row is headtohead.py's pick for the target, pick.py's verdict rule on the tune split, measured on the test split. Of a system's configurations it is the one with the most queries per second on 6 threads, which can differ from the ones its cold and warm charts show, and ColdIVF's is its Python module's.",
+    "invalid lists the thread counts, of 6 and 12, whose line swap-ins or compressions elsewhere on the machine made invalid. The chart writes (invalid) after such a 12-thread number, as the README's tables flag such a line, and a dash for a row without a 12-thread line.",
+    "mode, machine_state and code are those of the 6-thread line, and machine_state_12 and code_12 those of the 12-thread line, or null without one."
+   ],
+   "rows": [
     {
-     "recall10": 0.9,
-     "rows": [
-      {
-       "system": "symphonyqg",
-       "variant": "",
-       "label": "SymphonyQG",
-       "full_label": "SymphonyQG",
-       "config_id": "default",
-       "qps": 82839.09,
-       "setting": {
-        "ef": 64
-       },
-       "recall10": 0.9202,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "ef 64",
-       "source": "results/bench/bench-1m/symphonyqg.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261012T011723Z-bench-1m-c67e"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         88.215,
-         88.215
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         9.774902,
-         9.774902
-        ]
-       },
-       "code": {
-        "system_version": "0.5.2",
-        "wheel_sha256": {
-         "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
+     "label": "SymphonyQG",
+     "short": "SymphonyQG",
+     "group": "system",
+     "harness": "driver",
+     "system": "symphonyqg",
+     "variant": "",
+     "config_id": "default",
+     "setting": {
+      "ef": 128
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "ef 128",
+     "qps": 51620.02,
+     "qps_12": 65967.3,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9572,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/symphonyqg.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261012T011723Z-bench-1m-c67e"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       88.215,
+       88.215
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       4.44873,
+       4.44873
+      ]
+     },
+     "code": {
+      "system_version": "0.5.2",
+      "wheel_sha256": {
+       "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
       },
-      {
-       "system": "rabitq-hnsw",
-       "variant": "",
-       "label": "RaBitQ HNSW 4-bit",
-       "full_label": "RaBitQ-Library HNSW 4-bit",
-       "config_id": "b4",
-       "qps": 33318.97,
-       "setting": {
-        "ef": 128
-       },
-       "recall10": 0.9142,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "ef 128",
-       "source": "results/bench/bench-1m/rabitq-hnsw.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261012T005537Z-bench-1m-f03b"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         88.12,
-         88.12
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         3.977539,
-         3.977539
-        ]
-       },
-       "code": {
-        "system_version": "0.5.2",
-        "wheel_sha256": {
-         "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261012T011723Z-bench-1m-c67e"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       88.215,
+       88.215
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       12.41211,
+       12.41211
+      ]
+     },
+     "code_12": {
+      "system_version": "0.5.2",
+      "wheel_sha256": {
+       "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
       },
-      {
-       "system": "coldivf",
-       "variant": "python",
-       "label": "ColdIVF",
-       "full_label": "ColdIVF",
-       "config_id": "tl320",
-       "qps": 20286.73,
-       "setting": {
-        "nprobe": 64,
-        "rerank": 39
-       },
-       "recall10": 0.9214,
-       "mode": "whole",
-       "method": "threads",
-       "invalid": [],
-       "setting_text": "nprobe 64, rerank 39",
-       "source": "results/bench/bench-1m/coldivf.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T125349Z-bench-1m-43b5"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.225,
-         89.225
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         4.94873,
-         4.94873
-        ]
-       },
-       "code": {
-        "system_version": "coldivf 0.1.0",
-        "wheel_sha256": {
-         "coldivf": "d558d78016ea5764e9da605ae36f56f846de5d6e6ab16d688b09ff1f78c03706",
-         "build_index": "7fe84ea102df6aafb2ef8ff93e1d0680a112280b76ae04ba60460cdae70064c1"
-        },
-        "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "rabitq-ivf",
-       "variant": "",
-       "label": "RaBitQ IVF 9-bit",
-       "full_label": "RaBitQ-Library IVF 9-bit",
-       "config_id": "cp320-b9",
-       "qps": 13243.06,
-       "setting": {
-        "nprobe": 48
-       },
-       "recall10": 0.9062,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 48",
-       "source": "results/bench/bench-1m/rabitq-ivf.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T220230Z-bench-1m-2e76"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.145,
-         89.145
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         5.319336,
-         5.319336
-        ]
-       },
-       "code": {
-        "system_version": "0.5.2",
-        "wheel_sha256": {
-         "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "faiss-hnsw",
-       "variant": "",
-       "label": "faiss HNSW SQ8",
-       "full_label": "faiss HNSW32-SQ8",
-       "config_id": "hnsw32-sq8",
-       "qps": 12198.67,
-       "setting": {
-        "ef_search": 48
-       },
-       "recall10": 0.9228,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "ef 48",
-       "source": "results/bench/bench-1m/faiss-hnsw.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T200725Z-bench-1m-be13"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         87.805,
-         87.805
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         22.27344,
-         22.27344
-        ]
-       },
-       "code": {
-        "system_version": "1.15.1",
-        "wheel_sha256": {
-         "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "qdrant-edge",
-       "variant": "",
-       "label": "qdrant-edge",
-       "full_label": "qdrant-edge",
-       "config_id": "default",
-       "qps": 11543.45,
-       "setting": {
-        "hnsw_ef": 96,
-        "oversampling": 2
-       },
-       "recall10": 0.9184,
-       "mode": "whole",
-       "method": "processes",
-       "invalid": [],
-       "setting_text": "hnsw_ef 96, oversampling 2",
-       "source": "results/bench/bench-1m/qdrant-edge.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T223859Z-bench-1m-3e92"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         91.01,
-         91.01
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         9.161133,
-         9.161133
-        ]
-       },
-       "code": {
-        "system_version": "0.8.0",
-        "wheel_sha256": {
-         "qdrant-edge-py": "634dc23f4f74ad9d9858954e435d580a58254eba843258164bdd067240cffc72"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "faiss-fastscan",
-       "variant": "fastscan",
-       "label": "faiss FastScan",
-       "full_label": "faiss FastScan + SQ8",
-       "config_id": "cp320-rq1",
-       "qps": 8841.488,
-       "setting": {
-        "nprobe": 48,
-        "k_factor": 4,
-        "qb": 8
-       },
-       "recall10": 0.9108,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 48, k_factor 4, qb 8",
-       "source": "results/bench/bench-1m/faiss-fastscan.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T213132Z-bench-1m-e452"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.51,
-         89.51
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         13.08594,
-         13.08594
-        ]
-       },
-       "code": {
-        "system_version": "1.15.1",
-        "wheel_sha256": {
-         "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "faiss-ivf",
-       "variant": "graph",
-       "label": "faiss graph route",
-       "full_label": "faiss IVF, HNSW quantizer, 320 per list",
-       "config_id": "cp320-rq1-hnsw32",
-       "qps": 8224.361,
-       "setting": {
-        "nprobe": 48,
-        "k_factor": 4,
-        "qb": 4,
-        "quantizer_ef": 128
-       },
-       "recall10": 0.909,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 48, k_factor 4, qb 4, quantizer_ef 128",
-       "source": "results/bench/bench-1m/faiss-ivf.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T172725Z-bench-1m-9058"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         91.825,
-         91.825
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         10.56836,
-         10.56836
-        ]
-       },
-       "code": {
-        "system_version": "1.15.1",
-        "wheel_sha256": {
-         "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
-        },
-        "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "usearch",
-       "variant": "",
-       "label": "usearch HNSW f16",
-       "full_label": "usearch HNSW f16",
-       "config_id": "f16-m16",
-       "qps": 7697.942,
-       "setting": {
-        "expansion_search": 96
-       },
-       "recall10": 0.9204,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "expansion 96",
-       "source": "results/bench/bench-1m/usearch.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T204917Z-bench-1m-9e2a"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         91.08,
-         91.08
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         8.428711,
-         8.428711
-        ]
-       },
-       "code": {
-        "system_version": "2.26.4",
-        "wheel_sha256": {
-         "usearch": "cb9b8fc39446d90294ee7e4bc7c7423da21057af0152c308f5bb42ce937b59d5",
-         "numkong": "703dd6c8c023b5f37b4f78f5884f5cfc7d93b665f19fb710fbcc52c0a8d0ba96"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "diskann",
-       "variant": "",
-       "label": "DiskANN",
-       "full_label": "DiskANN",
-       "config_id": "default",
-       "qps": 7334.317,
-       "setting": {
-        "list": 48,
-        "beam": 8
-       },
-       "recall10": 0.9186,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "list 48, beam 8",
-       "source": "results/bench/bench-1m/diskann.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T175824Z-bench-1m-9999"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         88.945,
-         88.945
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         68.52734,
-         68.52734
-        ]
-       },
-       "code": {
-        "system_version": "diskann 0.60.0, diskann3 0.1.0+8f2c7b0a216d",
-        "wheel_sha256": {
-         "libdiskann3": "8f2c7b0a216d99db02e9e3a4138d694fbf01015b0fea3538fcfef4ee3225756d",
-         "diskann3": "a1020337c5685528485c7e9977eae9180d183406fab3d9fecc0efd49efd7fa01"
-        },
-        "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "lancedb",
-       "variant": "",
-       "label": "LanceDB IVF_RQ",
-       "full_label": "LanceDB IVF_RQ",
-       "config_id": "rq1-default",
-       "qps": 1401.64,
-       "setting": {
-        "nprobes": 12,
-        "refine_factor": 4
-       },
-       "recall10": 0.9314,
-       "mode": "whole",
-       "method": "threads",
-       "invalid": [],
-       "setting_text": "nprobes 12, refine 4",
-       "source": "results/bench/bench-1m/lancedb.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T134212Z-bench-1m-dbdc"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.46,
-         89.46
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         11.66309,
-         11.66309
-        ]
-       },
-       "code": {
-        "system_version": "lancedb 0.40.0, pylance 13.0.0",
-        "wheel_sha256": {
-         "lancedb": "ae65415fdbe8886e5daba66e63fb2ce7a044711da8fc9c619914de5911126eef",
-         "pylance": "de62fd301cbddfc1791c5b8d9eabff3dcd1bdc57bc31c975385ed5641653ac05",
-         "pyarrow": "7a70caecee8e8eddd1fec158326d079eddb35e244f116b1270d7bd55b23a8be8"
-        },
-        "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "astervec",
-       "variant": "",
-       "label": "AsterVec",
-       "full_label": "AsterVec",
-       "config_id": "default",
-       "qps": 990.5484,
-       "setting": {
-        "ef": 96
-       },
-       "recall10": 0.92,
-       "mode": "whole",
-       "method": "processes",
-       "invalid": [],
-       "setting_text": "ef 96",
-       "source": "results/bench/bench-1m/astervec.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T235954Z-bench-1m-51fc"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         87.595,
-         87.595
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         11.24756,
-         11.24756
-        ]
-       },
-       "code": {
-        "system_version": "0.2.2",
-        "wheel_sha256": {
-         "aster-vec": "c7abce2655c21b6047cb0109152b86af812f6f81da60203ed1903b9a8fa57ffd"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "paimon",
-       "variant": "",
-       "label": "Paimon 4-bit",
-       "full_label": "Paimon 4-bit",
-       "config_id": "b4",
-       "qps": 491.1884,
-       "setting": {
-        "nprobe": 48
-       },
-       "recall10": 0.9172,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 48",
-       "source": "results/bench/bench-1m/paimon.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T190602Z-bench-1m-b2d4"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         87.74,
-         87.74
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         11.5874,
-         11.5874
-        ]
-       },
-       "code": {
-        "system_version": "paimon-vindex 0.5.0",
-        "wheel_sha256": {
-         "paimon-vindex": "d7a0160b07ae8310823adbb9ca8b04eef22fd4e7ed31b6e3381554a729b96109"
-        },
-        "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "flat",
-       "variant": "",
-       "label": "flat scan",
-       "full_label": "flat scan",
-       "config_id": "default",
-       "qps": 36.39633,
-       "setting": {},
-       "recall10": 1.0,
-       "mode": "whole",
-       "method": "threads",
-       "invalid": [],
-       "setting_text": "none",
-       "source": "results/bench/bench-1m/flat.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261012T023110Z-bench-1m-4ee3"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.465,
-         89.465
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         4.293945,
-         4.293945
-        ]
-       },
-       "code": {
-        "system_version": "numpy 2.5.3",
-        "wheel_sha256": {},
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "sqlite-vec",
-       "variant": "",
-       "label": "sqlite-vec",
-       "full_label": "sqlite-vec",
-       "config_id": "default",
-       "qps": 3.399752,
-       "setting": {},
-       "recall10": 1.0,
-       "mode": "whole",
-       "method": "processes",
-       "invalid": [],
-       "setting_text": "none",
-       "source": "results/bench/bench-1m/sqlite-vec.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261012T015353Z-bench-1m-07f1"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.24,
-         89.24
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         4.96582,
-         4.96582
-        ]
-       },
-       "code": {
-        "system_version": "0.1.9, SQLite 3.53.1",
-        "wheel_sha256": {
-         "sqlite-vec": "5b278775261faa7def18f80900f3992919c6aecc65e13cfe6a01043cd857fa31"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
-      }
-     ],
-     "not_reached": [
-      {
-       "system": "turbovec",
-       "label": "turbovec"
-      }
-     ]
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
     },
     {
-     "recall10": 0.95,
-     "rows": [
-      {
-       "system": "symphonyqg",
-       "variant": "",
-       "label": "SymphonyQG",
-       "full_label": "SymphonyQG",
-       "config_id": "default",
-       "qps": 51620.02,
-       "setting": {
-        "ef": 128
-       },
-       "recall10": 0.9572,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "ef 128",
-       "source": "results/bench/bench-1m/symphonyqg.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261012T011723Z-bench-1m-c67e"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         88.215,
-         88.215
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         4.44873,
-         4.44873
-        ]
-       },
-       "code": {
-        "system_version": "0.5.2",
-        "wheel_sha256": {
-         "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
+     "label": "ColdIVF",
+     "short": "ColdIVF",
+     "group": "coldivf",
+     "harness": "driver",
+     "system": "coldivf",
+     "variant": "python",
+     "config_id": "tl320",
+     "setting": {
+      "nprobe": 128,
+      "rerank": 64
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 128, rerank 64",
+     "qps": 12209.19,
+     "qps_12": 11305.26,
+     "method": "threads",
+     "method_12": "threads",
+     "recall10_warm": 0.961,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/coldivf.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T125349Z-bench-1m-43b5"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.225,
+       89.225
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       6.221191,
+       6.221191
+      ]
+     },
+     "code": {
+      "system_version": "coldivf 0.1.0",
+      "wheel_sha256": {
+       "coldivf": "d558d78016ea5764e9da605ae36f56f846de5d6e6ab16d688b09ff1f78c03706",
+       "build_index": "7fe84ea102df6aafb2ef8ff93e1d0680a112280b76ae04ba60460cdae70064c1"
       },
-      {
-       "system": "coldivf",
-       "variant": "python",
-       "label": "ColdIVF",
-       "full_label": "ColdIVF",
-       "config_id": "tl320",
-       "qps": 12209.19,
-       "setting": {
-        "nprobe": 128,
-        "rerank": 64
-       },
-       "recall10": 0.961,
-       "mode": "whole",
-       "method": "threads",
-       "invalid": [],
-       "setting_text": "nprobe 128, rerank 64",
-       "source": "results/bench/bench-1m/coldivf.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T125349Z-bench-1m-43b5"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.225,
-         89.225
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         6.221191,
-         6.221191
-        ]
-       },
-       "code": {
-        "system_version": "coldivf 0.1.0",
-        "wheel_sha256": {
-         "coldivf": "d558d78016ea5764e9da605ae36f56f846de5d6e6ab16d688b09ff1f78c03706",
-         "build_index": "7fe84ea102df6aafb2ef8ff93e1d0680a112280b76ae04ba60460cdae70064c1"
-        },
-        "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
-        "harness_unstaged": true
-       }
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T125349Z-bench-1m-43b5"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.225,
+       89.225
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       25.87939,
+       25.87939
+      ]
+     },
+     "code_12": {
+      "system_version": "coldivf 0.1.0",
+      "wheel_sha256": {
+       "coldivf": "d558d78016ea5764e9da605ae36f56f846de5d6e6ab16d688b09ff1f78c03706",
+       "build_index": "7fe84ea102df6aafb2ef8ff93e1d0680a112280b76ae04ba60460cdae70064c1"
       },
-      {
-       "system": "faiss-hnsw",
-       "variant": "",
-       "label": "faiss HNSW SQ8",
-       "full_label": "faiss HNSW32-SQ8",
-       "config_id": "hnsw32-sq8",
-       "qps": 7174.708,
-       "setting": {
-        "ef_search": 96
-       },
-       "recall10": 0.958,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "ef 96",
-       "source": "results/bench/bench-1m/faiss-hnsw.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T200725Z-bench-1m-be13"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         87.805,
-         87.805
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         5.650879,
-         5.650879
-        ]
-       },
-       "code": {
-        "system_version": "1.15.1",
-        "wheel_sha256": {
-         "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "faiss HNSW32-SQ8",
+     "short": "faiss HNSW SQ8",
+     "group": "system",
+     "harness": "driver",
+     "system": "faiss-hnsw",
+     "variant": "",
+     "config_id": "hnsw32-sq8",
+     "setting": {
+      "ef_search": 96
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "ef 96",
+     "qps": 7174.708,
+     "qps_12": 10426.72,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.958,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/faiss-hnsw.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T200725Z-bench-1m-be13"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.805,
+       87.805
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       5.650879,
+       5.650879
+      ]
+     },
+     "code": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
       },
-      {
-       "system": "rabitq-ivf",
-       "variant": "",
-       "label": "RaBitQ IVF 9-bit",
-       "full_label": "RaBitQ-Library IVF 9-bit",
-       "config_id": "cp320-b9",
-       "qps": 7034.303,
-       "setting": {
-        "nprobe": 128
-       },
-       "recall10": 0.9588,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 128",
-       "source": "results/bench/bench-1m/rabitq-ivf.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T220230Z-bench-1m-2e76"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.145,
-         89.145
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         24.82129,
-         24.82129
-        ]
-       },
-       "code": {
-        "system_version": "0.5.2",
-        "wheel_sha256": {
-         "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T200725Z-bench-1m-be13"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.805,
+       87.805
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       28.66846,
+       28.66846
+      ]
+     },
+     "code_12": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
       },
-      {
-       "system": "faiss-fastscan",
-       "variant": "fastscan",
-       "label": "faiss FastScan",
-       "full_label": "faiss FastScan + SQ8",
-       "config_id": "cp320-rq1",
-       "qps": 5480.334,
-       "setting": {
-        "nprobe": 96,
-        "k_factor": 8,
-        "qb": 8
-       },
-       "recall10": 0.9564,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 96, k_factor 8, qb 8",
-       "source": "results/bench/bench-1m/faiss-fastscan.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T213132Z-bench-1m-e452"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.51,
-         89.51
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         3.484863,
-         3.484863
-        ]
-       },
-       "code": {
-        "system_version": "1.15.1",
-        "wheel_sha256": {
-         "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "RaBitQ-Library IVF 9-bit",
+     "short": "RaBitQ IVF 9-bit",
+     "group": "system",
+     "harness": "driver",
+     "system": "rabitq-ivf",
+     "variant": "",
+     "config_id": "cp320-b9",
+     "setting": {
+      "nprobe": 128
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 128",
+     "qps": 7034.303,
+     "qps_12": 9009.059,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9588,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/rabitq-ivf.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T220230Z-bench-1m-2e76"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.145,
+       89.145
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       24.82129,
+       24.82129
+      ]
+     },
+     "code": {
+      "system_version": "0.5.2",
+      "wheel_sha256": {
+       "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
       },
-      {
-       "system": "qdrant-edge",
-       "variant": "",
-       "label": "qdrant-edge",
-       "full_label": "qdrant-edge",
-       "config_id": "default",
-       "qps": 5353.477,
-       "setting": {
-        "hnsw_ef": 256,
-        "oversampling": 2
-       },
-       "recall10": 0.9582,
-       "mode": "whole",
-       "method": "processes",
-       "invalid": [],
-       "setting_text": "hnsw_ef 256, oversampling 2",
-       "source": "results/bench/bench-1m/qdrant-edge.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T225611Z-bench-1m-c763"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         88.71,
-         88.71
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         4.70752,
-         4.70752
-        ]
-       },
-       "code": {
-        "system_version": "0.8.0",
-        "wheel_sha256": {
-         "qdrant-edge-py": "634dc23f4f74ad9d9858954e435d580a58254eba843258164bdd067240cffc72"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T220230Z-bench-1m-2e76"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.145,
+       89.145
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       29.53906,
+       29.53906
+      ]
+     },
+     "code_12": {
+      "system_version": "0.5.2",
+      "wheel_sha256": {
+       "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
       },
-      {
-       "system": "diskann",
-       "variant": "",
-       "label": "DiskANN",
-       "full_label": "DiskANN",
-       "config_id": "default",
-       "qps": 4509.439,
-       "setting": {
-        "list": 96,
-        "beam": 8
-       },
-       "recall10": 0.9626,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "list 96, beam 8",
-       "source": "results/bench/bench-1m/diskann.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T181137Z-bench-1m-2abb"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         88.975,
-         88.975
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         20.4917,
-         20.4917
-        ]
-       },
-       "code": {
-        "system_version": "diskann 0.60.0, diskann3 0.1.0+8f2c7b0a216d",
-        "wheel_sha256": {
-         "libdiskann3": "8f2c7b0a216d99db02e9e3a4138d694fbf01015b0fea3538fcfef4ee3225756d",
-         "diskann3": "a1020337c5685528485c7e9977eae9180d183406fab3d9fecc0efd49efd7fa01"
-        },
-        "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
-        "harness_unstaged": true
-       }
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "faiss FastScan + SQ8",
+     "short": "faiss FastScan",
+     "group": "system",
+     "harness": "driver",
+     "system": "faiss-fastscan",
+     "variant": "fastscan",
+     "config_id": "cp320-rq1",
+     "setting": {
+      "nprobe": 96,
+      "k_factor": 8,
+      "qb": 8
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 96, k_factor 8, qb 8",
+     "qps": 5480.334,
+     "qps_12": 7064.698,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9564,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/faiss-fastscan.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T213132Z-bench-1m-e452"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.51,
+       89.51
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       3.484863,
+       3.484863
+      ]
+     },
+     "code": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
       },
-      {
-       "system": "faiss-ivf",
-       "variant": "graph",
-       "label": "faiss graph route",
-       "full_label": "faiss IVF, HNSW quantizer, 320 per list",
-       "config_id": "cp320-rq1-hnsw32",
-       "qps": 4478.419,
-       "setting": {
-        "nprobe": 96,
-        "k_factor": 8,
-        "qb": 4,
-        "quantizer_ef": 128
-       },
-       "recall10": 0.9528,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 96, k_factor 8, qb 4, quantizer_ef 128",
-       "source": "results/bench/bench-1m/faiss-ivf.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T173853Z-bench-1m-13d5"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         87.355,
-         87.355
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         3.546875,
-         3.546875
-        ]
-       },
-       "code": {
-        "system_version": "1.15.1",
-        "wheel_sha256": {
-         "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
-        },
-        "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
-        "harness_unstaged": true
-       }
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T213132Z-bench-1m-e452"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.51,
+       89.51
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       17.44238,
+       17.44238
+      ]
+     },
+     "code_12": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
       },
-      {
-       "system": "usearch",
-       "variant": "",
-       "label": "usearch HNSW f16",
-       "full_label": "usearch HNSW f16",
-       "config_id": "f16-m16",
-       "qps": 2282.165,
-       "setting": {
-        "expansion_search": 384
-       },
-       "recall10": 0.9612,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "expansion 384",
-       "source": "results/bench/bench-1m/usearch.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T204917Z-bench-1m-9e2a"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         91.08,
-         91.08
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         10.16895,
-         10.16895
-        ]
-       },
-       "code": {
-        "system_version": "2.26.4",
-        "wheel_sha256": {
-         "usearch": "cb9b8fc39446d90294ee7e4bc7c7423da21057af0152c308f5bb42ce937b59d5",
-         "numkong": "703dd6c8c023b5f37b4f78f5884f5cfc7d93b665f19fb710fbcc52c0a8d0ba96"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "lancedb",
-       "variant": "",
-       "label": "LanceDB IVF_RQ",
-       "full_label": "LanceDB IVF_RQ",
-       "config_id": "rq1-default",
-       "qps": 1082.839,
-       "setting": {
-        "nprobes": 16,
-        "refine_factor": 8
-       },
-       "recall10": 0.9634,
-       "mode": "whole",
-       "method": "threads",
-       "invalid": [],
-       "setting_text": "nprobes 16, refine 8",
-       "source": "results/bench/bench-1m/lancedb.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T134212Z-bench-1m-dbdc"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.46,
-         89.46
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         11.58057,
-         11.58057
-        ]
-       },
-       "code": {
-        "system_version": "lancedb 0.40.0, pylance 13.0.0",
-        "wheel_sha256": {
-         "lancedb": "ae65415fdbe8886e5daba66e63fb2ce7a044711da8fc9c619914de5911126eef",
-         "pylance": "de62fd301cbddfc1791c5b8d9eabff3dcd1bdc57bc31c975385ed5641653ac05",
-         "pyarrow": "7a70caecee8e8eddd1fec158326d079eddb35e244f116b1270d7bd55b23a8be8"
-        },
-        "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "astervec",
-       "variant": "",
-       "label": "AsterVec",
-       "full_label": "AsterVec",
-       "config_id": "default",
-       "qps": 298.0016,
-       "setting": {
-        "ef": 384
-       },
-       "recall10": 0.9634,
-       "mode": "whole",
-       "method": "processes",
-       "invalid": [],
-       "setting_text": "ef 384",
-       "source": "results/bench/bench-1m/astervec.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T235954Z-bench-1m-51fc"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         87.595,
-         87.595
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         5.433594,
-         5.433594
-        ]
-       },
-       "code": {
-        "system_version": "0.2.2",
-        "wheel_sha256": {
-         "aster-vec": "c7abce2655c21b6047cb0109152b86af812f6f81da60203ed1903b9a8fa57ffd"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "paimon",
-       "variant": "",
-       "label": "Paimon 8-bit",
-       "full_label": "Paimon 8-bit",
-       "config_id": "b8",
-       "qps": 221.7615,
-       "setting": {
-        "nprobe": 48
-       },
-       "recall10": 0.9596,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 48",
-       "source": "results/bench/bench-1m/paimon.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T190602Z-bench-1m-b2d4"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         87.74,
-         87.74
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         16.27539,
-         16.27539
-        ]
-       },
-       "code": {
-        "system_version": "paimon-vindex 0.5.0",
-        "wheel_sha256": {
-         "paimon-vindex": "d7a0160b07ae8310823adbb9ca8b04eef22fd4e7ed31b6e3381554a729b96109"
-        },
-        "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "flat",
-       "variant": "",
-       "label": "flat scan",
-       "full_label": "flat scan",
-       "config_id": "default",
-       "qps": 36.39633,
-       "setting": {},
-       "recall10": 1.0,
-       "mode": "whole",
-       "method": "threads",
-       "invalid": [],
-       "setting_text": "none",
-       "source": "results/bench/bench-1m/flat.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261012T023110Z-bench-1m-4ee3"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.465,
-         89.465
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         4.293945,
-         4.293945
-        ]
-       },
-       "code": {
-        "system_version": "numpy 2.5.3",
-        "wheel_sha256": {},
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "sqlite-vec",
-       "variant": "",
-       "label": "sqlite-vec",
-       "full_label": "sqlite-vec",
-       "config_id": "default",
-       "qps": 3.399752,
-       "setting": {},
-       "recall10": 1.0,
-       "mode": "whole",
-       "method": "processes",
-       "invalid": [],
-       "setting_text": "none",
-       "source": "results/bench/bench-1m/sqlite-vec.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261012T015353Z-bench-1m-07f1"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.24,
-         89.24
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         4.96582,
-         4.96582
-        ]
-       },
-       "code": {
-        "system_version": "0.1.9, SQLite 3.53.1",
-        "wheel_sha256": {
-         "sqlite-vec": "5b278775261faa7def18f80900f3992919c6aecc65e13cfe6a01043cd857fa31"
-        },
-        "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
-        "harness_unstaged": true
-       }
-      }
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "qdrant-edge",
+     "short": "qdrant-edge",
+     "group": "system",
+     "harness": "driver",
+     "system": "qdrant-edge",
+     "variant": "",
+     "config_id": "default",
+     "setting": {
+      "hnsw_ef": 256,
+      "oversampling": 2
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "hnsw_ef 256, oversampling 2",
+     "qps": 5353.477,
+     "qps_12": 5933.316,
+     "method": "processes",
+     "method_12": "processes",
+     "recall10_warm": 0.9582,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [
+      12
      ],
-     "not_reached": [
-      {
-       "system": "rabitq-hnsw",
-       "label": "RaBitQ HNSW"
+     "source": "results/bench/bench-1m/qdrant-edge.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T225611Z-bench-1m-c763"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       88.71,
+       88.71
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       4.70752,
+       4.70752
+      ]
+     },
+     "code": {
+      "system_version": "0.8.0",
+      "wheel_sha256": {
+       "qdrant-edge-py": "634dc23f4f74ad9d9858954e435d580a58254eba843258164bdd067240cffc72"
       },
-      {
-       "system": "turbovec",
-       "label": "turbovec"
-      }
-     ]
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T230016Z-bench-1m-ddec"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.29,
+       87.29
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       9.068848,
+       9.068848
+      ]
+     },
+     "code_12": {
+      "system_version": "0.8.0",
+      "wheel_sha256": {
+       "qdrant-edge-py": "634dc23f4f74ad9d9858954e435d580a58254eba843258164bdd067240cffc72"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "DiskANN",
+     "short": "DiskANN",
+     "group": "system",
+     "harness": "driver",
+     "system": "diskann",
+     "variant": "",
+     "config_id": "default",
+     "setting": {
+      "list": 96,
+      "beam": 8
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "list 96, beam 8",
+     "qps": 4509.439,
+     "qps_12": 5641.067,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9626,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/diskann.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T181137Z-bench-1m-2abb"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       88.975,
+       88.975
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       20.4917,
+       20.4917
+      ]
+     },
+     "code": {
+      "system_version": "diskann 0.60.0, diskann3 0.1.0+8f2c7b0a216d",
+      "wheel_sha256": {
+       "libdiskann3": "8f2c7b0a216d99db02e9e3a4138d694fbf01015b0fea3538fcfef4ee3225756d",
+       "diskann3": "a1020337c5685528485c7e9977eae9180d183406fab3d9fecc0efd49efd7fa01"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T175824Z-bench-1m-9999"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       88.945,
+       88.945
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       87.49951,
+       87.49951
+      ]
+     },
+     "code_12": {
+      "system_version": "diskann 0.60.0, diskann3 0.1.0+8f2c7b0a216d",
+      "wheel_sha256": {
+       "libdiskann3": "8f2c7b0a216d99db02e9e3a4138d694fbf01015b0fea3538fcfef4ee3225756d",
+       "diskann3": "a1020337c5685528485c7e9977eae9180d183406fab3d9fecc0efd49efd7fa01"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "faiss IVF, HNSW quantizer, 320 per list",
+     "short": "faiss graph route",
+     "group": "system",
+     "harness": "driver",
+     "system": "faiss-ivf",
+     "variant": "graph",
+     "config_id": "cp320-rq1-hnsw32",
+     "setting": {
+      "nprobe": 96,
+      "k_factor": 8,
+      "qb": 4,
+      "quantizer_ef": 128
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 96, k_factor 8, qb 4, quantizer_ef 128",
+     "qps": 4478.419,
+     "qps_12": 5447.182,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9528,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/faiss-ivf.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T173853Z-bench-1m-13d5"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.355,
+       87.355
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       3.546875,
+       3.546875
+      ]
+     },
+     "code": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T172725Z-bench-1m-9058"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.825,
+       91.825
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       13.01904,
+       13.01904
+      ]
+     },
+     "code_12": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "usearch HNSW f16",
+     "short": "usearch HNSW f16",
+     "group": "system",
+     "harness": "driver",
+     "system": "usearch",
+     "variant": "",
+     "config_id": "f16-m16",
+     "setting": {
+      "expansion_search": 384
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "expansion 384",
+     "qps": 2282.165,
+     "qps_12": 3199.035,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9612,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/usearch.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T204917Z-bench-1m-9e2a"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.08,
+       91.08
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       10.16895,
+       10.16895
+      ]
+     },
+     "code": {
+      "system_version": "2.26.4",
+      "wheel_sha256": {
+       "usearch": "cb9b8fc39446d90294ee7e4bc7c7423da21057af0152c308f5bb42ce937b59d5",
+       "numkong": "703dd6c8c023b5f37b4f78f5884f5cfc7d93b665f19fb710fbcc52c0a8d0ba96"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T204917Z-bench-1m-9e2a"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.08,
+       91.08
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       11.87158,
+       11.87158
+      ]
+     },
+     "code_12": {
+      "system_version": "2.26.4",
+      "wheel_sha256": {
+       "usearch": "cb9b8fc39446d90294ee7e4bc7c7423da21057af0152c308f5bb42ce937b59d5",
+       "numkong": "703dd6c8c023b5f37b4f78f5884f5cfc7d93b665f19fb710fbcc52c0a8d0ba96"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "LanceDB IVF_RQ",
+     "short": "LanceDB IVF_RQ",
+     "group": "system",
+     "harness": "driver",
+     "system": "lancedb",
+     "variant": "",
+     "config_id": "rq1-default",
+     "setting": {
+      "nprobes": 16,
+      "refine_factor": 8
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobes 16, refine 8",
+     "qps": 1082.839,
+     "qps_12": 1149.968,
+     "method": "threads",
+     "method_12": "threads",
+     "recall10_warm": 0.9634,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/lancedb.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T134212Z-bench-1m-dbdc"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.46,
+       89.46
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       11.58057,
+       11.58057
+      ]
+     },
+     "code": {
+      "system_version": "lancedb 0.40.0, pylance 13.0.0",
+      "wheel_sha256": {
+       "lancedb": "ae65415fdbe8886e5daba66e63fb2ce7a044711da8fc9c619914de5911126eef",
+       "pylance": "de62fd301cbddfc1791c5b8d9eabff3dcd1bdc57bc31c975385ed5641653ac05",
+       "pyarrow": "7a70caecee8e8eddd1fec158326d079eddb35e244f116b1270d7bd55b23a8be8"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T134212Z-bench-1m-dbdc"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.46,
+       89.46
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       15.31494,
+       15.31494
+      ]
+     },
+     "code_12": {
+      "system_version": "lancedb 0.40.0, pylance 13.0.0",
+      "wheel_sha256": {
+       "lancedb": "ae65415fdbe8886e5daba66e63fb2ce7a044711da8fc9c619914de5911126eef",
+       "pylance": "de62fd301cbddfc1791c5b8d9eabff3dcd1bdc57bc31c975385ed5641653ac05",
+       "pyarrow": "7a70caecee8e8eddd1fec158326d079eddb35e244f116b1270d7bd55b23a8be8"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "AsterVec",
+     "short": "AsterVec",
+     "group": "system",
+     "harness": "driver",
+     "system": "astervec",
+     "variant": "",
+     "config_id": "default",
+     "setting": {
+      "ef": 384
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "ef 384",
+     "qps": 298.0016,
+     "qps_12": 268.9671,
+     "method": "processes",
+     "method_12": "processes",
+     "recall10_warm": 0.9634,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/astervec.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T235954Z-bench-1m-51fc"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.595,
+       87.595
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       5.433594,
+       5.433594
+      ]
+     },
+     "code": {
+      "system_version": "0.2.2",
+      "wheel_sha256": {
+       "aster-vec": "c7abce2655c21b6047cb0109152b86af812f6f81da60203ed1903b9a8fa57ffd"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T235954Z-bench-1m-51fc"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.595,
+       87.595
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       21.79395,
+       21.79395
+      ]
+     },
+     "code_12": {
+      "system_version": "0.2.2",
+      "wheel_sha256": {
+       "aster-vec": "c7abce2655c21b6047cb0109152b86af812f6f81da60203ed1903b9a8fa57ffd"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "Paimon 8-bit",
+     "short": "Paimon 8-bit",
+     "group": "system",
+     "harness": "driver",
+     "system": "paimon",
+     "variant": "",
+     "config_id": "b8",
+     "setting": {
+      "nprobe": 48
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 48",
+     "qps": 221.7615,
+     "qps_12": 290.9215,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9596,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/paimon.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T190602Z-bench-1m-b2d4"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.74,
+       87.74
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       16.27539,
+       16.27539
+      ]
+     },
+     "code": {
+      "system_version": "paimon-vindex 0.5.0",
+      "wheel_sha256": {
+       "paimon-vindex": "d7a0160b07ae8310823adbb9ca8b04eef22fd4e7ed31b6e3381554a729b96109"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T190602Z-bench-1m-b2d4"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.74,
+       87.74
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       17.7417,
+       17.7417
+      ]
+     },
+     "code_12": {
+      "system_version": "paimon-vindex 0.5.0",
+      "wheel_sha256": {
+       "paimon-vindex": "d7a0160b07ae8310823adbb9ca8b04eef22fd4e7ed31b6e3381554a729b96109"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "flat scan",
+     "short": "flat scan",
+     "group": "system",
+     "harness": "driver",
+     "system": "flat",
+     "variant": "",
+     "config_id": "default",
+     "setting": {},
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "none",
+     "qps": 36.39633,
+     "qps_12": 37.01729,
+     "method": "threads",
+     "method_12": "threads",
+     "recall10_warm": 1.0,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/flat.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261012T023110Z-bench-1m-4ee3"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.465,
+       89.465
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       4.293945,
+       4.293945
+      ]
+     },
+     "code": {
+      "system_version": "numpy 2.5.3",
+      "wheel_sha256": {},
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261012T023110Z-bench-1m-4ee3"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.465,
+       89.465
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       24.95801,
+       24.95801
+      ]
+     },
+     "code_12": {
+      "system_version": "numpy 2.5.3",
+      "wheel_sha256": {},
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "sqlite-vec",
+     "short": "sqlite-vec",
+     "group": "system",
+     "harness": "driver",
+     "system": "sqlite-vec",
+     "variant": "",
+     "config_id": "default",
+     "setting": {},
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "none",
+     "qps": 3.399752,
+     "qps_12": 1.516658,
+     "method": "processes",
+     "method_12": "processes",
+     "recall10_warm": 1.0,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/sqlite-vec.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261012T015353Z-bench-1m-07f1"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.24,
+       89.24
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       4.96582,
+       4.96582
+      ]
+     },
+     "code": {
+      "system_version": "0.1.9, SQLite 3.53.1",
+      "wheel_sha256": {
+       "sqlite-vec": "5b278775261faa7def18f80900f3992919c6aecc65e13cfe6a01043cd857fa31"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261012T015353Z-bench-1m-07f1"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.24,
+       89.24
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       28.97559,
+       28.97559
+      ]
+     },
+     "code_12": {
+      "system_version": "0.1.9, SQLite 3.53.1",
+      "wheel_sha256": {
+       "sqlite-vec": "5b278775261faa7def18f80900f3992919c6aecc65e13cfe6a01043cd857fa31"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
     }
    ],
+   "not_reached": [
+    {
+     "system": "rabitq-hnsw",
+     "label": "RaBitQ HNSW"
+    },
+    {
+     "system": "turbovec",
+     "label": "turbovec"
+    }
+   ],
+   "reference": "ColdIVF",
+   "footnote": "Recall target of 0.95 not reached: RaBitQ HNSW and turbovec.",
    "files": {
-    "dark": "qps-1m-dark.svg"
+    "dark": "qps-1m-95-dark.svg"
+   }
+  },
+  {
+   "id": "qps-1m-90",
+   "kind": "h2h-qps",
+   "title": "Queries per second at 1M vectors, recall@10 0.90",
+   "dataset": "cohere10m-768-cosine",
+   "n": 1000000,
+   "unit": "queries per second",
+   "target_recall10": 0.9,
+   "preliminary": false,
+   "legend": [
+    "ColdIVF",
+    "Other systems"
+   ],
+   "subtitle": "The first 1M rows of cohere10m-768-cosine (Cohere 10M, 768 dimensions, cosine, 1,000 queries), on one Apple M3 Pro with 36 GB of memory. Each dot is a system's queries per second on 6 threads, the M3 Pro's performance cores, with every index read into memory first. The columns give them on 6 threads and on 12, as many as the M3 Pro has cores. Each is the median of 3 runs of 10 s each, which keep no time per query, so a dot has no line to a p99. Each system runs at its pick for recall@10 0.90, whose recall over the 500 test queries at 1 thread is 0.906 to 1.000. Higher is faster. Log scale.",
+   "footer": "SymphonyQG, RaBitQ HNSW 4-bit, RaBitQ IVF 9-bit, faiss HNSW SQ8, faiss FastScan, faiss graph route, usearch HNSW f16, DiskANN and Paimon 4-bit search through a call for a batch of queries that releases Python's lock. qdrant-edge, AsterVec and sqlite-vec search from 6 processes, and ColdIVF, LanceDB IVF_RQ and flat scan from 6 threads in one process. ColdIVF's module has no batch call.",
+   "notes": [
+    "Each row is headtohead.py's pick for the target, pick.py's verdict rule on the tune split, measured on the test split. Of a system's configurations it is the one with the most queries per second on 6 threads, which can differ from the ones its cold and warm charts show, and ColdIVF's is its Python module's.",
+    "invalid lists the thread counts, of 6 and 12, whose line swap-ins or compressions elsewhere on the machine made invalid. The chart writes (invalid) after such a 12-thread number, as the README's tables flag such a line, and a dash for a row without a 12-thread line.",
+    "mode, machine_state and code are those of the 6-thread line, and machine_state_12 and code_12 those of the 12-thread line, or null without one."
+   ],
+   "rows": [
+    {
+     "label": "SymphonyQG",
+     "short": "SymphonyQG",
+     "group": "system",
+     "harness": "driver",
+     "system": "symphonyqg",
+     "variant": "",
+     "config_id": "default",
+     "setting": {
+      "ef": 64
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "ef 64",
+     "qps": 82839.09,
+     "qps_12": 101958.1,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9202,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/symphonyqg.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261012T011723Z-bench-1m-c67e"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       88.215,
+       88.215
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       9.774902,
+       9.774902
+      ]
+     },
+     "code": {
+      "system_version": "0.5.2",
+      "wheel_sha256": {
+       "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261012T011723Z-bench-1m-c67e"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       88.215,
+       88.215
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       7.457031,
+       7.457031
+      ]
+     },
+     "code_12": {
+      "system_version": "0.5.2",
+      "wheel_sha256": {
+       "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "RaBitQ-Library HNSW 4-bit",
+     "short": "RaBitQ HNSW 4-bit",
+     "group": "system",
+     "harness": "driver",
+     "system": "rabitq-hnsw",
+     "variant": "",
+     "config_id": "b4",
+     "setting": {
+      "ef": 128
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "ef 128",
+     "qps": 33318.97,
+     "qps_12": 45148.95,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9142,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/rabitq-hnsw.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261012T005537Z-bench-1m-f03b"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       88.12,
+       88.12
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       3.977539,
+       3.977539
+      ]
+     },
+     "code": {
+      "system_version": "0.5.2",
+      "wheel_sha256": {
+       "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261012T004829Z-bench-1m-b7b5"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       90.85,
+       90.85
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       9.594238,
+       9.594238
+      ]
+     },
+     "code_12": {
+      "system_version": "0.5.2",
+      "wheel_sha256": {
+       "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "ColdIVF",
+     "short": "ColdIVF",
+     "group": "coldivf",
+     "harness": "driver",
+     "system": "coldivf",
+     "variant": "python",
+     "config_id": "tl320",
+     "setting": {
+      "nprobe": 64,
+      "rerank": 39
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 64, rerank 39",
+     "qps": 20286.73,
+     "qps_12": 19247.09,
+     "method": "threads",
+     "method_12": "threads",
+     "recall10_warm": 0.9214,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/coldivf.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T125349Z-bench-1m-43b5"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.225,
+       89.225
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       4.94873,
+       4.94873
+      ]
+     },
+     "code": {
+      "system_version": "coldivf 0.1.0",
+      "wheel_sha256": {
+       "coldivf": "d558d78016ea5764e9da605ae36f56f846de5d6e6ab16d688b09ff1f78c03706",
+       "build_index": "7fe84ea102df6aafb2ef8ff93e1d0680a112280b76ae04ba60460cdae70064c1"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T125349Z-bench-1m-43b5"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.225,
+       89.225
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       12.73047,
+       12.73047
+      ]
+     },
+     "code_12": {
+      "system_version": "coldivf 0.1.0",
+      "wheel_sha256": {
+       "coldivf": "d558d78016ea5764e9da605ae36f56f846de5d6e6ab16d688b09ff1f78c03706",
+       "build_index": "7fe84ea102df6aafb2ef8ff93e1d0680a112280b76ae04ba60460cdae70064c1"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "RaBitQ-Library IVF 9-bit",
+     "short": "RaBitQ IVF 9-bit",
+     "group": "system",
+     "harness": "driver",
+     "system": "rabitq-ivf",
+     "variant": "",
+     "config_id": "cp320-b9",
+     "setting": {
+      "nprobe": 48
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 48",
+     "qps": 13243.06,
+     "qps_12": 16375.23,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9062,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/rabitq-ivf.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T220230Z-bench-1m-2e76"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.145,
+       89.145
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       5.319336,
+       5.319336
+      ]
+     },
+     "code": {
+      "system_version": "0.5.2",
+      "wheel_sha256": {
+       "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T220230Z-bench-1m-2e76"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.145,
+       89.145
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       20.61182,
+       20.61182
+      ]
+     },
+     "code_12": {
+      "system_version": "0.5.2",
+      "wheel_sha256": {
+       "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "faiss HNSW32-SQ8",
+     "short": "faiss HNSW SQ8",
+     "group": "system",
+     "harness": "driver",
+     "system": "faiss-hnsw",
+     "variant": "",
+     "config_id": "hnsw32-sq8",
+     "setting": {
+      "ef_search": 48
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "ef 48",
+     "qps": 12198.67,
+     "qps_12": 18111.69,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9228,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/faiss-hnsw.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T200725Z-bench-1m-be13"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.805,
+       87.805
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       22.27344,
+       22.27344
+      ]
+     },
+     "code": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T200725Z-bench-1m-be13"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.805,
+       87.805
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       20.72363,
+       20.72363
+      ]
+     },
+     "code_12": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "qdrant-edge",
+     "short": "qdrant-edge",
+     "group": "system",
+     "harness": "driver",
+     "system": "qdrant-edge",
+     "variant": "",
+     "config_id": "default",
+     "setting": {
+      "hnsw_ef": 96,
+      "oversampling": 2
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "hnsw_ef 96, oversampling 2",
+     "qps": 11543.45,
+     "qps_12": 10668.35,
+     "method": "processes",
+     "method_12": "processes",
+     "recall10_warm": 0.9184,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [
+      12
+     ],
+     "source": "results/bench/bench-1m/qdrant-edge.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T223859Z-bench-1m-3e92"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.01,
+       91.01
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       9.161133,
+       9.161133
+      ]
+     },
+     "code": {
+      "system_version": "0.8.0",
+      "wheel_sha256": {
+       "qdrant-edge-py": "634dc23f4f74ad9d9858954e435d580a58254eba843258164bdd067240cffc72"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T230016Z-bench-1m-ddec"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.29,
+       87.29
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       6.44043,
+       6.44043
+      ]
+     },
+     "code_12": {
+      "system_version": "0.8.0",
+      "wheel_sha256": {
+       "qdrant-edge-py": "634dc23f4f74ad9d9858954e435d580a58254eba843258164bdd067240cffc72"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "faiss FastScan + SQ8",
+     "short": "faiss FastScan",
+     "group": "system",
+     "harness": "driver",
+     "system": "faiss-fastscan",
+     "variant": "fastscan",
+     "config_id": "cp320-rq1",
+     "setting": {
+      "nprobe": 48,
+      "k_factor": 4,
+      "qb": 8
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 48, k_factor 4, qb 8",
+     "qps": 8841.488,
+     "qps_12": 11843.09,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9108,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/faiss-fastscan.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T213132Z-bench-1m-e452"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.51,
+       89.51
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       13.08594,
+       13.08594
+      ]
+     },
+     "code": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T213132Z-bench-1m-e452"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.51,
+       89.51
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       6.512695,
+       6.512695
+      ]
+     },
+     "code_12": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "faiss IVF, HNSW quantizer, 320 per list",
+     "short": "faiss graph route",
+     "group": "system",
+     "harness": "driver",
+     "system": "faiss-ivf",
+     "variant": "graph",
+     "config_id": "cp320-rq1-hnsw32",
+     "setting": {
+      "nprobe": 48,
+      "k_factor": 4,
+      "qb": 4,
+      "quantizer_ef": 128
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 48, k_factor 4, qb 4, quantizer_ef 128",
+     "qps": 8224.361,
+     "qps_12": 10011.08,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.909,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/faiss-ivf.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T172725Z-bench-1m-9058"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.825,
+       91.825
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       10.56836,
+       10.56836
+      ]
+     },
+     "code": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T172725Z-bench-1m-9058"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.825,
+       91.825
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       8.240234,
+       8.240234
+      ]
+     },
+     "code_12": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "usearch HNSW f16",
+     "short": "usearch HNSW f16",
+     "group": "system",
+     "harness": "driver",
+     "system": "usearch",
+     "variant": "",
+     "config_id": "f16-m16",
+     "setting": {
+      "expansion_search": 96
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "expansion 96",
+     "qps": 7697.942,
+     "qps_12": 10749.01,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9204,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/usearch.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T204917Z-bench-1m-9e2a"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.08,
+       91.08
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       8.428711,
+       8.428711
+      ]
+     },
+     "code": {
+      "system_version": "2.26.4",
+      "wheel_sha256": {
+       "usearch": "cb9b8fc39446d90294ee7e4bc7c7423da21057af0152c308f5bb42ce937b59d5",
+       "numkong": "703dd6c8c023b5f37b4f78f5884f5cfc7d93b665f19fb710fbcc52c0a8d0ba96"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T204917Z-bench-1m-9e2a"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.08,
+       91.08
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       10.45068,
+       10.45068
+      ]
+     },
+     "code_12": {
+      "system_version": "2.26.4",
+      "wheel_sha256": {
+       "usearch": "cb9b8fc39446d90294ee7e4bc7c7423da21057af0152c308f5bb42ce937b59d5",
+       "numkong": "703dd6c8c023b5f37b4f78f5884f5cfc7d93b665f19fb710fbcc52c0a8d0ba96"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "DiskANN",
+     "short": "DiskANN",
+     "group": "system",
+     "harness": "driver",
+     "system": "diskann",
+     "variant": "",
+     "config_id": "default",
+     "setting": {
+      "list": 48,
+      "beam": 8
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "list 48, beam 8",
+     "qps": 7334.317,
+     "qps_12": 9330.088,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9186,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/diskann.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T175824Z-bench-1m-9999"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       88.945,
+       88.945
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       68.52734,
+       68.52734
+      ]
+     },
+     "code": {
+      "system_version": "diskann 0.60.0, diskann3 0.1.0+8f2c7b0a216d",
+      "wheel_sha256": {
+       "libdiskann3": "8f2c7b0a216d99db02e9e3a4138d694fbf01015b0fea3538fcfef4ee3225756d",
+       "diskann3": "a1020337c5685528485c7e9977eae9180d183406fab3d9fecc0efd49efd7fa01"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T175824Z-bench-1m-9999"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       88.945,
+       88.945
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       51.84961,
+       51.84961
+      ]
+     },
+     "code_12": {
+      "system_version": "diskann 0.60.0, diskann3 0.1.0+8f2c7b0a216d",
+      "wheel_sha256": {
+       "libdiskann3": "8f2c7b0a216d99db02e9e3a4138d694fbf01015b0fea3538fcfef4ee3225756d",
+       "diskann3": "a1020337c5685528485c7e9977eae9180d183406fab3d9fecc0efd49efd7fa01"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "LanceDB IVF_RQ",
+     "short": "LanceDB IVF_RQ",
+     "group": "system",
+     "harness": "driver",
+     "system": "lancedb",
+     "variant": "",
+     "config_id": "rq1-default",
+     "setting": {
+      "nprobes": 12,
+      "refine_factor": 4
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobes 12, refine 4",
+     "qps": 1401.64,
+     "qps_12": 1406.007,
+     "method": "threads",
+     "method_12": "threads",
+     "recall10_warm": 0.9314,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/lancedb.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T134212Z-bench-1m-dbdc"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.46,
+       89.46
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       11.66309,
+       11.66309
+      ]
+     },
+     "code": {
+      "system_version": "lancedb 0.40.0, pylance 13.0.0",
+      "wheel_sha256": {
+       "lancedb": "ae65415fdbe8886e5daba66e63fb2ce7a044711da8fc9c619914de5911126eef",
+       "pylance": "de62fd301cbddfc1791c5b8d9eabff3dcd1bdc57bc31c975385ed5641653ac05",
+       "pyarrow": "7a70caecee8e8eddd1fec158326d079eddb35e244f116b1270d7bd55b23a8be8"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T134212Z-bench-1m-dbdc"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.46,
+       89.46
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       7.834961,
+       7.834961
+      ]
+     },
+     "code_12": {
+      "system_version": "lancedb 0.40.0, pylance 13.0.0",
+      "wheel_sha256": {
+       "lancedb": "ae65415fdbe8886e5daba66e63fb2ce7a044711da8fc9c619914de5911126eef",
+       "pylance": "de62fd301cbddfc1791c5b8d9eabff3dcd1bdc57bc31c975385ed5641653ac05",
+       "pyarrow": "7a70caecee8e8eddd1fec158326d079eddb35e244f116b1270d7bd55b23a8be8"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "AsterVec",
+     "short": "AsterVec",
+     "group": "system",
+     "harness": "driver",
+     "system": "astervec",
+     "variant": "",
+     "config_id": "default",
+     "setting": {
+      "ef": 96
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "ef 96",
+     "qps": 990.5484,
+     "qps_12": 869.9492,
+     "method": "processes",
+     "method_12": "processes",
+     "recall10_warm": 0.92,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [
+      12
+     ],
+     "source": "results/bench/bench-1m/astervec.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T235954Z-bench-1m-51fc"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.595,
+       87.595
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       11.24756,
+       11.24756
+      ]
+     },
+     "code": {
+      "system_version": "0.2.2",
+      "wheel_sha256": {
+       "aster-vec": "c7abce2655c21b6047cb0109152b86af812f6f81da60203ed1903b9a8fa57ffd"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261012T002500Z-bench-1m-5b55"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       85.865,
+       85.865
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       14.69092,
+       14.69092
+      ]
+     },
+     "code_12": {
+      "system_version": "0.2.2",
+      "wheel_sha256": {
+       "aster-vec": "c7abce2655c21b6047cb0109152b86af812f6f81da60203ed1903b9a8fa57ffd"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "Paimon 4-bit",
+     "short": "Paimon 4-bit",
+     "group": "system",
+     "harness": "driver",
+     "system": "paimon",
+     "variant": "",
+     "config_id": "b4",
+     "setting": {
+      "nprobe": 48
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 48",
+     "qps": 491.1884,
+     "qps_12": 639.963,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9172,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/paimon.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T190602Z-bench-1m-b2d4"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.74,
+       87.74
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       11.5874,
+       11.5874
+      ]
+     },
+     "code": {
+      "system_version": "paimon-vindex 0.5.0",
+      "wheel_sha256": {
+       "paimon-vindex": "d7a0160b07ae8310823adbb9ca8b04eef22fd4e7ed31b6e3381554a729b96109"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T190602Z-bench-1m-b2d4"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.74,
+       87.74
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       14.8457,
+       14.8457
+      ]
+     },
+     "code_12": {
+      "system_version": "paimon-vindex 0.5.0",
+      "wheel_sha256": {
+       "paimon-vindex": "d7a0160b07ae8310823adbb9ca8b04eef22fd4e7ed31b6e3381554a729b96109"
+      },
+      "harness_head": "be95690dcd5fb03414c6f35118db9185342b5518",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "flat scan",
+     "short": "flat scan",
+     "group": "system",
+     "harness": "driver",
+     "system": "flat",
+     "variant": "",
+     "config_id": "default",
+     "setting": {},
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "none",
+     "qps": 36.39633,
+     "qps_12": 37.01729,
+     "method": "threads",
+     "method_12": "threads",
+     "recall10_warm": 1.0,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/flat.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261012T023110Z-bench-1m-4ee3"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.465,
+       89.465
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       4.293945,
+       4.293945
+      ]
+     },
+     "code": {
+      "system_version": "numpy 2.5.3",
+      "wheel_sha256": {},
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261012T023110Z-bench-1m-4ee3"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.465,
+       89.465
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       24.95801,
+       24.95801
+      ]
+     },
+     "code_12": {
+      "system_version": "numpy 2.5.3",
+      "wheel_sha256": {},
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "sqlite-vec",
+     "short": "sqlite-vec",
+     "group": "system",
+     "harness": "driver",
+     "system": "sqlite-vec",
+     "variant": "",
+     "config_id": "default",
+     "setting": {},
+     "dataset": "cohere10m-768-cosine",
+     "n": 1000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "none",
+     "qps": 3.399752,
+     "qps_12": 1.516658,
+     "method": "processes",
+     "method_12": "processes",
+     "recall10_warm": 1.0,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-1m/sqlite-vec.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261012T015353Z-bench-1m-07f1"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.24,
+       89.24
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       4.96582,
+       4.96582
+      ]
+     },
+     "code": {
+      "system_version": "0.1.9, SQLite 3.53.1",
+      "wheel_sha256": {
+       "sqlite-vec": "5b278775261faa7def18f80900f3992919c6aecc65e13cfe6a01043cd857fa31"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261012T015353Z-bench-1m-07f1"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.24,
+       89.24
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       28.97559,
+       28.97559
+      ]
+     },
+     "code_12": {
+      "system_version": "0.1.9, SQLite 3.53.1",
+      "wheel_sha256": {
+       "sqlite-vec": "5b278775261faa7def18f80900f3992919c6aecc65e13cfe6a01043cd857fa31"
+      },
+      "harness_head": "4b1f1545b189290178ffdbf1cb9e3425e0fa5404",
+      "harness_unstaged": true
+     }
+    }
+   ],
+   "not_reached": [
+    {
+     "system": "turbovec",
+     "label": "turbovec"
+    }
+   ],
+   "reference": "ColdIVF",
+   "footnote": "Recall target of 0.90 not reached: turbovec.",
+   "files": {
+    "dark": "qps-1m-90-dark.svg"
    }
   },
   {
@@ -10391,821 +11471,1465 @@
    }
   },
   {
-   "id": "qps-10m",
+   "id": "qps-10m-95",
    "kind": "h2h-qps",
-   "title": "Queries per second at 10M vectors, 6 threads",
-   "unit": "queries per second",
+   "title": "Queries per second at 10M vectors, recall@10 0.95",
    "dataset": "cohere10m-768-cosine",
    "n": 10000000,
+   "unit": "queries per second",
+   "target_recall10": 0.95,
    "preliminary": false,
-   "not_reached_text": "Not reached",
-   "layout": {
-    "label_w": 276.0,
-    "plot_w": 372.0,
-    "value_w": 60.0
-   },
-   "subtitle": "10M vectors of cohere10m-768-cosine (Cohere 10M, 768 dimensions, cosine, 1,000 queries), on one Apple M3 Pro with 36 GB of memory. Each panel ranks the systems by queries per second on 6 threads, the M3 Pro's performance cores, at their pick for one recall@10 target, the median of 3 runs of 10 s each. Higher is faster. The panels share one log scale.",
-   "footer": "faiss HNSW SQ8, faiss graph route, faiss FastScan, RaBitQ IVF 9-bit, DiskANN, turbovec calibrated and Paimon 4-bit search through a call for a batch of queries that releases Python's lock. ColdIVF and LanceDB IVF_RQ search from 6 threads in one process. ColdIVF's module has no batch call.",
-   "boards": [
+   "legend": [
+    "ColdIVF",
+    "Other systems"
+   ],
+   "subtitle": "10M vectors of cohere10m-768-cosine (Cohere 10M, 768 dimensions, cosine, 1,000 queries), on one Apple M3 Pro with 36 GB of memory. Each dot is a system's queries per second on 6 threads, the M3 Pro's performance cores, with every index read into memory first. The columns give them on 6 threads and on 12, as many as the M3 Pro has cores. Each is the median of 3 runs of 10 s each, which keep no time per query, so a dot has no line to a p99. DiskANN keeps only its PQ codes in memory and reads every sector from the disk, since its index doesn't fit in memory. LanceDB IVF_RQ caches only its index files, so its rows are read from its table. Each system runs at its pick for recall@10 0.95, whose recall over the 500 test queries at 1 thread is 0.948 to 0.964. Higher is faster. Log scale.",
+   "footer": "faiss HNSW SQ8, faiss FastScan, faiss graph route, RaBitQ IVF 9-bit, DiskANN and Paimon 4-bit search through a call for a batch of queries that releases Python's lock. ColdIVF and LanceDB IVF_RQ search from 6 threads in one process. ColdIVF's module has no batch call.",
+   "notes": [
+    "Each row is headtohead.py's pick for the target, pick.py's verdict rule on the tune split, measured on the test split. Of a system's configurations it is the one with the most queries per second on 6 threads, which can differ from the ones its cold and warm charts show, and ColdIVF's is its Python module's.",
+    "invalid lists the thread counts, of 6 and 12, whose line swap-ins or compressions elsewhere on the machine made invalid. The chart writes (invalid) after such a 12-thread number, as the README's tables flag such a line, and a dash for a row without a 12-thread line.",
+    "mode, machine_state and code are those of the 6-thread line, and machine_state_12 and code_12 those of the 12-thread line, or null without one."
+   ],
+   "rows": [
     {
-     "recall10": 0.9,
-     "rows": [
-      {
-       "system": "coldivf",
-       "variant": "python",
-       "label": "ColdIVF",
-       "full_label": "ColdIVF",
-       "config_id": "tl640",
-       "qps": 11340.01,
-       "setting": {
-        "nprobe": 64,
-        "rerank": 29
-       },
-       "recall10": 0.907,
-       "mode": "whole",
-       "method": "threads",
-       "invalid": [],
-       "setting_text": "nprobe 64, rerank 29",
-       "source": "results/bench/bench-10m/coldivf.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T070027Z-bench-10m-f0a7"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         90.165,
-         90.165
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         11.0249,
-         11.0249
-        ]
-       },
-       "code": {
-        "system_version": "coldivf 0.1.0",
-        "wheel_sha256": {
-         "coldivf": "d558d78016ea5764e9da605ae36f56f846de5d6e6ab16d688b09ff1f78c03706",
-         "build_index": "7fe84ea102df6aafb2ef8ff93e1d0680a112280b76ae04ba60460cdae70064c1"
-        },
-        "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
-        "harness_unstaged": true
-       }
+     "label": "faiss HNSW32-SQ8",
+     "short": "faiss HNSW SQ8",
+     "group": "system",
+     "harness": "driver",
+     "system": "faiss-hnsw",
+     "variant": "",
+     "config_id": "hnsw32-sq8",
+     "setting": {
+      "ef_search": 96
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "ef 96",
+     "qps": 5973.56,
+     "qps_12": 9180.42,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9618,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/faiss-hnsw.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261010T233254Z-bench-10m-4442"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       88.215,
+       88.215
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       5.307129,
+       5.307129
+      ]
+     },
+     "code": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
       },
-      {
-       "system": "faiss-hnsw",
-       "variant": "",
-       "label": "faiss HNSW SQ8",
-       "full_label": "faiss HNSW32-SQ8",
-       "config_id": "hnsw32-sq8",
-       "qps": 10897.16,
-       "setting": {
-        "ef_search": 48
-       },
-       "recall10": 0.9332,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "ef 48",
-       "source": "results/bench/bench-10m/faiss-hnsw.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261010T225805Z-bench-10m-076a"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         88.72,
-         88.72
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         23.96289,
-         23.96289
-        ]
-       },
-       "code": {
-        "system_version": "1.15.1",
-        "wheel_sha256": {
-         "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
-        },
-        "harness_head": "277e1aa6ca830d3a7464c4d1c1fb4b46040f21c1",
-        "harness_unstaged": true
-       }
+      "harness_head": "f06b172f668ca671dd8361463f82585308f70628",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261010T225805Z-bench-10m-076a"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       88.72,
+       88.72
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       38.09473,
+       38.09473
+      ]
+     },
+     "code_12": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
       },
-      {
-       "system": "faiss-ivf",
-       "variant": "graph",
-       "label": "faiss graph route",
-       "full_label": "faiss IVF, HNSW quantizer, 640 per list",
-       "config_id": "cp640-rq1-hnsw32",
-       "qps": 4004.232,
-       "setting": {
-        "nprobe": 48,
-        "k_factor": 4,
-        "qb": 4,
-        "quantizer_ef": 128
-       },
-       "recall10": 0.9054,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 48, k_factor 4, qb 4, quantizer_ef 128",
-       "source": "results/bench/bench-10m/faiss-ivf.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261010T162812Z-bench-10m-16df"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         86.91,
-         86.91
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         13.38623,
-         13.38623
-        ]
-       },
-       "code": {
-        "system_version": "1.15.1",
-        "wheel_sha256": {
-         "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
-        },
-        "harness_head": "a79f822d41ffbc010ea609fa30e99db104e300fd",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "faiss-fastscan",
-       "variant": "fastscan",
-       "label": "faiss FastScan",
-       "full_label": "faiss FastScan + SQ8",
-       "config_id": "cp640-rq1",
-       "qps": 3210.606,
-       "setting": {
-        "nprobe": 48,
-        "k_factor": 4,
-        "qb": 8
-       },
-       "recall10": 0.9054,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 48, k_factor 4, qb 8",
-       "source": "results/bench/bench-10m/faiss-fastscan.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T030345Z-bench-10m-fe07"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.18,
-         89.18
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         15.15625,
-         15.15625
-        ]
-       },
-       "code": {
-        "system_version": "1.15.1",
-        "wheel_sha256": {
-         "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
-        },
-        "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "rabitq-ivf",
-       "variant": "",
-       "label": "RaBitQ IVF 9-bit",
-       "full_label": "RaBitQ-Library IVF 9-bit",
-       "config_id": "cp640-b9",
-       "qps": 2396.6,
-       "setting": {
-        "nprobe": 96
-       },
-       "recall10": 0.9162,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 96",
-       "source": "results/bench/bench-10m/rabitq-ivf.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T010123Z-bench-10m-1718"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         86.665,
-         86.665
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         5.09668,
-         5.09668
-        ]
-       },
-       "code": {
-        "system_version": "0.5.2",
-        "wheel_sha256": {
-         "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
-        },
-        "harness_head": "f06b172f668ca671dd8361463f82585308f70628",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "diskann",
-       "variant": "",
-       "label": "DiskANN",
-       "full_label": "DiskANN",
-       "config_id": "bpq192",
-       "qps": 2171.583,
-       "setting": {
-        "list": 32,
-        "beam": 8
-       },
-       "recall10": 0.9182,
-       "mode": "pq",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "list 32, beam 8",
-       "source": "results/bench/bench-10m/diskann.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261012T121412Z-bench-10m-diskann-e97c"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         87.585,
-         87.585
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         33.979,
-         33.979
-        ]
-       },
-       "code": {
-        "system_version": "diskann 0.60.0, diskann3 0.1.0+4c2a8d387fa3",
-        "wheel_sha256": {
-         "libdiskann3": "4c2a8d387fa3819effcf50ca91053ad386c8c9ff266f8549babab561df8c7690",
-         "diskann3": "4f9725851f5318bff0d1d51a5427883310a4c3dc85f8ea8bb188c32f0b4064c3"
-        },
-        "harness_head": "c0c704b62a7ed7c1c3fecd9af1c53629b515db98",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "lancedb",
-       "variant": "",
-       "label": "LanceDB IVF_RQ",
-       "full_label": "LanceDB IVF_RQ",
-       "config_id": "rq1-default",
-       "qps": 432.9665,
-       "setting": {
-        "nprobes": 32,
-        "refine_factor": 16
-       },
-       "recall10": 0.9384,
-       "mode": "index",
-       "method": "threads",
-       "invalid": [],
-       "setting_text": "nprobes 32, refine 16",
-       "source": "results/bench/bench-10m/lancedb.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T051226Z-bench-10m-ed6e"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         91.23,
-         91.23
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         10.68018,
-         10.68018
-        ]
-       },
-       "code": {
-        "system_version": "lancedb 0.40.0, pylance 13.0.0",
-        "wheel_sha256": {
-         "lancedb": "ae65415fdbe8886e5daba66e63fb2ce7a044711da8fc9c619914de5911126eef",
-         "pylance": "de62fd301cbddfc1791c5b8d9eabff3dcd1bdc57bc31c975385ed5641653ac05",
-         "pyarrow": "7a70caecee8e8eddd1fec158326d079eddb35e244f116b1270d7bd55b23a8be8"
-        },
-        "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "turbovec",
-       "variant": "",
-       "label": "turbovec calibrated",
-       "full_label": "turbovec 4-bit, calibrated",
-       "config_id": "b4-cal",
-       "qps": 212.7266,
-       "setting": {},
-       "recall10": 0.9132,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "none",
-       "source": "results/bench/bench-10m/turbovec.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T041332Z-bench-10m-bceb"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         91.165,
-         91.165
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         11.54346,
-         11.54346
-        ]
-       },
-       "code": {
-        "system_version": "1.1.2",
-        "wheel_sha256": {
-         "turbovec": "48c37c021d790bc220a113df876a70a3601c242f8b84c32b8a76b4b5d2a1f5a0"
-        },
-        "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
-        "harness_unstaged": true
-       }
-      },
-      {
-       "system": "paimon",
-       "variant": "",
-       "label": "Paimon 4-bit",
-       "full_label": "Paimon 4-bit",
-       "config_id": "b4",
-       "qps": 172.852,
-       "setting": {
-        "nprobe": 48
-       },
-       "recall10": 0.9072,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 48",
-       "source": "results/bench/bench-10m/paimon.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261010T195551Z-bench-10m-a6c4"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         86.915,
-         86.915
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         5.862305,
-         5.862305
-        ]
-       },
-       "code": {
-        "system_version": "paimon-vindex 0.5.0",
-        "wheel_sha256": {
-         "paimon-vindex": "d7a0160b07ae8310823adbb9ca8b04eef22fd4e7ed31b6e3381554a729b96109"
-        },
-        "harness_head": "a79f822d41ffbc010ea609fa30e99db104e300fd",
-        "harness_unstaged": true
-       }
-      }
-     ],
-     "not_reached": [
-      {
-       "system": "usearch",
-       "label": "usearch HNSW i8"
-      }
-     ]
+      "harness_head": "277e1aa6ca830d3a7464c4d1c1fb4b46040f21c1",
+      "harness_unstaged": true
+     }
     },
     {
-     "recall10": 0.95,
-     "rows": [
-      {
-       "system": "faiss-hnsw",
-       "variant": "",
-       "label": "faiss HNSW SQ8",
-       "full_label": "faiss HNSW32-SQ8",
-       "config_id": "hnsw32-sq8",
-       "qps": 5973.56,
-       "setting": {
-        "ef_search": 96
-       },
-       "recall10": 0.9618,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "ef 96",
-       "source": "results/bench/bench-10m/faiss-hnsw.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261010T233254Z-bench-10m-4442"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         88.215,
-         88.215
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         5.307129,
-         5.307129
-        ]
-       },
-       "code": {
-        "system_version": "1.15.1",
-        "wheel_sha256": {
-         "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
-        },
-        "harness_head": "f06b172f668ca671dd8361463f82585308f70628",
-        "harness_unstaged": true
-       }
+     "label": "ColdIVF",
+     "short": "ColdIVF",
+     "group": "coldivf",
+     "harness": "driver",
+     "system": "coldivf",
+     "variant": "python",
+     "config_id": "tl640",
+     "setting": {
+      "nprobe": 192,
+      "rerank": 39
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 192, rerank 39",
+     "qps": 5325.245,
+     "qps_12": 4938.208,
+     "method": "threads",
+     "method_12": "threads",
+     "recall10_warm": 0.9534,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/coldivf.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T073532Z-bench-10m-cdf6"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.1,
+       89.1
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       26.33643,
+       26.33643
+      ]
+     },
+     "code": {
+      "system_version": "coldivf 0.1.0",
+      "wheel_sha256": {
+       "coldivf": "d558d78016ea5764e9da605ae36f56f846de5d6e6ab16d688b09ff1f78c03706",
+       "build_index": "7fe84ea102df6aafb2ef8ff93e1d0680a112280b76ae04ba60460cdae70064c1"
       },
-      {
-       "system": "coldivf",
-       "variant": "python",
-       "label": "ColdIVF",
-       "full_label": "ColdIVF",
-       "config_id": "tl640",
-       "qps": 5325.245,
-       "setting": {
-        "nprobe": 192,
-        "rerank": 39
-       },
-       "recall10": 0.9534,
-       "mode": "whole",
-       "method": "threads",
-       "invalid": [],
-       "setting_text": "nprobe 192, rerank 39",
-       "source": "results/bench/bench-10m/coldivf.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T073532Z-bench-10m-cdf6"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.1,
-         89.1
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         26.33643,
-         26.33643
-        ]
-       },
-       "code": {
-        "system_version": "coldivf 0.1.0",
-        "wheel_sha256": {
-         "coldivf": "d558d78016ea5764e9da605ae36f56f846de5d6e6ab16d688b09ff1f78c03706",
-         "build_index": "7fe84ea102df6aafb2ef8ff93e1d0680a112280b76ae04ba60460cdae70064c1"
-        },
-        "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
-        "harness_unstaged": true
-       }
+      "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T073532Z-bench-10m-cdf6"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.1,
+       89.1
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       33.02295,
+       33.02295
+      ]
+     },
+     "code_12": {
+      "system_version": "coldivf 0.1.0",
+      "wheel_sha256": {
+       "coldivf": "d558d78016ea5764e9da605ae36f56f846de5d6e6ab16d688b09ff1f78c03706",
+       "build_index": "7fe84ea102df6aafb2ef8ff93e1d0680a112280b76ae04ba60460cdae70064c1"
       },
-      {
-       "system": "faiss-fastscan",
-       "variant": "fastscan",
-       "label": "faiss FastScan",
-       "full_label": "faiss FastScan + SQ8",
-       "config_id": "cp640-rq1",
-       "qps": 2252.965,
-       "setting": {
-        "nprobe": 128,
-        "k_factor": 4,
-        "qb": 8
-       },
-       "recall10": 0.9476,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 128, k_factor 4, qb 8",
-       "source": "results/bench/bench-10m/faiss-fastscan.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T030345Z-bench-10m-fe07"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.18,
-         89.18
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         5.436523,
-         5.436523
-        ]
-       },
-       "code": {
-        "system_version": "1.15.1",
-        "wheel_sha256": {
-         "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
-        },
-        "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
-        "harness_unstaged": true
-       }
+      "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "faiss FastScan + SQ8",
+     "short": "faiss FastScan",
+     "group": "system",
+     "harness": "driver",
+     "system": "faiss-fastscan",
+     "variant": "fastscan",
+     "config_id": "cp640-rq1",
+     "setting": {
+      "nprobe": 128,
+      "k_factor": 4,
+      "qb": 8
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 128, k_factor 4, qb 8",
+     "qps": 2252.965,
+     "qps_12": 2497.869,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9476,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/faiss-fastscan.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T030345Z-bench-10m-fe07"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.18,
+       89.18
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       5.436523,
+       5.436523
+      ]
+     },
+     "code": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
       },
-      {
-       "system": "faiss-ivf",
-       "variant": "graph",
-       "label": "faiss graph route",
-       "full_label": "faiss IVF, HNSW quantizer, 640 per list",
-       "config_id": "cp640-rq1-hnsw32",
-       "qps": 1791.039,
-       "setting": {
-        "nprobe": 128,
-        "k_factor": 8,
-        "qb": 4,
-        "quantizer_ef": 128
-       },
-       "recall10": 0.9526,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 128, k_factor 8, qb 4, quantizer_ef 128",
-       "source": "results/bench/bench-10m/faiss-ivf.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261010T162812Z-bench-10m-16df"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         86.91,
-         86.91
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         6.061035,
-         6.061035
-        ]
-       },
-       "code": {
-        "system_version": "1.15.1",
-        "wheel_sha256": {
-         "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
-        },
-        "harness_head": "a79f822d41ffbc010ea609fa30e99db104e300fd",
-        "harness_unstaged": true
-       }
+      "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T030345Z-bench-10m-fe07"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.18,
+       89.18
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       20.96533,
+       20.96533
+      ]
+     },
+     "code_12": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
       },
-      {
-       "system": "rabitq-ivf",
-       "variant": "",
-       "label": "RaBitQ IVF 9-bit",
-       "full_label": "RaBitQ-Library IVF 9-bit",
-       "config_id": "cp640-b9",
-       "qps": 1498.829,
-       "setting": {
-        "nprobe": 256
-       },
-       "recall10": 0.9644,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 256",
-       "source": "results/bench/bench-10m/rabitq-ivf.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T015735Z-bench-10m-2fc1"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         89.35,
-         89.35
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         6.904297,
-         6.904297
-        ]
-       },
-       "code": {
-        "system_version": "0.5.2",
-        "wheel_sha256": {
-         "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
-        },
-        "harness_head": "f06b172f668ca671dd8361463f82585308f70628",
-        "harness_unstaged": true
-       }
+      "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "faiss IVF, HNSW quantizer, 640 per list",
+     "short": "faiss graph route",
+     "group": "system",
+     "harness": "driver",
+     "system": "faiss-ivf",
+     "variant": "graph",
+     "config_id": "cp640-rq1-hnsw32",
+     "setting": {
+      "nprobe": 128,
+      "k_factor": 8,
+      "qb": 4,
+      "quantizer_ef": 128
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 128, k_factor 8, qb 4, quantizer_ef 128",
+     "qps": 1791.039,
+     "qps_12": 2217.353,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9526,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/faiss-ivf.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261010T162812Z-bench-10m-16df"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       86.91,
+       86.91
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       6.061035,
+       6.061035
+      ]
+     },
+     "code": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
       },
-      {
-       "system": "diskann",
-       "variant": "",
-       "label": "DiskANN",
-       "full_label": "DiskANN",
-       "config_id": "bpq192",
-       "qps": 1252.155,
-       "setting": {
-        "list": 64,
-        "beam": 16
-       },
-       "recall10": 0.9588,
-       "mode": "pq",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "list 64, beam 16",
-       "source": "results/bench/bench-10m/diskann.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261012T121412Z-bench-10m-diskann-e97c"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         87.585,
-         87.585
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         31.29541,
-         31.29541
-        ]
-       },
-       "code": {
-        "system_version": "diskann 0.60.0, diskann3 0.1.0+4c2a8d387fa3",
-        "wheel_sha256": {
-         "libdiskann3": "4c2a8d387fa3819effcf50ca91053ad386c8c9ff266f8549babab561df8c7690",
-         "diskann3": "4f9725851f5318bff0d1d51a5427883310a4c3dc85f8ea8bb188c32f0b4064c3"
-        },
-        "harness_head": "c0c704b62a7ed7c1c3fecd9af1c53629b515db98",
-        "harness_unstaged": true
-       }
+      "harness_head": "a79f822d41ffbc010ea609fa30e99db104e300fd",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261010T162812Z-bench-10m-16df"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       86.91,
+       86.91
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       19.13965,
+       19.13965
+      ]
+     },
+     "code_12": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
       },
-      {
-       "system": "lancedb",
-       "variant": "",
-       "label": "LanceDB IVF_RQ",
-       "full_label": "LanceDB IVF_RQ",
-       "config_id": "rq1-default",
-       "qps": 435.0648,
-       "setting": {
-        "nprobes": 48,
-        "refine_factor": 8
-       },
-       "recall10": 0.9562,
-       "mode": "index",
-       "method": "threads",
-       "invalid": [],
-       "setting_text": "nprobes 48, refine 8",
-       "source": "results/bench/bench-10m/lancedb.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261011T051226Z-bench-10m-ed6e"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         91.23,
-         91.23
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         8.630371,
-         8.630371
-        ]
-       },
-       "code": {
-        "system_version": "lancedb 0.40.0, pylance 13.0.0",
-        "wheel_sha256": {
-         "lancedb": "ae65415fdbe8886e5daba66e63fb2ce7a044711da8fc9c619914de5911126eef",
-         "pylance": "de62fd301cbddfc1791c5b8d9eabff3dcd1bdc57bc31c975385ed5641653ac05",
-         "pyarrow": "7a70caecee8e8eddd1fec158326d079eddb35e244f116b1270d7bd55b23a8be8"
-        },
-        "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
-        "harness_unstaged": true
-       }
+      "harness_head": "a79f822d41ffbc010ea609fa30e99db104e300fd",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "RaBitQ-Library IVF 9-bit",
+     "short": "RaBitQ IVF 9-bit",
+     "group": "system",
+     "harness": "driver",
+     "system": "rabitq-ivf",
+     "variant": "",
+     "config_id": "cp640-b9",
+     "setting": {
+      "nprobe": 256
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 256",
+     "qps": 1498.829,
+     "qps_12": 1744.818,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9644,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/rabitq-ivf.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T015735Z-bench-10m-2fc1"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.35,
+       89.35
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       6.904297,
+       6.904297
+      ]
+     },
+     "code": {
+      "system_version": "0.5.2",
+      "wheel_sha256": {
+       "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
       },
-      {
-       "system": "paimon",
-       "variant": "",
-       "label": "Paimon 4-bit",
-       "full_label": "Paimon 4-bit",
-       "config_id": "b4",
-       "qps": 52.80429,
-       "setting": {
-        "nprobe": 192
-       },
-       "recall10": 0.9524,
-       "mode": "whole",
-       "method": "batch call",
-       "invalid": [],
-       "setting_text": "nprobe 192",
-       "source": "results/bench/bench-10m/paimon.jsonl",
-       "machine_state": {
-        "batches": [
-         "20261010T203829Z-paimon-test-warm-4007"
-        ],
-        "gate_mode": "enforce",
-        "gate_passed": true,
-        "solo": true,
-        "cpu_idle_pct": [
-         91.81,
-         91.81
-        ],
-        "problems": [],
-        "power": "AC Power",
-        "low_power": false,
-        "load_1": [
-         8.75,
-         8.75
-        ]
-       },
-       "code": {
-        "system_version": "paimon-vindex 0.5.0",
-        "wheel_sha256": {
-         "paimon-vindex": "d7a0160b07ae8310823adbb9ca8b04eef22fd4e7ed31b6e3381554a729b96109"
-        },
-        "harness_head": "b8e66bdd867be822c5d7ab370f4b6b8d71247e1c",
-        "harness_unstaged": true
-       }
-      }
-     ],
-     "not_reached": [
-      {
-       "system": "turbovec",
-       "label": "turbovec"
+      "harness_head": "f06b172f668ca671dd8361463f82585308f70628",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T010123Z-bench-10m-1718"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       86.665,
+       86.665
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       30.03662,
+       30.03662
+      ]
+     },
+     "code_12": {
+      "system_version": "0.5.2",
+      "wheel_sha256": {
+       "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
       },
-      {
-       "system": "usearch",
-       "label": "usearch HNSW i8"
-      }
-     ]
+      "harness_head": "f06b172f668ca671dd8361463f82585308f70628",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "DiskANN",
+     "short": "DiskANN",
+     "group": "system",
+     "harness": "driver",
+     "system": "diskann",
+     "variant": "",
+     "config_id": "bpq192",
+     "setting": {
+      "list": 64,
+      "beam": 16
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "pq",
+     "threads": 6,
+     "setting_text": "list 64, beam 16",
+     "qps": 1252.155,
+     "qps_12": 1233.856,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9588,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/diskann.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261012T121412Z-bench-10m-diskann-e97c"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.585,
+       87.585
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       31.29541,
+       31.29541
+      ]
+     },
+     "code": {
+      "system_version": "diskann 0.60.0, diskann3 0.1.0+4c2a8d387fa3",
+      "wheel_sha256": {
+       "libdiskann3": "4c2a8d387fa3819effcf50ca91053ad386c8c9ff266f8549babab561df8c7690",
+       "diskann3": "4f9725851f5318bff0d1d51a5427883310a4c3dc85f8ea8bb188c32f0b4064c3"
+      },
+      "harness_head": "c0c704b62a7ed7c1c3fecd9af1c53629b515db98",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261012T121412Z-bench-10m-diskann-e97c"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.585,
+       87.585
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       42.33057,
+       42.33057
+      ]
+     },
+     "code_12": {
+      "system_version": "diskann 0.60.0, diskann3 0.1.0+4c2a8d387fa3",
+      "wheel_sha256": {
+       "libdiskann3": "4c2a8d387fa3819effcf50ca91053ad386c8c9ff266f8549babab561df8c7690",
+       "diskann3": "4f9725851f5318bff0d1d51a5427883310a4c3dc85f8ea8bb188c32f0b4064c3"
+      },
+      "harness_head": "c0c704b62a7ed7c1c3fecd9af1c53629b515db98",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "LanceDB IVF_RQ",
+     "short": "LanceDB IVF_RQ",
+     "group": "system",
+     "harness": "driver",
+     "system": "lancedb",
+     "variant": "",
+     "config_id": "rq1-default",
+     "setting": {
+      "nprobes": 48,
+      "refine_factor": 8
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "index",
+     "threads": 6,
+     "setting_text": "nprobes 48, refine 8",
+     "qps": 435.0648,
+     "qps_12": 431.5991,
+     "method": "threads",
+     "method_12": "threads",
+     "recall10_warm": 0.9562,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/lancedb.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T051226Z-bench-10m-ed6e"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.23,
+       91.23
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       8.630371,
+       8.630371
+      ]
+     },
+     "code": {
+      "system_version": "lancedb 0.40.0, pylance 13.0.0",
+      "wheel_sha256": {
+       "lancedb": "ae65415fdbe8886e5daba66e63fb2ce7a044711da8fc9c619914de5911126eef",
+       "pylance": "de62fd301cbddfc1791c5b8d9eabff3dcd1bdc57bc31c975385ed5641653ac05",
+       "pyarrow": "7a70caecee8e8eddd1fec158326d079eddb35e244f116b1270d7bd55b23a8be8"
+      },
+      "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T051226Z-bench-10m-ed6e"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.23,
+       91.23
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       11.72168,
+       11.72168
+      ]
+     },
+     "code_12": {
+      "system_version": "lancedb 0.40.0, pylance 13.0.0",
+      "wheel_sha256": {
+       "lancedb": "ae65415fdbe8886e5daba66e63fb2ce7a044711da8fc9c619914de5911126eef",
+       "pylance": "de62fd301cbddfc1791c5b8d9eabff3dcd1bdc57bc31c975385ed5641653ac05",
+       "pyarrow": "7a70caecee8e8eddd1fec158326d079eddb35e244f116b1270d7bd55b23a8be8"
+      },
+      "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "Paimon 4-bit",
+     "short": "Paimon 4-bit",
+     "group": "system",
+     "harness": "driver",
+     "system": "paimon",
+     "variant": "",
+     "config_id": "b4",
+     "setting": {
+      "nprobe": 192
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 192",
+     "qps": 52.80429,
+     "qps_12": 66.97463,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9524,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/paimon.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261010T203829Z-paimon-test-warm-4007"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.81,
+       91.81
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       8.75,
+       8.75
+      ]
+     },
+     "code": {
+      "system_version": "paimon-vindex 0.5.0",
+      "wheel_sha256": {
+       "paimon-vindex": "d7a0160b07ae8310823adbb9ca8b04eef22fd4e7ed31b6e3381554a729b96109"
+      },
+      "harness_head": "b8e66bdd867be822c5d7ab370f4b6b8d71247e1c",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261010T203829Z-paimon-test-warm-4007"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.81,
+       91.81
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       15.09326,
+       15.09326
+      ]
+     },
+     "code_12": {
+      "system_version": "paimon-vindex 0.5.0",
+      "wheel_sha256": {
+       "paimon-vindex": "d7a0160b07ae8310823adbb9ca8b04eef22fd4e7ed31b6e3381554a729b96109"
+      },
+      "harness_head": "b8e66bdd867be822c5d7ab370f4b6b8d71247e1c",
+      "harness_unstaged": true
+     }
     }
    ],
+   "not_reached": [
+    {
+     "system": "turbovec",
+     "label": "turbovec"
+    },
+    {
+     "system": "usearch",
+     "label": "usearch HNSW i8"
+    }
+   ],
+   "reference": "ColdIVF",
+   "footnote": "Recall target of 0.95 not reached: turbovec and usearch HNSW i8.",
    "files": {
-    "dark": "qps-10m-dark.svg"
+    "dark": "qps-10m-95-dark.svg"
+   }
+  },
+  {
+   "id": "qps-10m-90",
+   "kind": "h2h-qps",
+   "title": "Queries per second at 10M vectors, recall@10 0.90",
+   "dataset": "cohere10m-768-cosine",
+   "n": 10000000,
+   "unit": "queries per second",
+   "target_recall10": 0.9,
+   "preliminary": false,
+   "legend": [
+    "ColdIVF",
+    "Other systems"
+   ],
+   "subtitle": "10M vectors of cohere10m-768-cosine (Cohere 10M, 768 dimensions, cosine, 1,000 queries), on one Apple M3 Pro with 36 GB of memory. Each dot is a system's queries per second on 6 threads, the M3 Pro's performance cores, with every index read into memory first. The columns give them on 6 threads and on 12, as many as the M3 Pro has cores. Each is the median of 3 runs of 10 s each, which keep no time per query, so a dot has no line to a p99. DiskANN keeps only its PQ codes in memory and reads every sector from the disk, since its index doesn't fit in memory. LanceDB IVF_RQ caches only its index files, so its rows are read from its table. Each system runs at its pick for recall@10 0.90, whose recall over the 500 test queries at 1 thread is 0.905 to 0.938. Higher is faster. Log scale.",
+   "footer": "faiss HNSW SQ8, faiss graph route, faiss FastScan, RaBitQ IVF 9-bit, DiskANN, turbovec calibrated and Paimon 4-bit search through a call for a batch of queries that releases Python's lock. ColdIVF and LanceDB IVF_RQ search from 6 threads in one process. ColdIVF's module has no batch call.",
+   "notes": [
+    "Each row is headtohead.py's pick for the target, pick.py's verdict rule on the tune split, measured on the test split. Of a system's configurations it is the one with the most queries per second on 6 threads, which can differ from the ones its cold and warm charts show, and ColdIVF's is its Python module's.",
+    "invalid lists the thread counts, of 6 and 12, whose line swap-ins or compressions elsewhere on the machine made invalid. The chart writes (invalid) after such a 12-thread number, as the README's tables flag such a line, and a dash for a row without a 12-thread line.",
+    "mode, machine_state and code are those of the 6-thread line, and machine_state_12 and code_12 those of the 12-thread line, or null without one."
+   ],
+   "rows": [
+    {
+     "label": "ColdIVF",
+     "short": "ColdIVF",
+     "group": "coldivf",
+     "harness": "driver",
+     "system": "coldivf",
+     "variant": "python",
+     "config_id": "tl640",
+     "setting": {
+      "nprobe": 64,
+      "rerank": 29
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 64, rerank 29",
+     "qps": 11340.01,
+     "qps_12": 11605.0,
+     "method": "threads",
+     "method_12": "threads",
+     "recall10_warm": 0.907,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/coldivf.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T070027Z-bench-10m-f0a7"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       90.165,
+       90.165
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       11.0249,
+       11.0249
+      ]
+     },
+     "code": {
+      "system_version": "coldivf 0.1.0",
+      "wheel_sha256": {
+       "coldivf": "d558d78016ea5764e9da605ae36f56f846de5d6e6ab16d688b09ff1f78c03706",
+       "build_index": "7fe84ea102df6aafb2ef8ff93e1d0680a112280b76ae04ba60460cdae70064c1"
+      },
+      "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T070027Z-bench-10m-f0a7"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       90.165,
+       90.165
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       42.69678,
+       42.69678
+      ]
+     },
+     "code_12": {
+      "system_version": "coldivf 0.1.0",
+      "wheel_sha256": {
+       "coldivf": "d558d78016ea5764e9da605ae36f56f846de5d6e6ab16d688b09ff1f78c03706",
+       "build_index": "7fe84ea102df6aafb2ef8ff93e1d0680a112280b76ae04ba60460cdae70064c1"
+      },
+      "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "faiss HNSW32-SQ8",
+     "short": "faiss HNSW SQ8",
+     "group": "system",
+     "harness": "driver",
+     "system": "faiss-hnsw",
+     "variant": "",
+     "config_id": "hnsw32-sq8",
+     "setting": {
+      "ef_search": 48
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "ef 48",
+     "qps": 10897.16,
+     "qps_12": 16020.07,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9332,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/faiss-hnsw.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261010T225805Z-bench-10m-076a"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       88.72,
+       88.72
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       23.96289,
+       23.96289
+      ]
+     },
+     "code": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
+      },
+      "harness_head": "277e1aa6ca830d3a7464c4d1c1fb4b46040f21c1",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261010T225805Z-bench-10m-076a"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       88.72,
+       88.72
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       23.84912,
+       23.84912
+      ]
+     },
+     "code_12": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
+      },
+      "harness_head": "277e1aa6ca830d3a7464c4d1c1fb4b46040f21c1",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "faiss IVF, HNSW quantizer, 640 per list",
+     "short": "faiss graph route",
+     "group": "system",
+     "harness": "driver",
+     "system": "faiss-ivf",
+     "variant": "graph",
+     "config_id": "cp640-rq1-hnsw32",
+     "setting": {
+      "nprobe": 48,
+      "k_factor": 4,
+      "qb": 4,
+      "quantizer_ef": 128
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 48, k_factor 4, qb 4, quantizer_ef 128",
+     "qps": 4004.232,
+     "qps_12": 4772.67,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9054,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/faiss-ivf.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261010T162812Z-bench-10m-16df"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       86.91,
+       86.91
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       13.38623,
+       13.38623
+      ]
+     },
+     "code": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
+      },
+      "harness_head": "a79f822d41ffbc010ea609fa30e99db104e300fd",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261010T162812Z-bench-10m-16df"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       86.91,
+       86.91
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       11.59082,
+       11.59082
+      ]
+     },
+     "code_12": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
+      },
+      "harness_head": "a79f822d41ffbc010ea609fa30e99db104e300fd",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "faiss FastScan + SQ8",
+     "short": "faiss FastScan",
+     "group": "system",
+     "harness": "driver",
+     "system": "faiss-fastscan",
+     "variant": "fastscan",
+     "config_id": "cp640-rq1",
+     "setting": {
+      "nprobe": 48,
+      "k_factor": 4,
+      "qb": 8
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 48, k_factor 4, qb 8",
+     "qps": 3210.606,
+     "qps_12": 3411.724,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9054,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/faiss-fastscan.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T030345Z-bench-10m-fe07"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.18,
+       89.18
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       15.15625,
+       15.15625
+      ]
+     },
+     "code": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
+      },
+      "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T030345Z-bench-10m-fe07"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       89.18,
+       89.18
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       11.11768,
+       11.11768
+      ]
+     },
+     "code_12": {
+      "system_version": "1.15.1",
+      "wheel_sha256": {
+       "faiss-cpu": "92f8cded4ea3cea40b6375731c4acd6a7beeac37d0d716bdc3e1e8a18ef00c12"
+      },
+      "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "RaBitQ-Library IVF 9-bit",
+     "short": "RaBitQ IVF 9-bit",
+     "group": "system",
+     "harness": "driver",
+     "system": "rabitq-ivf",
+     "variant": "",
+     "config_id": "cp640-b9",
+     "setting": {
+      "nprobe": 96
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 96",
+     "qps": 2396.6,
+     "qps_12": 2717.936,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9162,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/rabitq-ivf.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T010123Z-bench-10m-1718"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       86.665,
+       86.665
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       5.09668,
+       5.09668
+      ]
+     },
+     "code": {
+      "system_version": "0.5.2",
+      "wheel_sha256": {
+       "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
+      },
+      "harness_head": "f06b172f668ca671dd8361463f82585308f70628",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T010123Z-bench-10m-1718"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       86.665,
+       86.665
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       29.58984,
+       29.58984
+      ]
+     },
+     "code_12": {
+      "system_version": "0.5.2",
+      "wheel_sha256": {
+       "rabitqlib": "c885fdd0bd7ae96949a952bdc937a892691bbc4c79d81f1472d71ce28e066fa0"
+      },
+      "harness_head": "f06b172f668ca671dd8361463f82585308f70628",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "DiskANN",
+     "short": "DiskANN",
+     "group": "system",
+     "harness": "driver",
+     "system": "diskann",
+     "variant": "",
+     "config_id": "bpq192",
+     "setting": {
+      "list": 32,
+      "beam": 8
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "pq",
+     "threads": 6,
+     "setting_text": "list 32, beam 8",
+     "qps": 2171.583,
+     "qps_12": 2414.8,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9182,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/diskann.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261012T121412Z-bench-10m-diskann-e97c"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.585,
+       87.585
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       33.979,
+       33.979
+      ]
+     },
+     "code": {
+      "system_version": "diskann 0.60.0, diskann3 0.1.0+4c2a8d387fa3",
+      "wheel_sha256": {
+       "libdiskann3": "4c2a8d387fa3819effcf50ca91053ad386c8c9ff266f8549babab561df8c7690",
+       "diskann3": "4f9725851f5318bff0d1d51a5427883310a4c3dc85f8ea8bb188c32f0b4064c3"
+      },
+      "harness_head": "c0c704b62a7ed7c1c3fecd9af1c53629b515db98",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261012T121412Z-bench-10m-diskann-e97c"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       87.585,
+       87.585
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       50.92529,
+       50.92529
+      ]
+     },
+     "code_12": {
+      "system_version": "diskann 0.60.0, diskann3 0.1.0+4c2a8d387fa3",
+      "wheel_sha256": {
+       "libdiskann3": "4c2a8d387fa3819effcf50ca91053ad386c8c9ff266f8549babab561df8c7690",
+       "diskann3": "4f9725851f5318bff0d1d51a5427883310a4c3dc85f8ea8bb188c32f0b4064c3"
+      },
+      "harness_head": "c0c704b62a7ed7c1c3fecd9af1c53629b515db98",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "LanceDB IVF_RQ",
+     "short": "LanceDB IVF_RQ",
+     "group": "system",
+     "harness": "driver",
+     "system": "lancedb",
+     "variant": "",
+     "config_id": "rq1-default",
+     "setting": {
+      "nprobes": 32,
+      "refine_factor": 16
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "index",
+     "threads": 6,
+     "setting_text": "nprobes 32, refine 16",
+     "qps": 432.9665,
+     "qps_12": 420.132,
+     "method": "threads",
+     "method_12": "threads",
+     "recall10_warm": 0.9384,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/lancedb.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T051226Z-bench-10m-ed6e"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.23,
+       91.23
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       10.68018,
+       10.68018
+      ]
+     },
+     "code": {
+      "system_version": "lancedb 0.40.0, pylance 13.0.0",
+      "wheel_sha256": {
+       "lancedb": "ae65415fdbe8886e5daba66e63fb2ce7a044711da8fc9c619914de5911126eef",
+       "pylance": "de62fd301cbddfc1791c5b8d9eabff3dcd1bdc57bc31c975385ed5641653ac05",
+       "pyarrow": "7a70caecee8e8eddd1fec158326d079eddb35e244f116b1270d7bd55b23a8be8"
+      },
+      "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T051226Z-bench-10m-ed6e"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.23,
+       91.23
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       8.187988,
+       8.187988
+      ]
+     },
+     "code_12": {
+      "system_version": "lancedb 0.40.0, pylance 13.0.0",
+      "wheel_sha256": {
+       "lancedb": "ae65415fdbe8886e5daba66e63fb2ce7a044711da8fc9c619914de5911126eef",
+       "pylance": "de62fd301cbddfc1791c5b8d9eabff3dcd1bdc57bc31c975385ed5641653ac05",
+       "pyarrow": "7a70caecee8e8eddd1fec158326d079eddb35e244f116b1270d7bd55b23a8be8"
+      },
+      "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "turbovec 4-bit, calibrated",
+     "short": "turbovec calibrated",
+     "group": "system",
+     "harness": "driver",
+     "system": "turbovec",
+     "variant": "",
+     "config_id": "b4-cal",
+     "setting": {},
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "none",
+     "qps": 212.7266,
+     "qps_12": 291.2721,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9132,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/turbovec.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261011T041332Z-bench-10m-bceb"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.165,
+       91.165
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       11.54346,
+       11.54346
+      ]
+     },
+     "code": {
+      "system_version": "1.1.2",
+      "wheel_sha256": {
+       "turbovec": "48c37c021d790bc220a113df876a70a3601c242f8b84c32b8a76b4b5d2a1f5a0"
+      },
+      "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261011T041332Z-bench-10m-bceb"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       91.165,
+       91.165
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       22.00391,
+       22.00391
+      ]
+     },
+     "code_12": {
+      "system_version": "1.1.2",
+      "wheel_sha256": {
+       "turbovec": "48c37c021d790bc220a113df876a70a3601c242f8b84c32b8a76b4b5d2a1f5a0"
+      },
+      "harness_head": "258588f8d59451bc0914bdfccea944eee86ac201",
+      "harness_unstaged": true
+     }
+    },
+    {
+     "label": "Paimon 4-bit",
+     "short": "Paimon 4-bit",
+     "group": "system",
+     "harness": "driver",
+     "system": "paimon",
+     "variant": "",
+     "config_id": "b4",
+     "setting": {
+      "nprobe": 48
+     },
+     "dataset": "cohere10m-768-cosine",
+     "n": 10000000,
+     "mode": "whole",
+     "threads": 6,
+     "setting_text": "nprobe 48",
+     "qps": 172.852,
+     "qps_12": 214.2731,
+     "method": "batch call",
+     "method_12": "batch call",
+     "recall10_warm": 0.9072,
+     "recall10_warm_queries": 500,
+     "recall10_warm_split": "test",
+     "invalid": [],
+     "source": "results/bench/bench-10m/paimon.jsonl",
+     "machine_state": {
+      "batches": [
+       "20261010T195551Z-bench-10m-a6c4"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       86.915,
+       86.915
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       5.862305,
+       5.862305
+      ]
+     },
+     "code": {
+      "system_version": "paimon-vindex 0.5.0",
+      "wheel_sha256": {
+       "paimon-vindex": "d7a0160b07ae8310823adbb9ca8b04eef22fd4e7ed31b6e3381554a729b96109"
+      },
+      "harness_head": "a79f822d41ffbc010ea609fa30e99db104e300fd",
+      "harness_unstaged": true
+     },
+     "machine_state_12": {
+      "batches": [
+       "20261010T212139Z-paimon-test-warm-cce6"
+      ],
+      "gate_mode": "enforce",
+      "gate_passed": true,
+      "solo": true,
+      "cpu_idle_pct": [
+       88.625,
+       88.625
+      ],
+      "problems": [],
+      "power": "AC Power",
+      "low_power": false,
+      "load_1": [
+       11.38916,
+       11.38916
+      ]
+     },
+     "code_12": {
+      "system_version": "paimon-vindex 0.5.0",
+      "wheel_sha256": {
+       "paimon-vindex": "d7a0160b07ae8310823adbb9ca8b04eef22fd4e7ed31b6e3381554a729b96109"
+      },
+      "harness_head": "b8e66bdd867be822c5d7ab370f4b6b8d71247e1c",
+      "harness_unstaged": true
+     }
+    }
+   ],
+   "not_reached": [
+    {
+     "system": "usearch",
+     "label": "usearch HNSW i8"
+    }
+   ],
+   "reference": "ColdIVF",
+   "footnote": "Recall target of 0.90 not reached: usearch HNSW i8.",
+   "files": {
+    "dark": "qps-10m-90-dark.svg"
    }
   },
   {
