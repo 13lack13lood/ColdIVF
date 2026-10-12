@@ -749,6 +749,9 @@ impl Writer {
     /// the new job goes on from where it got, whatever is due. A writer runs one job at a time, so while its job or
     /// that job's [`Done`] lives, this fails with `WouldBlock`.
     pub fn begin_compact(&mut self, params: &MaintainParams) -> Result<Option<Job>, Error> {
+        // Settings that a run would refuse fail even when no run is due.
+        maintain::check(params)?;
+
         if !maintain::job::kept(&self.root).is_empty() {
             return self.begin(params, RunKind::Auto).map(Some);
         }
@@ -842,6 +845,7 @@ impl Writer {
 
     /// What maintenance with `params` would do now. It reads the file's ids when a change hid any vector.
     pub fn status(&self, params: &MaintainParams) -> Result<Status, Error> {
+        maintain::check(params)?;
         Ok(maintain::status(&self.index.inner(), params, self.idle())?.0)
     }
 

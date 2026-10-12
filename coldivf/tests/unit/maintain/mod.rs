@@ -335,6 +335,23 @@ fn status_says_what_a_run_would_do() {
     let s = writer.status(&settings()).unwrap();
     assert_eq!((s.pending, s.deleted, s.regions_due, s.major_due), (0, 0, 0, false));
 
+    // Settings that a run would refuse fail here too, with no run due.
+    let bad = MaintainParams {
+        minor: MinorParams {
+            shrink: 2.0,
+            ..MinorParams::default()
+        },
+        ..settings()
+    };
+    assert_eq!(
+        writer.status(&bad).err().map(|e| e.kind()),
+        Some(ErrorKind::InvalidInput)
+    );
+    assert_eq!(
+        writer.begin_compact(&bad).err().map(|e| e.kind()),
+        Some(ErrorKind::InvalidInput)
+    );
+
     (0..100).for_each(|i| {
         writer
             .insert(9000 + i, &rows.data[i as usize * DIM..(i as usize + 1) * DIM])
