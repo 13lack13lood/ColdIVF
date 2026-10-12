@@ -521,7 +521,7 @@ SYSTEM_NAMES = {
 }
 
 # How a warm line on 6 threads ran its queries side by side, by headtohead.py's name for it, in the order the
-# footnotes of the queries per second (QPS) charts list them.
+# footers of the queries per second (QPS) charts list them.
 METHODS = ("batch call", "processes", "threads")
 
 
@@ -745,6 +745,12 @@ def malloc_note(rows: list[dict]) -> str:
     return ""
 
 
+def not_reached_note(target: float, missing: list[dict]) -> str:
+    """A chart's footnote on the systems that don't reach its target, eg. "Recall target of 0.95 not reached: RaBitQ
+    HNSW and turbovec.", by their labels in the order of `missing`, listed as the README lists names."""
+    return f"Recall target of {target:.2f} not reached: {listed([m['label'] for m in missing])}."
+
+
 def h2h_charts(suite_path: Path, repo: Path, scale: str = "10m") -> tuple[list[dict], dict]:
     """A head-to-head's charts from its suite's results, by headtohead.py's picks: the cold first query and the warm
     query at 1 thread at recall@10 0.95 and 0.90, queries per second on 6 and 12 threads at each target where ColdIVF
@@ -884,6 +890,15 @@ def h2h_charts(suite_path: Path, repo: Path, scale: str = "10m") -> tuple[list[d
                       "those of the 12-thread line, or null without one."],
             "rows": rows, "not_reached": missing(rows), "reference": entry["reference"],
         })
+
+    # A QPS chart names the systems that don't reach its target in a footnote under its axis. A system that reaches it
+    # but has no number on 6 threads has no row either, and the footnote leaves it out.
+    for c in charts:
+        reached = {r["system"] for r in data["targets"][c["target_recall10"]]["rows"]}
+        gone = [m for m in c["not_reached"] if m["system"] not in reached]
+
+        if c["kind"] == "h2h-qps" and gone:
+            c["footnote"] = not_reached_note(c["target_recall10"], gone)
 
     rows, seen = [], set()
     shown = {r["label"] for c in charts if c["kind"] == "h2h-cold" for r in c["rows"]}
@@ -1365,12 +1380,15 @@ def _dot_chart(chart: dict, t: dict, path: Path, axis: str, ticks, dot: str, lin
                columns: tuple) -> None:
     """A dot at each row's `dot` value with a line to its p99, the value `line` names, or no lines when `line` is None,
     on a log scale labeled `axis` with ticks written by `ticks`. Each row's name and detail stand on the left, and the
-    two `columns` on the right, each a header and the text it gives a row."""
+    two `columns` on the right, each a header and the text it gives a row. The chart's footnote, when it has one, eg.
+    on the systems that don't reach its target, stands under the axis at the left margin."""
     m = _mpl()
     rows = chart["rows"]
     row_h, left, plot_w = 31.0, 300.0, 290.0
+    # A footnote takes a line of its own under the axis's label.
+    foot = chart.get("footnote")
     page = Page(t, chart["title"] + (" (preliminary)" if chart.get("preliminary", False) else ""),
-                34 + row_h * len(rows) + 42)
+                34 + row_h * len(rows) + 42 + (20 if foot else 0))
     top = page.top + 34
     ax = page.axes(left, top, plot_w, row_h * len(rows))
     # A chart without lines leaves its last dot the room it leaves its first.
@@ -1425,6 +1443,10 @@ def _dot_chart(chart: dict, t: dict, path: Path, axis: str, ticks, dot: str, lin
 
     page.fig.legend(handles=handles, loc="upper left", ncol=len(handles), handlelength=1.6, columnspacing=1.8,
                     borderaxespad=0, borderpad=0, bbox_to_anchor=page.anchor(MARGIN, page.top + 4))
+
+    if foot:
+        page.text(MARGIN, top + row_h * len(rows) + 48, foot, size=8, color=t["ink2"])
+
     page.save(path)
 
 

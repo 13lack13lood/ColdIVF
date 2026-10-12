@@ -241,6 +241,9 @@ class ChartsTest(unittest.TestCase):
         texts = svg_texts(out / "cold-coldivf-dark.svg")
         self.assertIn("nprobe 96, rerank 35 · recall 0.951 · 2 trials", texts)
         self.assertIn("6.50 ms", texts)
+        # It shows only ColdIVF's setups, so it names no system that misses its target.
+        self.assertNotIn("footnote", json.loads((out / "chart-data.json").read_text())["charts"][0])
+        self.assertFalse([s for s in texts if "not reached" in s])
 
 
 # A same-batch check of ColdIVF's module, its binaries and faiss with batched reads, on the head-to-head's indexes.
@@ -475,6 +478,37 @@ class HeadToHeadChartsTest(unittest.TestCase):
         qps = [c for c in self.charts if c["kind"] == "h2h-qps"]
         self.assertEqual([c["id"] for c in qps], ["qps-10m-95", "qps-10m-90"])
         self.assertTrue(all(any(r["system"] == "coldivf" for r in c["rows"]) for c in qps))
+
+    def test_each_qps_chart_names_the_systems_that_dont_reach_its_target_in_a_footnote(self):
+        # The cold and warm charts leave those systems out too, and name none of them.
+        self.assertEqual({c["id"]: c.get("footnote") for c in self.charts},
+                         {"cold-10m-95": None, "cold-10m-90": None, "warm-10m-95": None, "warm-10m-90": None,
+                          "qps-10m-95": "Recall target of 0.95 not reached: turbovec.",
+                          "qps-10m-90": "Recall target of 0.90 not reached: turbovec.",
+                          "memory-10m": None, "build-10m": None})
+        # Several names keep the list's order and are listed as the README lists names.
+        names = [{"system": s, "label": s} for s in ("RaBitQ HNSW", "turbovec", "usearch HNSW i8")]
+        self.assertEqual(charts.not_reached_note(0.95, names[:2]),
+                         "Recall target of 0.95 not reached: RaBitQ HNSW and turbovec.")
+        self.assertEqual(charts.not_reached_note(0.9, names),
+                         "Recall target of 0.90 not reached: RaBitQ HNSW, turbovec and usearch HNSW i8.")
+        # Where every system reaches each target, no chart has a footnote.
+        (self.root / "results" / "t" / "turbovec.jsonl").write_text("")
+        made, _ = charts.h2h_charts(self.root / "suite.toml", self.root)
+        self.assertEqual([c["not_reached"] for c in made if c["kind"] != "h2h-memory"], [[]] * 6)
+        self.assertFalse([c["id"] for c in made if "footnote" in c])
+
+    def test_a_qps_footnote_leaves_out_a_system_that_reaches_the_target_with_no_number_on_6_threads(self):
+        # faiss reaches both targets but has no 6-thread line, so its QPS charts have no row of it.
+        path = self.root / "results" / "t" / "faiss-ivf.jsonl"
+        lines = [json.loads(x) for x in path.read_text().splitlines()]
+        path.write_text("".join(json.dumps(x) + "\n" for x in lines if x.get("threads") != 6))
+        made = {c["id"]: c for c in charts.h2h_charts(self.root / "suite.toml", self.root)[0]}
+
+        for name, target in (("qps-10m-95", "0.95"), ("qps-10m-90", "0.90")):
+            self.assertEqual([r["system"] for r in made[name]["rows"]], ["coldivf"])
+            self.assertEqual([m["label"] for m in made[name]["not_reached"]], ["faiss IVF", "turbovec"])
+            self.assertEqual(made[name]["footnote"], f"Recall target of {target} not reached: turbovec.")
 
     def test_a_qps_row_lists_an_invalid_12_thread_line(self):
         # faiss's 12-thread line is its only one, and swap-ins or compressions during its runs made it invalid.
@@ -740,13 +774,29 @@ class HeadToHeadChartsTest(unittest.TestCase):
         self.assertEqual(warm[warm.index("0.410 ms") + 1], "0.615 ms")
         self.assertEqual(warm[warm.index("2.10 ms") + 1], "3.15 ms")
 
-        # A QPS chart heads its two columns once, with the thread counts, and its legend has no line to a p99. Like the
-        # cold and warm charts, it leaves out the systems that don't reach its target.
+        # A QPS chart heads its two columns once, with the thread counts, and its legend has no line to a p99.
         for name in ("qps-10m-95", "qps-10m-90"):
             texts = svg_texts(out / f"{name}-dark.svg")
             self.assertEqual((texts.count("6 threads"), texts.count("12 threads")), (1, 1), name)
-            self.assertFalse({"p50", "p99", "Line to the p99", "turbovec"} & set(texts), name)
-            self.assertFalse([s for s in texts if s.startswith("Not reached")], name)
+            self.assertFalse({"p50", "p99", "Line to the p99"} & set(texts), name)
+
+        # A cold, warm or QPS chart leaves out the systems that don't reach its target. A QPS chart names them once, in
+        # its footnote, which chart-data.json records, and a cold or warm chart names none.
+        written = {c["id"]: c for c in json.loads((out / "chart-data.json").read_text())["charts"]}
+        self.assertEqual([k for k, c in written.items() if "footnote" in c], ["qps-10m-95", "qps-10m-90"])
+
+        for c in self.charts:
+            if c["kind"] == "h2h-memory":
+                continue
+
+            texts = svg_texts(out / f"{c['id']}-dark.svg")
+            named = [s for s in texts if "turbovec" in s or "not reached" in s]
+
+            if c["kind"] == "h2h-qps":
+                foot = f"Recall target of {c['target_recall10']:.2f} not reached: turbovec."
+                self.assertEqual((named, written[c["id"]]["footnote"]), ([foot], foot), c["id"])
+            else:
+                self.assertEqual(named, [], c["id"])
 
         qps = svg_texts(out / "qps-10m-95-dark.svg")
         self.assertIn("Queries per second at 0.001M vectors, recall@10 0.95", qps)
@@ -816,6 +866,49 @@ class HeadToHeadChartsTest(unittest.TestCase):
                            charts.MARGIN)
         self.assertLess(boxes["16,020 (invalid)"].x1, charts.WIDTH - charts.MARGIN)
         self.assertGreater(min(b.x0 for b in boxes.values()), charts.MARGIN)
+
+    @unittest.skipUnless(HAS_MATPLOTLIB, "matplotlib isn't installed")
+    def test_a_footnote_stands_under_the_axis_at_the_left_margin_and_moves_nothing_else(self):
+        # A footnote of three names, more than any of the 1M and 10M charts have, and the same chart without one.
+        chart = json.loads(json.dumps(self.by_id["qps-10m-95"]))
+        names = [{"system": s, "label": s} for s in ("RaBitQ HNSW", "turbovec", "usearch HNSW i8")]
+        chart["footnote"] = charts.not_reached_note(0.95, names)
+        bare = {k: v for k, v in chart.items() if k != "footnote"}
+        save, pages, rc = charts.Page.save, [], charts._rc(charts.THEME)
+
+        def keep(page, path):
+            pages.append(page)
+            save(page, path)
+
+        with mock.patch.object(charts.Page, "save", keep), charts._mpl().matplotlib.rc_context(rc):
+            for c in (chart, bare):
+                charts.DRAW[c["kind"]]({}, c, charts.THEME, self.root / "qps.svg")
+
+            def boxes(page) -> dict:
+                """The boxes of the figure's texts, its axes, its axis's label and its legend, in points."""
+                renderer = page.fig.canvas.get_renderer()
+                (ax,) = page.fig.axes
+                return {t.get_text(): t.get_window_extent(renderer) for t in page.fig.texts} | {
+                    "axes": ax.get_window_extent(renderer), "label": ax.xaxis.label.get_window_extent(renderer),
+                    "legend": page.fig.legends[0].get_window_extent(renderer)}
+
+            drawn, plain = boxes(pages[0]), boxes(pages[1])
+            (foot,) = [t for t in pages[0].fig.texts if t.get_text() == chart["footnote"]]
+
+        self.assertEqual((foot.get_fontsize(), foot.get_color()), (8, charts.THEME["ink2"]))
+        box = drawn[chart["footnote"]]
+        self.assertAlmostEqual(box.x0, charts.MARGIN)
+        self.assertLess(box.x1, charts.WIDTH - charts.MARGIN)
+        # It stands under the axis's label and inside the figure, which grows to hold it.
+        self.assertLess(box.y1, drawn["label"].y0)
+        self.assertGreater(box.y0, 0)
+        self.assertGreater(pages[0].h, pages[1].h)
+        # Everything else stands where it stands without the footnote, as far from the top and the left edge.
+        self.assertEqual(set(drawn) - set(plain), {chart["footnote"]})
+
+        for k, b in plain.items():
+            self.assertAlmostEqual(pages[0].h - drawn[k].y1, pages[1].h - b.y1, places=6, msg=k)
+            self.assertAlmostEqual(drawn[k].x0, b.x0, places=6, msg=k)
 
     @unittest.skipUnless(HAS_MATPLOTLIB, "matplotlib isn't installed")
     def test_an_invalid_12_thread_number_is_marked_and_a_missing_one_is_a_dash(self):
