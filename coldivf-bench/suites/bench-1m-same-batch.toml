@@ -1,0 +1,121 @@
+# ColdIVF's module and its closest rival at recall@10 0.95 at 1M, timed in one batch. In bench-1m.toml the module ran
+# in a batch of its own and faiss IVF with batched reads at 2,560 vectors per list in another, each beside ColdIVF's
+# binaries. Here the three cells run interleaved in the same rounds, at bench-1m.toml's 0.95 picks, 300 test trials
+# for the module and faiss as there and 100 for the binaries, the control that ties this batch to that run's. faiss's
+# index is built again by bench-1m.toml's config, since that run deleted it, and a warm run on the test split gives the
+# new index's recall at the pick. ColdIVF searches bench-1m.toml's index.
+#
+# From coldivf-bench/py, with ColdIVF's 1M index in place:
+#   driver.py ../suites/bench-1m-same-batch.toml --only build --gate warn
+#   driver.py ../suites/bench-1m-same-batch.toml --only warm,cold,refs
+# The second batch times, so it runs as the machine's only heavy job once the CPU is at least 85% idle. Then delete
+# data/bench.noindex/bench-1m-same-batch.
+
+phase = "bench-1m-same-batch"
+dataset = "cohere10m-768-cosine"
+n = 1000000
+index_root = "data/bench.noindex/bench-1m-same-batch"
+truth = "data/cohere10m-768-cosine-1000000.gt.ibin"
+seed = 1
+k = 10
+max_attempts = 3
+
+[gate]
+mode = "enforce"
+max_wait_s = 7200
+
+[refs]
+mode = "on"
+coldivf_index = "data/cohere-50k.coldivf"
+coldivf_dataset = "cohere-768-cosine"
+coldivf_n = 50000
+coldivf_params = { nprobe = 32, rerank = 39 }
+
+[[system]]
+name = "coldivf"
+adapter = "coldivf"
+
+  [[system.build]]
+  config_id = "tl320"
+  index = "data/bench.noindex/bench-1m/coldivf/tl320-n1000000-s1"
+
+  [[system.cold]]
+  config_id = "tl320"
+  params = { nprobe = 128, rerank = 64 }
+  split = "test"
+  trials = 100
+  group = "same-batch"
+  dummy = "data/bench.noindex/bench-1m/coldivf/tl320-n1000000-s1-dummy200000"
+
+[[system]]
+name = "coldivf"
+variant = "python"
+adapter = "coldivf_py"
+python = "${COLDIVF_BENCH_VENVS}/venv-coldivf/bin/python3"
+
+  [[system.build]]
+  config_id = "tl320"
+  index = "data/bench.noindex/bench-1m/coldivf/tl320-n1000000-s1"
+
+  [[system.warm]]
+  config_id = "tl320"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 128, rerank = 64 },
+  ]
+
+  [[system.cold]]
+  config_id = "tl320"
+  params = { nprobe = 128, rerank = 64 }
+  split = "test"
+  trials = 300
+  group = "same-batch"
+  dummy = "data/bench.noindex/bench-1m/coldivf/tl320-n1000000-s1-dummy200000"
+
+[[system]]
+name = "faiss-ivf"
+variant = "shipped"
+adapter = "faiss_ivf"
+
+  [[system.build]]
+  config_id = "vpl2560-rq1"
+  config = { vectors_per_list = 2560, bits = 1 }
+  threads = 10
+  disk_gb = 2
+  timeout_s = 10800
+
+  [[system.build]]
+  config_id = "dummy2560-rq1"
+  config = { vectors_per_list = 2560, bits = 1 }
+  n = 50000
+  threads = 10
+  disk_gb = 1
+  timeout_s = 1800
+
+[[system]]
+name = "faiss-ivf"
+variant = "batched"
+adapter = "faiss_ivf"
+
+  [[system.build]]
+  config_id = "vpl2560-rq1"
+  index = "data/bench.noindex/bench-1m-same-batch/faiss-ivf-shipped/vpl2560-rq1-n1000000-s1"
+
+  [[system.warm]]
+  config_id = "vpl2560-rq1"
+  split = "test"
+  passes = 3
+  warmup = 1000
+  settings = [
+    { nprobe = 24, k_factor = 8, qb = 4 },
+  ]
+
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 8, qb = 4 }
+  split = "test"
+  trials = 300
+  group = "same-batch"
+  dummy = "data/bench.noindex/bench-1m-same-batch/faiss-ivf-shipped/dummy2560-rq1-n50000-s1"

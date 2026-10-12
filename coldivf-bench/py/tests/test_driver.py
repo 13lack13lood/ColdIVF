@@ -1,5 +1,6 @@
 import io
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -520,6 +521,20 @@ variant = "loaded"
         self.assertTrue(all(x["error"] == "swapins 2 during the timed passes" for x in warm), warm[0]["error"])
         self.assertTrue(all(x["swapins_delta"] == 2 and x["recall10"] is not None for x in warm))
 
+    def test_lines_name_the_index_as_its_build_left_it_while_a_session_changes_it(self):
+        # The "session" variant adds a log to its index while its warm run has it open, as AsterVec's store does. A
+        # batch that reads the index's files only once a session is open sees a transient state, or a file that a
+        # restore removes as it reads, so every line must name the index as it was before any process opened it.
+        self.batch("session", only={"build"})
+        self.batch("session", only={"warm"})
+        lines = self.lines()
+        built = next(x for x in lines if x["kind"] == "build" and x["n"] == 1500)
+        warm = [x for x in lines if x["kind"] == "warm"]
+        self.assertEqual([x["status"] for x in warm], ["ok"] * 2)
+        self.assertEqual({x["index_identity"]["files"] for x in warm}, {built["index_identity"]["files"]})
+        self.assertTrue(all(x["index_identity"] == built["index_identity"] for x in warm))
+        self.assertFalse(any(p.name == "session.log" for p in (self.root / "indexes").rglob("*")))
+
     def test_unsupported_regime_writes_one_line(self):
         self.batch("noc1", only={"build", "cold"})
         c1 = [x for x in self.lines() if x["kind"] == "cold" and x["regime"] == "c1"]
@@ -547,6 +562,25 @@ variant = "loaded"
         self.assertIn("cold fake:flat:c0 group=main", out.getvalue())
         self.assertIn("3 of 3 trials to do", out.getvalue())
         self.assertFalse((self.root / "results" / "test" / "fake.jsonl").exists())
+
+    def test_lines_record_the_malloc_cache_setting(self):
+        # A build whose index folder is gone builds again and writes a line of its own, as a re-measure of its peak
+        # does. Each line records whether macOS malloc's cache of freed large blocks was off, since that changes the
+        # footprints it holds.
+        with mock.patch.dict(os.environ):
+            os.environ.pop("MallocLargeCache", None)
+            self.batch(only={"build"})
+
+        shutil.rmtree(self.root / "indexes")
+
+        with mock.patch.dict(os.environ, {"MallocLargeCache": "0"}):
+            self.batch(only={"build"})
+
+        builds = [x for x in self.lines() if x["kind"] == "build" and x["n"] == 1500]
+        self.assertEqual([x["status"] for x in builds], ["ok", "ok"])
+        self.assertEqual(builds[0]["run_key"], builds[1]["run_key"])
+        self.assertNotIn("MallocLargeCache", builds[0]["provenance"]["env"])
+        self.assertEqual(builds[1]["provenance"]["env"]["MallocLargeCache"], "0")
 
     def test_systems_select_a_variant_by_name_and_variant(self):
         suite = driver.load_suite(write_suite(self.root, variant="fast"))

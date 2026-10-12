@@ -416,11 +416,13 @@ def dist_sha256(name: str) -> str | None:
     return hashlib.sha256(record.encode()).hexdigest() if record else None
 
 
-# Environment variables that change how the systems run.
+# Environment variables that change how the systems run. MallocLargeCache=0 turns off macOS malloc's cache of freed
+# large blocks, which otherwise stays inside a process's footprint, so a line's footprints compare only with lines that
+# share its setting.
 ENV_KEYS = (
     "OMP_NUM_THREADS", "RAYON_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
     "NUMEXPR_NUM_THREADS", "LANCE_CPU_THREADS", "LANCE_IO_THREADS", "COLDIVF_DATA", "COLDIVF_BIN", "PYTHONHASHSEED",
-    "MallocNanoZone", "RUSTFLAGS",
+    "MallocNanoZone", "MallocLargeCache", "RUSTFLAGS",
 )
 
 

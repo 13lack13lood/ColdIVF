@@ -141,6 +141,10 @@ class ChartsTest(unittest.TestCase):
     def data(self) -> dict:
         return charts.chart_data(self.suite, self.quiet, self.repo)
 
+    def test_tidy_cuts_float_noise_and_keeps_counts_to_the_unit(self):
+        self.assertEqual(charts.tidy({"a": [0.9005999999999982, 11543.452, 3]}), {"a": [0.9006, 11543.45, 3]})
+        self.assertEqual(f"{charts.tidy(11543.452):,.0f}", "11,543")
+
     def test_percentile_is_nearest_rank(self):
         values = [float(v) for v in range(1, 11)]
         self.assertEqual(charts.percentile(values, 50), 5.0)
@@ -340,6 +344,60 @@ class ChartsTest(unittest.TestCase):
         self.assertNotIn("<dc:date>", light)
 
 
+# A same-batch check of ColdIVF's module, its binaries and faiss with batched reads, on the head-to-head's indexes.
+CHECK = """
+phase = "check"
+dataset = "tiny-16-cosine"
+n = 1000
+index_root = "{root}/indexes"
+results_root = "{root}/results"
+
+[[system]]
+name = "coldivf"
+adapter = "coldivf"
+
+  [[system.build]]
+  config_id = "tl"
+  index = "{root}/indexes/coldivf/tl-n1000-s1"
+
+  [[system.cold]]
+  config_id = "tl"
+  params = {{ nprobe = 64, rerank = 39 }}
+  split = "test"
+  trials = 2
+
+[[system]]
+name = "coldivf"
+adapter = "coldivf_py"
+variant = "python"
+
+  [[system.build]]
+  config_id = "tl"
+  index = "{root}/indexes/coldivf/tl-n1000-s1"
+
+  [[system.cold]]
+  config_id = "tl"
+  params = {{ nprobe = 64, rerank = 39 }}
+  split = "test"
+  trials = 3
+
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+variant = "batched"
+
+  [[system.build]]
+  config_id = "vpl"
+  index = "{root}/indexes/faiss/vpl"
+
+  [[system.cold]]
+  config_id = "vpl"
+  params = {{ nprobe = 48, k_factor = 4, qb = 4 }}
+  split = "test"
+  trials = 3
+"""
+
+
 class HeadToHeadChartsTest(unittest.TestCase):
     """The 10M charts on the small phase of the head-to-head report's tests."""
 
@@ -377,7 +435,7 @@ class HeadToHeadChartsTest(unittest.TestCase):
         self.assertEqual([(r["label"], r["p50_us"]) for r in p50["rows"]],
                          [("ColdIVF", 410.0), ("faiss IVF", 2100.0)])
         qps = self.by_id["qps-10m"]["boards"][1]
-        self.assertEqual([(r["label"], r["qps"]) for r in qps["rows"]], [("ColdIVF", 5000.0)])
+        self.assertEqual([(r["label"], r["qps"]) for r in qps["rows"]], [("ColdIVF", 5000.0), ("faiss IVF", 2000.0)])
         # No panel for recall@10 0.99, which ColdIVF doesn't reach, since a panel without it compares nothing.
         self.assertEqual([b["recall10"] for b in self.by_id["warm-10m"]["boards"]], [0.90, 0.95])
         self.assertEqual([b["recall10"] for b in self.by_id["qps-10m"]["boards"]], [0.90, 0.95])
@@ -420,13 +478,114 @@ class HeadToHeadChartsTest(unittest.TestCase):
         # Without a row of the module, ColdIVF's binaries keep theirs.
         self.assertEqual(charts.one_per_system(rows[:2], lambda r: r["p50_us"]), rows[:2])
 
-    def test_chart_data_puts_the_10m_charts_first(self):
+    def test_chart_data_puts_the_head_to_head_charts_first(self):
         smoke = self.root / "smoke.toml"
         smoke.write_text(f'phase = "smoke"\ndataset = "{DATASET}"\nn = {N}\n')
-        data = charts.chart_data(smoke, self.root / "no-quiet-run", self.root, self.root / "suite.toml")
+        data = charts.chart_data(smoke, self.root / "no-quiet-run", self.root, {"10m": self.root / "suite.toml"}, {})
         self.assertEqual([c["id"] for c in data["charts"][:5]],
                          ["cold-10m-95", "cold-10m-90", "warm-10m", "qps-10m", "memory-10m"])
-        self.assertEqual(data["h2h_suite"], "suite.toml")
+        self.assertEqual(data["h2h_suites"], {"10m": "suite.toml"})
+
+    def test_each_scale_names_its_charts_and_says_which_rows_it_takes(self):
+        with mock.patch.dict(charts.DATASET_ROWS, {"tiny-16-cosine": 5000}):
+            made, _ = charts.h2h_charts(self.root / "suite.toml", self.root, "1m")
+
+        self.assertEqual([(c["id"], c["kind"]) for c in made],
+                         [("cold-1m-95", "h2h-cold"), ("cold-1m-90", "h2h-cold"), ("warm-1m", "h2h-warm"),
+                          ("qps-1m", "h2h-qps"), ("memory-1m", "h2h-memory")])
+        self.assertTrue(all(c["subtitle"].startswith("The first 0.001M rows of tiny-16-cosine") for c in made))
+        self.assertTrue(self.by_id["cold-10m-95"]["subtitle"].startswith("0.001M vectors of tiny-16-cosine"))
+        # Every kind has a drawing.
+        self.assertTrue(all(c["kind"] in charts.DRAW for c in made))
+
+    def test_the_qps_chart_names_how_each_system_ran_its_queries_side_by_side(self):
+        footer = self.by_id["qps-10m"]["footer"]
+        self.assertIn("faiss IVF searches through a call for a batch of queries", footer)
+        self.assertIn("ColdIVF searches from 6 threads in one process.", footer)
+        self.assertIn("ColdIVF's module has no batch call.", footer)
+        self.assertEqual({r["method"] for b in self.by_id["qps-10m"]["boards"] for r in b["rows"]},
+                         {"threads", "batch call"})
+        self.assertEqual(charts.method_note([{"rows": [{"label": "a", "method": "processes"},
+                                                       {"label": "b", "method": "processes"},
+                                                       {"label": "c", "method": "threads"}]}]),
+                         "a and b search from 6 processes, and c from 6 threads in one process.")
+
+    def test_the_memory_chart_says_how_each_build_ran_and_which_rows_reach_no_target(self):
+        chart = self.by_id["memory-10m"]
+        self.assertIn("ColdIVF's build ran with macOS malloc's cache of freed large blocks off, and the other builds "
+                      "with it on", chart["footer"])
+        self.assertIn(", and turbovec at its setting of most recall, since it reaches neither.", chart["subtitle"])
+        rows = {r["label"]: r for r in chart["rows"]}
+        self.assertEqual((rows["ColdIVF"]["build"]["malloc_cache"], rows["faiss IVF"]["build"]["malloc_cache"]),
+                         ("off", "on"))
+        self.assertEqual(rows["ColdIVF"]["build"]["cluster_seconds"], 540.0)
+        both_off = [{"label": x, "build": {"peak_footprint": 1, "malloc_cache": "off"}} for x in ("a", "b")]
+        self.assertEqual(charts.malloc_note(both_off), "Every build ran with macOS malloc's cache of freed large "
+                                                       "blocks off, so no build peak holds freed memory.")
+
+    def test_rows_of_fewer_queries_get_a_note_on_their_subsets(self):
+        self.assertNotIn("subset", self.by_id["cold-10m-95"]["footer"])
+        from tests import test_headtohead as h
+
+        more = [h.cold("coldivf", "python", "tl", h.OURS, 13, 10_100.0, footprint_delta=24_000_000,
+                       disk_bytes=24_000_000, extra={"resident_loaded_bytes_after": 0})]
+
+        with open(self.root / "results" / "t" / "coldivf.jsonl", "a") as f:
+            f.write("".join(json.dumps(x) + "\n" for x in more))
+
+        made, _ = charts.h2h_charts(self.root / "suite.toml", self.root)
+        cold = next(c for c in made if c["id"] == "cold-10m-95")
+        self.assertEqual([r["queries"] for r in cold["rows"]], [5, 4])
+        self.assertIn("Rows with fewer queries time a subset of them", cold["footer"])
+
+    def test_the_cold_chart_at_095_keeps_the_control_cells(self):
+        controls = self.by_id["cold-10m-95"]["controls"]
+        self.assertEqual([(c["config_id"], c["fresh_clone"], c["trials"]) for c in controls], [("tl-clone", True, 2)])
+        self.assertNotIn("controls", self.by_id["cold-10m-90"])
+
+    def test_readme_tables_of_warm_queries_and_memory(self):
+        data = {"charts": self.charts}
+        warm = charts.h2h_warm_table(data, "10m")
+        self.assertEqual(warm.splitlines()[0], "| System | Warm p50 at 0.90 | QPS, 6 Threads, at 0.90 | Warm p50 at 0.95 "
+                                               "| QPS, 6 Threads, at 0.95 | QPS Method |")
+        self.assertIn("| **ColdIVF** | **0.310 ms** | - | **0.410 ms** | **5,000** | threads |", warm)
+        self.assertIn("| faiss IVF as shipped, 640 per list | 2.10 ms | 2,000 | 2.10 ms | 2,000 | batch call |", warm)
+        memory = charts.h2h_memory_table(data, "10m")
+        lines = memory.splitlines()
+        self.assertTrue(lines[2].startswith("| **ColdIVF** | **48 MB** | **30 MB + 9 GB** | **10.0 min** | **800 MB**"))
+        self.assertIn("| turbovec 4-bit, at its setting of most recall |", memory)
+        self.assertEqual({x.count("|") for x in lines}, {7})
+
+    def test_a_same_batch_check_compares_each_cell_with_coldivfs_module(self):
+        from tests import test_headtohead as h
+
+        check = self.root / "check.toml"
+        check.write_text(CHECK.format(root=self.root))
+        folder = self.root / "results" / "check"
+        folder.mkdir(parents=True)
+        lines = {"coldivf": [h.cold("coldivf", "python", "tl", h.OURS, q, 10_000.0) for q in (1, 3, 5)]
+                 + [h.cold("coldivf", "", "tl", h.OURS, q, 9_000.0) for q in (1, 3)],
+                 "faiss-ivf": [h.cold("faiss-ivf", "batched", "vpl", h.FAISS, q, t)
+                               for q, t in ((1, 11_000.0), (3, 12_000.0), (5, 9_000.0), (5, 99_000.0))]}
+        lines["faiss-ivf"][-1]["status"] = "invalid"
+
+        for name, rows in lines.items():
+            (folder / f"{name}.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows))
+
+        got = charts.same_batch(check, self.root)
+        cells = {c["label"]: c for c in got["cells"]}
+        self.assertEqual(set(cells), {"ColdIVF", "ColdIVF, binaries", "faiss IVF, batched reads"})
+        theirs = cells["faiss IVF, batched reads"]
+        self.assertEqual((theirs["trials"], theirs["p50_us"]), (3, 11_000.0))
+        self.assertAlmostEqual(theirs["against"]["c0_p50"], 1.1)
+        self.assertEqual((theirs["against"]["c0_paired"]["queries"], theirs["against"]["c0_paired"]["faster"]), (3, 1))
+        self.assertEqual(cells["ColdIVF, binaries"]["against"]["c0_paired"]["median"], 0.9)
+        smoke = self.root / "smoke.toml"
+        smoke.write_text(f'phase = "smoke"\ndataset = "{DATASET}"\nn = {N}\n')
+        data = charts.chart_data(smoke, self.root / "no-quiet-run", self.root, {"10m": self.root / "suite.toml"},
+                                 {"10m": check})
+        self.assertEqual(charts.chart_of(data, "cold-10m-95")["same_batch"]["folder"], "results/check")
+        self.assertNotIn("same_batch", charts.chart_of(data, "cold-10m-90"))
 
 
 if __name__ == "__main__":

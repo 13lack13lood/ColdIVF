@@ -34,9 +34,14 @@ class UsageTest(unittest.TestCase):
         self.assertAlmostEqual(sum(used.qos_ms.values()), used.cpu_ms, delta=0.1 * used.cpu_ms + 2)
 
     def test_background_work_lands_in_its_class(self):
+        # The thread spins until it has used 50 ms of CPU, however long that takes. A background thread gets the CPU
+        # last, so on a loaded machine 50 ms of wall time can hold much less CPU time than the bound below.
         def work():
             rusage._libc.pthread_set_qos_class_self_np(0x09, 0)
-            busy(0.05)
+            end = time.thread_time() + 0.05
+
+            while time.thread_time() < end:
+                pass
 
         before = rusage.Usage.settled()
         t = threading.Thread(target=work)

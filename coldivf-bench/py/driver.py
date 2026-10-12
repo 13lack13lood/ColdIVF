@@ -1354,6 +1354,9 @@ class Driver:
 
             return
 
+        # The lines name the index as its build left it, read before the job's process opens it. A system that writes
+        # to its index while it is open, eg. AsterVec's store, changes and removes files there until it closes.
+        self.index_identity(job.build)
         ids_dir = self.out_dir / "ids"
         tmp_ids = Path(tempfile.mkdtemp(prefix="ids-", dir=self.out_dir))
         args = ["warm", *self.data_args(job.build.n, job.threads, system, job.k), "--index", str(job.build.index),
@@ -1508,6 +1511,7 @@ class Driver:
 
             # No process of the group has opened the index yet, so it is as its build left it.
             cell.index_key = self._index_key(cell.build)
+            self.index_identity(cell.build)
 
         live: dict[int, Child] = {}
 

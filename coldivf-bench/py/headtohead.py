@@ -7,13 +7,16 @@ For each build with a warm grid on the tune split, the point for a target is pic
 settings by warm 1-thread p50 whose tune recall@10 reaches the target, it is the one with the lowest C0 p50 over its
 tune trials, or a cheaper one whose 95% interval for that median overlaps it, or the cheapest when no screen ran. Its
 numbers come from the test split: recall@10 and p50 from the 1-thread warm line, queries per second (QPS) at 6 and 12
-threads, and the C0 trials of that setting. A build that reaches no target shows the cells the suite holds for it.
+threads with how those queries ran side by side, through the library's call for a batch of queries, one process per
+thread or threads in one process, and the C0 trials of that setting. A build that reaches no target shows the cells the
+suite holds for it.
 
 Memory follows one rule for every system, what the process holds plus the pages of the index's own files in the page
 cache. A cold trial's memory is the footprint that the open and the first query add, plus the file pages they brought
 in. A range the system copies into its own memory at open counts once, in the footprint. A warm line's memory is the
 process's footprint plus the cached pages of the index's files, in the warm mode the line names: "whole", with every
-file read through first, or one a system defines, eg. LanceDB's "index", which leaves its table on disk.
+file read through first, or one a system defines, eg. LanceDB's "index", which leaves its table on disk. macOS malloc's
+cache of freed large blocks stays inside a footprint, so each build's peak comes with whether that cache was on.
 
 ColdIVF's numbers against the others are those of the reference, by default its Python module, which runs in the
 adapter's process as every other system's binding does. Each comparison gives the ratio of C0 p50s at the same target
@@ -58,16 +61,30 @@ NAMES = {
     ("lancedb", ""): "LanceDB IVF_RQ",
     ("paimon", ""): "Paimon",
     ("rabitq-ivf", ""): "RaBitQ-Library IVF",
-    ("usearch", ""): "usearch HNSW i8",
+    ("rabitq-hnsw", ""): "RaBitQ-Library HNSW",
+    ("usearch", ""): "usearch HNSW",
     ("turbovec", ""): "turbovec 4-bit",
+    ("qdrant-edge", ""): "qdrant-edge",
+    ("diskann", ""): "DiskANN",
+    ("astervec", ""): "AsterVec",
+    ("symphonyqg", ""): "SymphonyQG",
+    ("sqlite-vec", ""): "sqlite-vec",
+    ("flat", ""): "flat scan",
 }
 LABELS = {
     ("paimon", "", "b4"): "Paimon 4-bit", ("paimon", "", "b8"): "Paimon 8-bit",
-    ("rabitq-ivf", "", "cp640-b5"): "RaBitQ-Library IVF 5-bit",
-    ("rabitq-ivf", "", "cp640-b9"): "RaBitQ-Library IVF 9-bit",
     ("turbovec", "", "b4"): "turbovec 4-bit", ("turbovec", "", "b4-cal"): "turbovec 4-bit, calibrated",
 }
-PARTITIONS = {"cp640-rq1": "640 per list", "cp640-rq1-hnsw32": "640 per list", "vpl2560-rq1": "2,560 per list"}
+# A build's name from its config id, for the systems whose builds differ in it, eg. cp640-b9 for RaBitQ-Library's IVF
+# at 9 bits and f16-m16 for usearch with 16-bit float rows, so no two builds of a phase share a name.
+CONFIG_LABELS = (
+    ("rabitq-ivf", re.compile(r"cp\d+-b(\d+)"), "RaBitQ-Library IVF {}-bit"),
+    ("rabitq-hnsw", re.compile(r"b(\d+)"), "RaBitQ-Library HNSW {}-bit"),
+    ("usearch", re.compile(r"(i8|f16|f32)-m\d+"), "usearch HNSW {}"),
+)
+# The partition in a faiss IVF build's config id, eg. cp640-rq1 for ColdIVF's at 640 vectors per list and vpl2560-rq1
+# for faiss's own at 2,560.
+PARTITION = re.compile(r"(?:cp|vpl)(\d+)-rq1(?:-hnsw32)?")
 
 # Search settings by the names the tables use, and those every setting of a grid shares, which they leave out.
 SETTING_NAMES = {"refine_factor": "refine", "expansion_search": "expansion", "ef_search": "ef"}
@@ -93,8 +110,15 @@ def label(system: str, variant: str, config_id: str) -> str:
     if (system, variant, config_id) in LABELS:
         return LABELS[(system, variant, config_id)]
 
+    for owner, pattern, text in CONFIG_LABELS:
+        found = pattern.fullmatch(config_id)
+
+        if system == owner and found:
+            return text.format(found[1])
+
     name = NAMES.get((system, variant), f"{system}:{variant}" if variant else system)
-    return f"{name}, {PARTITIONS[config_id]}" if system == "faiss-ivf" and config_id in PARTITIONS else name
+    found = PARTITION.fullmatch(config_id)
+    return f"{name}, {int(found[1]):,} per list" if system == "faiss-ivf" and found else name
 
 
 def setting_text(params: dict | None) -> str:
@@ -122,6 +146,40 @@ def first_query_pages(line: dict) -> int | None:
     return max(0, int(line["disk_bytes"]) - loaded)
 
 
+def qps_method(line: dict | None) -> str | None:
+    """How a warm line on several threads ran its queries side by side: "batch call" through the library's own call for
+    a batch of queries, "processes" with one process per thread, or "threads" with that many threads in one process."""
+    if not line:
+        return None
+
+    if line.get("batch_api"):
+        return "batch call"
+
+    return "processes" if (line.get("processes") or 1) > 1 else "threads"
+
+
+def malloc_large_cache(line: dict | None) -> str | None:
+    """Whether macOS malloc's cache of freed large blocks was "on" or "off" in the process a line measured. The cache
+    keeps freed blocks inside the footprint, so footprints compare only under one setting. It is the MallocLargeCache
+    the line recorded, or else how its job ran: the machine's job gate turns the cache off for a normal job and leaves
+    it on for the solo job, which holds every slot. A line from before the variable was recorded, of a batch that saw
+    no job gate, gives None."""
+    if not line:
+        return None
+
+    env = (line.get("provenance") or {}).get("env") or {}
+
+    if "MallocLargeCache" in env:
+        return "off" if env["MallocLargeCache"] == "0" else "on"
+
+    gate = line.get("gate") or {}
+
+    if not gate.get("locks_seen"):
+        return None
+
+    return "on" if gate.get("solo") else "off"
+
+
 def cold_memory(line: dict) -> dict:
     """A cold trial's memory: the footprint its open and first query added, the file pages they brought in, and both."""
     process, pages = line.get("footprint_delta"), first_query_pages(line)
@@ -141,7 +199,8 @@ def per_query(trials: list[dict]) -> dict[int, float]:
 
 def paired(theirs: list[dict], ours: list[dict], resamples: int = RESAMPLES, seed: int = 1) -> dict | None:
     """Their C0 time over ours, query by query, over the test queries both cells timed: the median of the per-query
-    ratios with its 95% bootstrap interval, from `resamples` resamples of those queries, and their least and most."""
+    ratios with its 95% bootstrap interval, from `resamples` resamples of those queries, their least and most, and the
+    number of queries on which theirs is faster."""
     a, b = per_query(theirs), per_query(ours)
     shared = sorted(set(a) & set(b))
 
@@ -152,7 +211,8 @@ def paired(theirs: list[dict], ours: list[dict], resamples: int = RESAMPLES, see
     rng = random.Random(seed)
     boots = sorted(statistics.median(rng.choices(ratios, k=len(ratios))) for _ in range(resamples))
     return {"queries": len(shared), "median": statistics.median(ratios), "low": boots[int(0.025 * resamples)],
-            "high": boots[int(math.ceil(0.975 * resamples)) - 1], "min": min(ratios), "max": max(ratios)}
+            "high": boots[int(math.ceil(0.975 * resamples)) - 1], "min": min(ratios), "max": max(ratios),
+            "faster": sum(1 for r in ratios if r < 1)}
 
 
 def at_exactly(points: list[dict], target: float) -> dict | None:
@@ -286,6 +346,7 @@ def summarize(res: Results, systems: list[driver.System], system: driver.System,
         "warm_queries": w1.get("queries"), "warm_passes": w1.get("passes"),
         "warm_mode": w1.get("mode"), "warm_p50_us": w1.get("p50_us"), "warm_p99_us": w1.get("p99_us"),
         "qps": {t: (w[t] or {}).get("qps") for t in (1, 6, 12)},
+        "qps_method": {t: qps_method(w[t]) for t in (6, 12)},
         "warm_invalid": [t for t in (1, 6, 12) if w[t] and w[t].get("invalid")],
         "warm_footprint": w1.get("footprint"), "warm_cached": w1.get("resident_file_bytes"),
         "warm_total": w1.get("memory_total"),
@@ -296,8 +357,10 @@ def summarize(res: Results, systems: list[driver.System], system: driver.System,
         "disk_p50": median([x.get("disk_bytes") for x in ok]),
         "cold_process": median([m["process"] for m in memory]), "cold_pages": median([m["pages"] for m in memory]),
         "cold_total": median([m["total"] for m in memory]),
-        "build_s": (b or {}).get("seconds"), "build_peak": (b or {}).get("peak_footprint"),
-        "index_bytes": (b or {}).get("index_bytes"),
+        "build_s": (b or {}).get("seconds"), "build_cluster_s": (b or {}).get("cluster_seconds"),
+        "build_peak": (b or {}).get("peak_footprint"),
+        "build_malloc_cache": malloc_large_cache(b), "index_bytes": (b or {}).get("index_bytes"),
+        "stored_vector_bytes": (b or {}).get("stored_vector_bytes"),
         "bytes_per_vector": (b or {})["index_bytes"] / build.n if (b or {}).get("index_bytes") else None,
         "shared_file": build.prebuilt is not None and owner is not None and owner[0] is not system,
         "shared_partition": build.config_id.startswith("cp"),
@@ -464,10 +527,27 @@ def fmt_ratio(against: dict | None, name: str) -> str:
     return f"{value:.2f}x" if value is not None else "-"
 
 
-SPEED = ("| System | Setting | Test Recall@10 | Warm p50 ms | QPS on 6 Threads | QPS on 12 Threads | C0 p50 ms "
-         "| C0 p99 ms | C0 Trials (Queries) | C0 p50 at Exactly the Target ms | C0 Against ColdIVF, Paired by Query |")
+SPEED = ("| System | Setting | Test Recall@10 | Warm p50 ms | QPS on 6 Threads | QPS on 12 Threads | QPS Method "
+         "| C0 p50 ms | C0 p99 ms | C0 Trials (Queries) | C0 p50 at Exactly the Target ms "
+         "| C0 Against ColdIVF, Paired by Query |")
 MEMORY = ("| System | Setting | Open and First Query: Process + Index Pages | Warm Mode | Warm: Process + Cached Pages "
-          "| Build Minutes | Build Peak | Index Size | Bytes per Vector |")
+          "| Build Minutes | Build Peak | Build Malloc Cache | Index Size | Bytes per Vector |")
+
+
+def rule(header: str) -> str:
+    """The line under a table's header, one cell per column."""
+    return "|" + "---|" * (header.count("|") - 1)
+
+
+def method_text(r: dict) -> str:
+    """How a row's lines on 6 and 12 threads ran their queries side by side, once when both ran the same way."""
+    m = r.get("qps_method") or {}
+    six, twelve = m.get(6), m.get(12)
+
+    if six == twelve or twelve is None:
+        return six or "-"
+
+    return f"{twelve} on 12" if six is None else f"{six} on 6, {twelve} on 12"
 
 
 def speed_line(r: dict) -> str:
@@ -477,8 +557,8 @@ def speed_line(r: dict) -> str:
     pair = f"{p['median']:.2f}x ({p['low']:.2f} to {p['high']:.2f}, {p['queries']} queries)" if p else "-"
     exact = fmt_ms(r["c0_exact"]["p50_us"]) if r.get("c0_exact") else "-"
     return (f"| {r['label']}{flagged} | {r['setting_text']} | {fmt(r['recall10'], 4)} | {fmt_ms(r['warm_p50_us'])} "
-            f"| {fmt(r['qps'][6], 0, comma=True)} | {fmt(r['qps'][12], 0, comma=True)} | {fmt_ms(r['c0_p50_us'])} "
-            f"| {fmt_ms(r['c0_p99_us'])} | {r['trials']} ({r['queries']}) | {exact} | {pair} |")
+            f"| {fmt(r['qps'][6], 0, comma=True)} | {fmt(r['qps'][12], 0, comma=True)} | {method_text(r)} "
+            f"| {fmt_ms(r['c0_p50_us'])} | {fmt_ms(r['c0_p99_us'])} | {r['trials']} ({r['queries']}) | {exact} | {pair} |")
 
 
 def memory_line(r: dict) -> str:
@@ -486,24 +566,24 @@ def memory_line(r: dict) -> str:
     cold = f"{fmt_size(r['cold_process'])} + {fmt_size(r['cold_pages'])} = {fmt_size(r['cold_total'])}"
     warm = f"{fmt_size(r['warm_footprint'])} + {fmt_size(r['warm_cached'])} = {fmt_size(r['warm_total'])}"
     return (f"| {r['label']} | {r['setting_text']} | {cold} | {r['warm_mode'] or '-'} | {warm} "
-            f"| {fmt(r['build_s'], 1, 60)}{shared} | {fmt_size(r['build_peak'])} | {fmt_size(r['index_bytes'])} "
-            f"| {fmt(r['bytes_per_vector'], 0, comma=True)} |")
+            f"| {fmt(r['build_s'], 1, 60)}{shared} | {fmt_size(r['build_peak'])} | {r.get('build_malloc_cache') or '-'} "
+            f"| {fmt_size(r['index_bytes'])} | {fmt(r['bytes_per_vector'], 0, comma=True)} |")
 
 
 def markdown(data: dict) -> str:
     out = []
 
     for t, entry in data["targets"].items():
-        out += [f"\n### Recall@10 {t:.2f}\n", SPEED, "|" + "---|" * 11]
+        out += [f"\n### Recall@10 {t:.2f}\n", SPEED, rule(SPEED)]
         out += [speed_line(r) for r in entry["rows"]]
-        out += [f"| {m['label']} | {m['note']} |" + " |" * 9 for m in entry["not_reached"]]
-        out += ["", MEMORY, "|" + "---|" * 9]
+        out += [f"| {m['label']} | {m['note']} |" + " |" * (SPEED.count("|") - 3) for m in entry["not_reached"]]
+        out += ["", MEMORY, rule(MEMORY)]
         out += [memory_line(r) for r in entry["rows"]]
 
     if data["hand"]:
-        out += ["\n### Systems That Reach No Target, at Their Cells\n", SPEED, "|" + "---|" * 11]
+        out += ["\n### Systems That Reach No Target, at Their Cells\n", SPEED, rule(SPEED)]
         out += [speed_line(r) for r in data["hand"]]
-        out += ["", MEMORY, "|" + "---|" * 9]
+        out += ["", MEMORY, rule(MEMORY)]
         out += [memory_line(r) for r in data["hand"]]
 
     cold = [c for c in data["controls"] if c["kind"] == "cold"]

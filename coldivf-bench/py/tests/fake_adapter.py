@@ -8,11 +8,14 @@
 - "procqps" measures QPS with one process per worker.
 - "loaded" marks every file as loaded at open, though it maps them, so its cached pages show apart.
 - "swapping" reports 2 swap-ins during every warm setting, as a machine that swaps while it is timed would.
+- "session" writes a log into its index while a warm run has it open and removes it at the end, as AsterVec's store
+  does at every open until its seal is restored.
 """
 
 from __future__ import annotations
 
 import sys
+import time
 from typing import Iterator
 
 from adapters.base import ServeContext, main
@@ -52,11 +55,24 @@ class Fake(Flat):
         super().cold_setup(ctx)
 
     def warm_run(self, ctx: ServeContext, *args, **kwargs) -> Iterator[dict]:
-        for result in super().warm_run(ctx, *args, **kwargs):
-            if self.variant == "swapping":
-                result["fields"].update(swapins_delta=2, compressions_delta=0)
+        session = ctx.index / "session.log"
 
-            yield result
+        if self.variant == "session":
+            session.write_bytes(b"open")
+
+        try:
+            for result in super().warm_run(ctx, *args, **kwargs):
+                if self.variant == "swapping":
+                    result["fields"].update(swapins_delta=2, compressions_delta=0)
+
+                yield result
+
+                # The session stays open while the driver writes the setting's line.
+                if self.variant == "session":
+                    time.sleep(1.0)
+        finally:
+            if self.variant == "session":
+                session.unlink(missing_ok=True)
 
     def cold_trial(self, ctx: ServeContext, go: dict) -> dict:
         if self.variant == "crash":

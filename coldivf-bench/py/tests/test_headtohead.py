@@ -148,6 +148,8 @@ class StatisticsTest(unittest.TestCase):
         ours = [{"query_id": 1, "total_us": 10.0}, {"query_id": 3, "total_us": 30.0}, {"query_id": 5, "total_us": 1.0}]
         got = headtohead.paired(theirs, ours, resamples=200)
         self.assertEqual((got["queries"], got["median"], got["min"], got["max"]), (2, 3.5, 3.0, 4.0))
+        self.assertEqual(got["faster"], 0)
+        self.assertEqual(headtohead.paired(ours, theirs, resamples=200)["faster"], 2)
         self.assertTrue(3.0 <= got["low"] <= got["median"] <= got["high"] <= 4.0)
         self.assertEqual(got, headtohead.paired(theirs, ours, resamples=200))
         self.assertIsNone(headtohead.paired(theirs, [{"query_id": 9, "total_us": 1.0}]))
@@ -157,6 +159,27 @@ class StatisticsTest(unittest.TestCase):
                          "faiss IVF, on-disk lists, 2,560 per list")
         self.assertEqual(headtohead.label("rabitq-ivf", "", "cp640-b9"), "RaBitQ-Library IVF 9-bit")
         self.assertEqual(headtohead.label("turbovec", "", "b4-cal"), "turbovec 4-bit, calibrated")
+        self.assertEqual(headtohead.label("faiss-ivf", "shipped", "cp640-rq1"), "faiss IVF as shipped, 640 per list")
+        self.assertEqual(headtohead.label("usearch", "", "i8-m16"), "usearch HNSW i8")
+
+    def test_builds_on_other_partitions_and_row_types_get_names_of_their_own(self):
+        # The labels key each build's measured points, so two builds of a phase must never share one.
+        self.assertEqual(headtohead.label("faiss-ivf", "batched", "cp320-rq1"),
+                         "faiss IVF, batched reads, 320 per list")
+        self.assertEqual(headtohead.label("faiss-ivf", "graph", "cp160-rq1-hnsw32"),
+                         "faiss IVF, HNSW quantizer, 160 per list")
+        self.assertEqual(headtohead.label("rabitq-ivf", "", "cp320-b5"), "RaBitQ-Library IVF 5-bit")
+        self.assertEqual(headtohead.label("rabitq-hnsw", "", "b4"), "RaBitQ-Library HNSW 4-bit")
+        self.assertEqual(headtohead.label("usearch", "", "f16-m16"), "usearch HNSW f16")
+        self.assertEqual(headtohead.label("usearch", "", "default"), "usearch HNSW")
+        self.assertEqual(headtohead.label("flat", "", "default"), "flat scan")
+        builds = [("faiss-ivf", "batched", "cp320-rq1"), ("faiss-ivf", "batched", "vpl2560-rq1"),
+                  ("rabitq-ivf", "", "cp320-b5"), ("rabitq-ivf", "", "cp320-b9"), ("usearch", "", "f16-m16"),
+                  ("usearch", "", "i8-m16"), ("paimon", "", "b4"), ("paimon", "", "b8"), ("turbovec", "", "b4"),
+                  ("turbovec", "", "b4-cal"), ("qdrant-edge", "", "default"), ("diskann", "", "default"),
+                  ("astervec", "", "default"), ("symphonyqg", "", "default"), ("sqlite-vec", "", "default")]
+        names = [headtohead.label(*b) for b in builds]
+        self.assertEqual(len(set(names)), len(names))
         self.assertEqual(headtohead.setting_text({"nprobe": 48, "k_factor": 4, "qb": 4, "prefetch_threads": 32}),
                          "nprobe 48, k_factor 4")
         self.assertEqual(headtohead.setting_text({"nprobes": 48, "refine_factor": 8}), "nprobes 48, refine 8")
@@ -181,22 +204,29 @@ class CollectTest(unittest.TestCase):
         c += [warm("coldivf", "python", "tl", BELOW, 0.944, 310.0, split="test"),
               warm("coldivf", "python", "tl", OURS, 0.952, 410.0, split="test", footprint=30_000_000,
                    resident_file_bytes=9_000_000_000, memory_total=9_030_000_000)]
-        c += [warm("coldivf", "python", "tl", OURS, None, None, split="test", threads=6, qps=5000.0)]
+        c += [warm("coldivf", "python", "tl", OURS, None, None, split="test", threads=6, qps=5000.0, batch_api=False,
+                   processes=1)]
         memory = {"footprint_delta": 24_000_000, "disk_bytes": 24_000_000, "extra": {"resident_loaded_bytes_after": 0}}
         c += [cold("coldivf", "python", "tl", OURS, q, 10_000.0 + q, **memory) for q in (1, 3, 5, 7)]
         c += [cold("coldivf", "python", "tl", BELOW, q, 8_000.0, **memory) for q in (1, 3, 5, 7)]
         c += [cold("coldivf", "python", "tl", OURS, q, 99_000.0, status="invalid") for q in (9,)]
         c += [cold("coldivf", "python", "tl-clone", OURS, q, 11_000.0, extra={"clone": "x"}) for q in (1, 3)]
-        c.append(line("coldivf", "", "tl", "build", seconds=600.0, peak_footprint=800_000_000,
-                      index_bytes=9_430_000_000))
+        # ColdIVF's build ran as a normal job of the machine's job gate, which turns macOS malloc's cache of freed large
+        # blocks off, and faiss's as the solo job, which leaves it on.
+        c.append(line("coldivf", "", "tl", "build", seconds=600.0, cluster_seconds=540.0, peak_footprint=800_000_000,
+                      index_bytes=9_430_000_000, gate={"locks_seen": True, "solo": False}))
         f = lines["faiss-ivf"]
         f += [warm("faiss-ivf", "shipped", "cp640-rq1", FAISS, 0.951, 2000.0),
               warm("faiss-ivf", "shipped", "cp640-rq1", FAISS, 0.95, 2100.0, split="test")]
         f += [cold("faiss-ivf", "shipped", "cp640-rq1", FAISS, q, 30_000.0 + 1000 * q, footprint_delta=3_000_000,
                    extra={"resident_after_first": {"coarse": 48_000_000, "lists": 12_000_000},
                           "resident_loaded_bytes_after": 0}) for q in (1, 3, 5, 11)]
+        f += [warm("faiss-ivf", "shipped", "cp640-rq1", FAISS, None, None, split="test", threads=6, qps=2000.0,
+                   batch_api=True, processes=1),
+              warm("faiss-ivf", "shipped", "cp640-rq1", FAISS, None, None, split="test", threads=12, qps=2500.0,
+                   batch_api=False, processes=12)]
         f.append(line("faiss-ivf", "shipped", "cp640-rq1", "build", seconds=150.0, peak_footprint=9_400_000_000,
-                      index_bytes=8_850_000_000))
+                      index_bytes=8_850_000_000, gate={"locks_seen": True, "solo": True}))
         t = lines["turbovec"]
         t += [warm("turbovec", "", "b4", {}, 0.89, 27_000.0), warm("turbovec", "", "b4", {}, 0.894, 26_800.0,
                                                                      split="test")]
@@ -247,6 +277,38 @@ class CollectTest(unittest.TestCase):
         self.assertAlmostEqual(theirs["c0_exact"]["p50_us"], 34_000.0)
         self.assertAlmostEqual(against["c0_exact"], 34_000.0 / exact)
         self.assertAlmostEqual(against["warm_p50"], 2100.0 / 410.0)
+
+    def test_rows_name_how_their_queries_ran_side_by_side_and_their_builds_malloc_cache(self):
+        ours, theirs = self.data["targets"][0.95]["rows"]
+        self.assertEqual(ours["qps_method"], {6: "threads", 12: None})
+        self.assertEqual(theirs["qps_method"], {6: "batch call", 12: "processes"})
+        self.assertEqual((headtohead.method_text(ours), headtohead.method_text(theirs)),
+                         ("threads", "batch call on 6, processes on 12"))
+        self.assertEqual((ours["build_malloc_cache"], theirs["build_malloc_cache"]), ("off", "on"))
+        self.assertEqual((ours["build_cluster_s"], theirs["build_cluster_s"]), (540.0, None))
+        text = headtohead.markdown(self.data)
+        self.assertIn("| 5,000 | - | threads |", text)
+        self.assertIn("| 2,000 | 2,500 | batch call on 6, processes on 12 |", text)
+        self.assertIn("| 800 MB | off |", text)
+        self.assertIn("| 9.4 GB | on |", text)
+        # Every row of a table has its header's cells, a system that reaches no target too.
+        for table in text.split("\n\n"):
+            rows = [x for x in table.splitlines() if x.startswith("|")]
+            self.assertEqual({x.count("|") for x in rows}, {rows[0].count("|")} if rows else set(), table)
+
+    def test_a_lines_malloc_cache_is_what_it_recorded_or_how_its_job_ran(self):
+        solo = {"gate": {"locks_seen": True, "solo": True}}
+        self.assertEqual(headtohead.malloc_large_cache(solo), "on")
+        self.assertEqual(headtohead.malloc_large_cache({**solo, "provenance": {"env": {"MallocLargeCache": "0"}}}),
+                         "off")
+        self.assertEqual(headtohead.malloc_large_cache({"provenance": {"env": {"MallocLargeCache": "1"}}}), "on")
+        self.assertEqual(headtohead.malloc_large_cache({"gate": {"locks_seen": True, "solo": False}}), "off")
+        self.assertIsNone(headtohead.malloc_large_cache({"gate": {"locks_seen": False, "solo": False}}))
+        self.assertIsNone(headtohead.malloc_large_cache(None))
+        self.assertEqual([headtohead.qps_method(x) for x in ({"batch_api": True, "processes": 1},
+                                                             {"batch_api": False, "processes": 6},
+                                                             {"batch_api": False, "processes": 1}, None)],
+                         ["batch call", "processes", "threads", None])
 
     def test_markdown_and_json(self):
         text = headtohead.markdown(self.data)
