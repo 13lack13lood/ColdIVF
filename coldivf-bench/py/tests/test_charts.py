@@ -2,9 +2,11 @@
 installed."""
 
 import contextlib
+import html
 import importlib.util
 import io
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -57,6 +59,24 @@ def own_warm(nprobe, rerank, recall, p50=None, threads=1, qps=None):
 def write(path: Path, lines: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(line) + "\n" for line in lines) + "not json\n")
+
+
+def svg_texts(path: Path) -> list[str]:
+    """The strings a chart's SVG draws."""
+    return [html.unescape(s) for s in re.findall(r"<text[^>]*>([^<]*)</text>", path.read_text())]
+
+
+def svg_placed(path: Path) -> list[tuple[float, str]]:
+    """The strings a chart's SVG draws, each with the x it is anchored at."""
+    return [(float(x), html.unescape(s)) for x, s in re.findall(r'<text[^>]* x="([-\d.]+)"[^>]*>([^<]*)</text>',
+                                                               path.read_text())]
+
+
+def assert_value_columns(test: unittest.TestCase, path: Path) -> None:
+    """A dot-and-line chart heads its two columns of times once, with "p50" and "p99", and writes neither in a row."""
+    texts = svg_texts(path)
+    test.assertEqual((texts.count("p50"), texts.count("p99")), (1, 1), path.name)
+    test.assertFalse([s for s in texts if s.startswith(("p50 ", "p99 "))], path.name)
 
 
 class ChartsTest(unittest.TestCase):
@@ -223,6 +243,10 @@ class ChartsTest(unittest.TestCase):
         drawn_with = json.loads((out / "chart-data.json").read_text())["drawn_with"]
         self.assertEqual(set(drawn_with), {"matplotlib"})
         self.assertNotIn("<dc:date>", (out / "cold-coldivf-dark.svg").read_text())
+        assert_value_columns(self, out / "cold-coldivf-dark.svg")
+        texts = svg_texts(out / "cold-coldivf-dark.svg")
+        self.assertIn("nprobe 96, rerank 35 · recall 0.951 · 2 trials", texts)
+        self.assertIn("6.50 ms", texts)
 
 
 # A same-batch check of ColdIVF's module, its binaries and faiss with batched reads, on the head-to-head's indexes.
@@ -279,6 +303,27 @@ variant = "batched"
 """
 
 
+# A second faiss setup, with batched reads on faiss's own partition, for a test where faiss's two setups rank one way
+# cold and the other way warm.
+BATCHED = """
+[[system]]
+name = "faiss-ivf"
+adapter = "faiss_ivf"
+variant = "batched"
+
+  [[system.build]]
+  config_id = "vpl2560-rq1"
+  config = { bits = 1 }
+
+  [[system.cold]]
+  config_id = "vpl2560-rq1"
+  params = { nprobe = 24, k_factor = 4, qb = 4 }
+  split = "test"
+  trials = 4
+  group = "faiss"
+"""
+
+
 class HeadToHeadChartsTest(unittest.TestCase):
     """The 10M charts on the small phase of the head-to-head report's tests."""
 
@@ -288,6 +333,15 @@ class HeadToHeadChartsTest(unittest.TestCase):
         self.phase = test_headtohead.CollectTest("test_markdown_and_json")
         self.phase.setUp()
         self.root = self.phase.root
+
+        # Each warm line at 1 thread gets the p99 and the counts the driver records, a p99 of 1.5 times its p50 over
+        # 500 queries in 3 passes.
+        for path in (self.root / "results" / "t").glob("*.jsonl"):
+            lines = [json.loads(x) for x in path.read_text().splitlines()]
+            spread = [x | {"p99_us": 1.5 * x["p50_us"], "queries": 500, "passes": 3}
+                      if x["kind"] == "warm" and x["threads"] == 1 else x for x in lines]
+            path.write_text("".join(json.dumps(x) + "\n" for x in spread))
+
         self.charts, self.machine = charts.h2h_charts(self.root / "suite.toml", self.root)
         self.by_id = {c["id"]: c for c in self.charts}
 
@@ -295,8 +349,8 @@ class HeadToHeadChartsTest(unittest.TestCase):
         self.phase.tearDown()
 
     def test_each_chart_is_there_and_final(self):
-        self.assertEqual(list(self.by_id),
-                         ["cold-10m-95", "cold-10m-90", "warm-10m", "qps-10m", "memory-10m", "build-10m"])
+        self.assertEqual(list(self.by_id), ["cold-10m-95", "cold-10m-90", "warm-10m-95", "warm-10m-90", "qps-10m",
+                                            "memory-10m", "build-10m"])
         self.assertFalse(any(c["preliminary"] for c in self.charts))
         # The README shows memory and build as two images of the same rows.
         memory, build = self.by_id["memory-10m"], self.by_id["build-10m"]
@@ -311,19 +365,91 @@ class HeadToHeadChartsTest(unittest.TestCase):
         self.assertEqual((ours["p50_ratio"], ours["trials"], ours["queries"]), (1.0, 4, 4))
         self.assertAlmostEqual(theirs["p50_ratio"], 34_000.0 / 10_004.0)
         self.assertEqual(theirs["paired_ratio"]["queries"], 3)
-        self.assertEqual((theirs["setting_text"], charts.fmt_setting(theirs)), ("nprobe 48, k_factor 4",) * 2)
+        # Its setting names every search parameter, the qb its whole grid shares too, as the warm and QPS charts do.
+        self.assertEqual((theirs["setting_text"], charts.fmt_setting(theirs)), ("nprobe 48, k_factor 4, qb 4",) * 2)
         self.assertEqual(theirs["source"], "results/t/faiss-ivf.jsonl")
-        self.assertIn("| faiss IVF as shipped, 640 per list | nprobe 48, k_factor 4 | 0.950 | 4 (4) | 34.0 ms |",
+        self.assertIn("| faiss IVF as shipped, 640 per list | nprobe 48, k_factor 4, qb 4 | 0.950 | 4 (4) | 34.0 ms |",
                       charts.h2h_table({"charts": self.charts}, "cold-10m-95"))
 
-    def test_warm_panels_rank_by_p50_and_by_queries_per_second(self):
-        p50 = self.by_id["warm-10m"]["boards"][1]
-        self.assertEqual([(r["label"], r["p50_us"]) for r in p50["rows"]],
-                         [("ColdIVF", 410.0), ("faiss IVF", 2100.0)])
+    def test_a_warm_chart_shows_each_systems_pick_as_the_cold_charts_do(self):
+        from tests import test_headtohead as h
+
+        chart = self.by_id["warm-10m-95"]
+        self.assertEqual((chart["kind"], chart["target_recall10"], chart["title"]),
+                         ("h2h-warm", 0.95, "Warm query at 0.001M vectors, recall@10 0.95"))
+        self.assertEqual([(r["label"], r["group"], r["p50_us"], r["p99_us"]) for r in chart["rows"]],
+                         [("ColdIVF", "coldivf", 410.0, 615.0),
+                          ("faiss IVF as shipped, 640 per list", "system", 2100.0, 3150.0)])
+        ours, theirs = chart["rows"]
+        self.assertEqual((ours["queries"], ours["passes"], ours["threads"], ours["recall10_warm_split"]),
+                         (500, 3, 1, "test"))
+        self.assertAlmostEqual(theirs["p50_ratio"], 2100.0 / 410.0)
+        self.assertEqual((theirs["source"], theirs["short"]), ("results/t/faiss-ivf.jsonl", "faiss IVF"))
+        self.assertTrue({"machine_state", "code"} <= set(theirs))
+        self.assertEqual((ours["invalid"], theirs["invalid"]), ([], []))
+        # Its setting names every search parameter, as the cold chart's row does.
+        self.assertEqual(charts._row_detail(theirs), "nprobe 48, k_factor 4, qb 4 · recall 0.950 · 500 queries")
+        self.assertEqual(self.by_id["cold-10m-95"]["rows"][1]["setting_text"], theirs["setting_text"])
+        self.assertIn("Each dot is the p50 of the 500 test queries at 1 thread", chart["subtitle"])
+        self.assertIn("Both are the median of 3 passes over the queries.", chart["subtitle"])
+        # A system that reaches no target has no row, as in the cold charts.
+        self.assertEqual(chart["not_reached"], [{"system": "turbovec", "label": "turbovec"}])
+        self.assertEqual([(r["setting"], r["p50_us"], r["p99_us"]) for r in self.by_id["warm-10m-90"]["rows"]],
+                         [(h.BELOW, 310.0, 465.0), (h.FAISS, 2100.0, 3150.0)])
+
+    def test_a_warm_chart_ranks_its_rows_by_warm_p50(self):
+        # faiss is slower than ColdIVF cold but faster warm, so the warm chart's order differs from the cold one's.
+        path = self.root / "results" / "t" / "faiss-ivf.jsonl"
+        lines = [json.loads(x) for x in path.read_text().splitlines()]
+        fast = [x | {"p50_us": 300.0, "p99_us": 450.0}
+                if x["kind"] == "warm" and x["split"] == "test" and x["threads"] == 1 else x for x in lines]
+        path.write_text("".join(json.dumps(x) + "\n" for x in fast))
+        made = {c["id"]: c for c in charts.h2h_charts(self.root / "suite.toml", self.root)[0]}
+        self.assertEqual([r["system"] for r in made["cold-10m-95"]["rows"]], ["coldivf", "faiss-ivf"])
+        self.assertEqual([r["system"] for r in made["warm-10m-95"]["rows"]], ["faiss-ivf", "coldivf"])
+
+    def test_a_warm_chart_keeps_each_systems_setup_of_lowest_warm_p50(self):
+        from tests import test_headtohead as h
+
+        # faiss with batched reads is faster than faiss as shipped cold and slower warm, so the cold charts show it and
+        # the warm charts show faiss as shipped.
+        with open(self.root / "suite.toml", "a") as f:
+            f.write(BATCHED)
+
+        batched = {"nprobe": 24, "k_factor": 4, "qb": 4}
+        lines = [h.warm("faiss-ivf", "batched", "vpl2560-rq1", batched, 0.953, 2600.0),
+                 h.warm("faiss-ivf", "batched", "vpl2560-rq1", batched, 0.952, 2700.0, split="test", p99_us=4000.0,
+                        queries=500, passes=3)]
+        lines += [h.cold("faiss-ivf", "batched", "vpl2560-rq1", batched, q, 20_000.0) for q in (1, 3, 5, 11)]
+
+        with open(self.root / "results" / "t" / "faiss-ivf.jsonl", "a") as f:
+            f.write("".join(json.dumps(x) + "\n" for x in lines))
+
+        made = {c["id"]: c for c in charts.h2h_charts(self.root / "suite.toml", self.root)[0]}
+
+        for t in ("95", "90"):
+            self.assertEqual([(r["system"], r["variant"]) for r in made[f"cold-10m-{t}"]["rows"]],
+                             [("coldivf", "python"), ("faiss-ivf", "batched")])
+            self.assertEqual([(r["system"], r["variant"]) for r in made[f"warm-10m-{t}"]["rows"]],
+                             [("coldivf", "python"), ("faiss-ivf", "shipped")])
+
+    def test_every_setting_names_each_search_parameter(self):
+        self.assertEqual(charts.every_setting({"nprobe": 48, "k_factor": 4, "qb": 4, "quantizer_ef": 128}),
+                         "nprobe 48, k_factor 4, qb 4, quantizer_ef 128")
+        self.assertEqual(charts.every_setting({"nprobes": 16, "refine_factor": 8}), "nprobes 16, refine 8")
+        self.assertEqual(charts.every_setting({}), "none")
+
+    def test_qps_panels_rank_by_queries_per_second_with_each_setting(self):
         qps = self.by_id["qps-10m"]["boards"][1]
         self.assertEqual([(r["label"], r["qps"]) for r in qps["rows"]], [("ColdIVF", 5000.0), ("faiss IVF", 2000.0)])
+        self.assertEqual([r["setting_text"] for r in qps["rows"]],
+                         ["nprobe 64, rerank 39", "nprobe 48, k_factor 4, qb 4"])
+        self.assertEqual(qps["rows"][1]["source"], "results/t/faiss-ivf.jsonl")
+        self.assertTrue({"machine_state", "code"} <= set(qps["rows"][1]))
+        # The panels stand one above the other, each as wide as the page inside its margins.
+        layout = self.by_id["qps-10m"]["layout"]
+        self.assertEqual(layout["label_w"] + layout["plot_w"] + layout["value_w"], charts.WIDTH - 2 * charts.MARGIN)
         # No panel for recall@10 0.99, which ColdIVF doesn't reach, since a panel without it compares nothing.
-        self.assertEqual([b["recall10"] for b in self.by_id["warm-10m"]["boards"]], [0.90, 0.95])
         self.assertEqual([b["recall10"] for b in self.by_id["qps-10m"]["boards"]], [0.90, 0.95])
 
     def test_memory_counts_the_process_and_the_index_pages(self):
@@ -346,7 +472,9 @@ class HeadToHeadChartsTest(unittest.TestCase):
         made, _ = charts.h2h_charts(self.root / "suite.toml", self.root)
         rows = [r["label"] for r in next(c for c in made if c["id"] == "cold-10m-95")["rows"]]
         self.assertEqual(rows, ["ColdIVF", "faiss IVF as shipped, 640 per list"])
-        board = next(c for c in made if c["id"] == "warm-10m")["boards"]
+        warm = [r["label"] for c in made if c["kind"] == "h2h-warm" for r in c["rows"] + c["not_reached"]]
+        self.assertEqual(warm, ["ColdIVF", "faiss IVF as shipped, 640 per list", "turbovec"] * 2)
+        board = next(c for c in made if c["id"] == "qps-10m")["boards"]
         self.assertNotIn("ColdIVF binaries", [r["label"] for b in board for r in b["rows"] + b["not_reached"]])
         report = h.headtohead.collect(h.driver.load_suite(self.root / "suite.toml"),
                                       h.headtohead.Results(self.root / "results" / "t"))
@@ -370,8 +498,8 @@ class HeadToHeadChartsTest(unittest.TestCase):
                                 for x in path.read_text().splitlines()))
         data = charts.chart_data(self.root / "no-quiet-run", self.root, {"10m": self.root / "suite.toml"}, {})
         self.assertEqual([c["id"] for c in data["charts"]],
-                         ["cold-10m-95", "cold-10m-90", "warm-10m", "qps-10m", "memory-10m", "build-10m",
-                          "cold-coldivf"])
+                         ["cold-10m-95", "cold-10m-90", "warm-10m-95", "warm-10m-90", "qps-10m", "memory-10m",
+                          "build-10m", "cold-coldivf"])
         self.assertEqual(data["h2h_suites"], {"10m": "suite.toml"})
         self.assertEqual((data["machine"]["model"], data["machine"]["chip"]), ("Mac15,7", "Apple M3 Pro"))
 
@@ -380,8 +508,9 @@ class HeadToHeadChartsTest(unittest.TestCase):
             made, _ = charts.h2h_charts(self.root / "suite.toml", self.root, "1m")
 
         self.assertEqual([(c["id"], c["kind"]) for c in made],
-                         [("cold-1m-95", "h2h-cold"), ("cold-1m-90", "h2h-cold"), ("warm-1m", "h2h-warm"),
-                          ("qps-1m", "h2h-qps"), ("memory-1m", "h2h-memory"), ("build-1m", "h2h-memory")])
+                         [("cold-1m-95", "h2h-cold"), ("cold-1m-90", "h2h-cold"), ("warm-1m-95", "h2h-warm"),
+                          ("warm-1m-90", "h2h-warm"), ("qps-1m", "h2h-qps"), ("memory-1m", "h2h-memory"),
+                          ("build-1m", "h2h-memory")])
         self.assertTrue(all(c["subtitle"].startswith("The first 0.001M rows of tiny-16-cosine") for c in made))
         self.assertTrue(self.by_id["cold-10m-95"]["subtitle"].startswith("0.001M vectors of tiny-16-cosine"))
         # Every kind has a drawing.
@@ -467,6 +596,17 @@ class HeadToHeadChartsTest(unittest.TestCase):
         self.assertIn("| turbovec 4-bit, at its setting of most recall |", memory)
         self.assertEqual({x.count("|") for x in lines}, {7})
 
+    def test_the_warm_table_takes_every_target_of_the_warm_charts_and_the_qps_panels(self):
+        # Were ColdIVF to reach recall@10 0.99, the QPS chart would get a panel for it, while the warm charts keep
+        # their targets.
+        qps = json.loads(json.dumps(self.by_id["qps-10m"]))
+        ours = qps["boards"][1]["rows"][0]
+        qps["boards"].append({"recall10": 0.99, "rows": [ours | {"qps": 1200.0}], "not_reached": []})
+        data = {"charts": [c for c in self.charts if c["id"] != "qps-10m"] + [qps]}
+        warm = charts.h2h_warm_table(data, "10m")
+        self.assertTrue(warm.splitlines()[0].endswith("| Warm p50 at 0.99 | QPS, 6 Threads, at 0.99 | QPS Method |"))
+        self.assertIn("| **ColdIVF** | **0.310 ms** | - | **0.410 ms** | **5,000** | - | **1,200** | threads |", warm)
+
     def test_a_same_batch_check_compares_each_cell_with_coldivfs_module(self):
         from tests import test_headtohead as h
 
@@ -508,6 +648,58 @@ class HeadToHeadChartsTest(unittest.TestCase):
         # One file per chart that has lines. With no quiet run, the chart of ColdIVF in each setup has none.
         self.assertEqual(sorted(p.name for p in out.iterdir()),
                          sorted(["chart-data.json"] + [f"{c['id']}-dark.svg" for c in self.charts]))
+
+        for name in ("cold-10m-95", "cold-10m-90", "warm-10m-95", "warm-10m-90"):
+            assert_value_columns(self, out / f"{name}-dark.svg")
+
+        warm = svg_texts(out / "warm-10m-95-dark.svg")
+        self.assertIn("Warm query at 1 thread (ms), log scale", warm)
+        self.assertIn("nprobe 48, k_factor 4, qb 4 · recall 0.950 · 500 queries", warm)
+        self.assertEqual(warm[warm.index("0.410 ms") + 1], "0.615 ms")
+        self.assertEqual(warm[warm.index("2.10 ms") + 1], "3.15 ms")
+        qps = svg_texts(out / "qps-10m-dark.svg")
+        self.assertIn("nprobe 48, k_factor 4, qb 4 · recall 0.950", qps)
+        # A QPS row names its system in full, as the warm charts do, with its rank 6 points before the name.
+        placed, name = svg_placed(out / "qps-10m-dark.svg"), "faiss IVF as shipped, 640 per list"
+
+        with charts._mpl().matplotlib.rc_context(charts._rc(charts.THEME)):
+            width = charts.text_width(name, 8.5)
+
+        ranks = [(placed[i - 1][1], round(x - width - placed[i - 1][0], 2)) for i, (x, s) in enumerate(placed)
+                 if s == name]
+        self.assertEqual(ranks, [("1", 6.0), ("2", 6.0)])
+        self.assertIn("Not reached: turbovec.", qps)
+
+    @unittest.skipUnless(HAS_MATPLOTLIB, "matplotlib isn't installed")
+    def test_a_row_without_a_p99_draws_only_its_dot(self):
+        chart = json.loads(json.dumps(self.by_id["warm-10m-95"]))
+        chart["rows"][1]["p99_us"] = None
+        path = self.root / "warm.svg"
+
+        with charts._mpl().matplotlib.rc_context(charts._rc(charts.THEME)):
+            charts.DRAW[chart["kind"]]({}, chart, charts.THEME, path)
+
+        texts = svg_texts(path)
+        self.assertEqual(texts[texts.index("2.10 ms") + 1], "-")
+
+    @unittest.skipUnless(HAS_MATPLOTLIB, "matplotlib isn't installed")
+    def test_a_p99_under_its_dot_draws_no_tick_and_keeps_its_column(self):
+        chart = json.loads(json.dumps(self.by_id["warm-10m-95"]))
+        path = self.root / "warm.svg"
+        marks = []
+
+        # At 3.15 ms faiss's tick stands clear of its dot at 2.10 ms, and at 2.11 ms the dot would hide it.
+        for p99 in (3150.0, 2110.0):
+            chart["rows"][1]["p99_us"] = p99
+
+            with charts._mpl().matplotlib.rc_context(charts._rc(charts.THEME)):
+                charts.DRAW[chart["kind"]]({}, chart, charts.THEME, path)
+
+            marks.append(path.read_text().count("<use "))
+
+        self.assertEqual(marks[0] - marks[1], 1)
+        texts = svg_texts(path)
+        self.assertEqual(texts[texts.index("2.10 ms") + 1], "2.11 ms")
 
 
 if __name__ == "__main__":
