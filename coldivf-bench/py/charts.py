@@ -1086,6 +1086,46 @@ def method_note(boards: list[dict]) -> str:
     return " ".join(parts)
 
 
+def warm_reads_note(names_by_mode: dict[str, list[str]]) -> str:
+    """The warm chart's sentences on the systems whose warm mode leaves part of the index on disk, by mode: LanceDB's
+    "index", which caches only its index files, and DiskANN's "pq", which keeps its product quantization (PQ) codes in
+    memory and reads every sector from the disk, for an index larger than memory."""
+    parts = []
+
+    for mode, names in names_by_mode.items():
+        one = len(names) == 1
+        its = "its" if one else "their"
+
+        if mode == "index":
+            parts.append(f"{listed(names)} {'caches' if one else 'cache'} only {its} index files, so {its} rows are "
+                         f"read from {its} table.")
+        elif mode == "pq":
+            parts.append(f"{listed(names)} {'keeps' if one else 'keep'} only {its} PQ codes in memory and "
+                         f"{'reads' if one else 'read'} every sector from the disk, since {its} index doesn't fit in "
+                         "memory.")
+        else:
+            parts.append(f"{listed(names)} {'runs' if one else 'run'} in warm mode {mode}.")
+
+    return " ".join(parts)
+
+
+def warm_left_note(rows: list[dict]) -> str:
+    """The memory chart's sentences on what each row's warm mode leaves on disk, eg. LanceDB's table."""
+    parts = []
+
+    for r in rows:
+        name, mode = r["full_label"].split(" ")[0], r["warm"]["mode"]
+
+        if mode == "index" and r["build"]["stored_vector_bytes"]:
+            parts.append(f"{name}'s warm runs cache only its index files and leave its "
+                         f"{fmt_bytes(r['build']['stored_vector_bytes'])} table on disk.")
+        elif mode == "pq" and r["disk"]["index_bytes"]:
+            parts.append(f"{name}'s warm runs keep only its PQ codes in memory and read the sectors of its "
+                         f"{fmt_bytes(r['disk']['index_bytes'])} index from the disk.")
+
+    return " ".join(parts)
+
+
 def malloc_note(rows: list[dict]) -> str:
     """Which builds of a memory chart ran with macOS malloc's cache of freed large blocks off, which keeps freed blocks
     out of their peaks, and which with it on."""
@@ -1190,11 +1230,13 @@ def h2h_charts(suite_path: Path, repo: Path, scale: str = "10m") -> tuple[list[d
     # 2026-10-11), eg. recall@10 0.99 at 10M.
     reached = [t for t in headtohead.TARGETS if any(r["system"] == "coldivf" for r in data["targets"][t]["rows"])]
     boards = {value: [board(t, value) for t in reached] for value in ("p50_us", "qps")}
-    partial = list(dict.fromkeys(r["label"] for b in boards["p50_us"] for r in b["rows"]
-                                 if r["mode"] not in (None, "whole")))
-    reads = (f" {listed(partial)} {'caches' if len(partial) == 1 else 'cache'} only "
-             f"{'its' if len(partial) == 1 else 'their'} index files, so {'its' if len(partial) == 1 else 'their'} "
-             f"rows are read from {'its' if len(partial) == 1 else 'their'} table.") if partial else ""
+    partial = defaultdict(list)
+
+    for r in (r for b in boards["p50_us"] for r in b["rows"] if r["mode"] not in (None, "whole")):
+        if r["label"] not in partial[r["mode"]]:
+            partial[r["mode"]].append(r["label"])
+
+    reads = f" {warm_reads_note(partial)}" if partial else ""
     common = {"dataset": dataset, "n": n, "preliminary": False, "not_reached_text": "Not reached",
               "layout": {"label_w": 100.0, "plot_w": 88.0, "value_w": 42.0}, "left_out": []}
     charts.append({
@@ -1235,15 +1277,10 @@ def h2h_charts(suite_path: Path, repo: Path, scale: str = "10m") -> tuple[list[d
 
     held = (f", and {listed(hand)} at {'its setting' if len(hand) == 1 else 'their settings'} of most recall, "
             f"since {'it reaches' if len(hand) == 1 else 'they reach'} neither") if hand else ""
-    tables = [r for r in rows if r["warm"]["mode"] not in (None, "whole")]
-    leave = " ".join(f"{r['full_label'].split(' ')[0]}'s warm runs cache only its index files and leave its "
-                     f"{fmt_bytes(r['build']['stored_vector_bytes'])} table on disk."
-                     for r in tables if r["build"]["stored_vector_bytes"])
+    leave = warm_left_note(rows)
     charts.append({
         "id": f"memory-{scale}", "kind": "h2h-memory", "title": f"Memory at {millions(n)} vectors", "dataset": dataset,
         "n": n, "unit": "bytes", "preliminary": False,
-        "cold_title": "Open and first cold query: process plus index pages",
-        "warm_title": "Warm: process memory plus cached index pages",
         "subtitle": f"{about} Each system at its pick for recall@10 0.95, or 0.90 where it doesn't reach 0.95{held}. "
                     "Cold is the median of its trials of what the open and the first query add to the process, plus "
                     "the index's pages they bring into the page cache. Warm is the process plus the cached pages of "
@@ -1251,7 +1288,15 @@ def h2h_charts(suite_path: Path, repo: Path, scale: str = "10m") -> tuple[list[d
         "footer": " ".join(x for x in ("Pages an index copies into its own memory at open count once, in the process.",
                                        leave, "Setups that search another setup's file show that file's build.",
                                        malloc_note(rows)) if x),
-        "rows": rows,
+        "panels": "memory", "rows": rows,
+    })
+    # The same rows' build and disk panels, which the README shows as an image of their own.
+    charts.append({
+        "id": f"build-{scale}", "kind": "h2h-memory", "title": f"Build and index size at {millions(n)} vectors",
+        "dataset": dataset, "n": n, "unit": "bytes", "preliminary": False,
+        "subtitle": f"{about} Each system's build peak, the most memory its build process held, and its index's bytes "
+                    "per vector on disk, for the setup its memory row shows.",
+        "footer": malloc_note(rows), "panels": "build", "rows": rows,
     })
     return charts, machine
 
@@ -1681,27 +1726,19 @@ def wrap(text: str, size: float, width: float) -> list[str]:
 
 
 class Page:
-    """A figure laid out in points from its top left corner, with the title, subtitle and footnotes every chart has.
-    `body` is the height left for the chart between the subtitle and the footnotes, which starts at `top`."""
+    """A figure laid out in points from its top left corner, with the title every chart has. The README describes each
+    chart beside it, so the image holds no description. `body` is the height left for the chart, which starts at
+    `top`."""
 
-    def __init__(self, t: dict, title: str, subtitle: list[str], body: float, footer: list[str] = ()):
+    def __init__(self, t: dict, title: str, body: float):
         m = _mpl()
         self.t = t
-        width = (WIDTH - 2 * MARGIN) * 0.97
-        sub = [line for para in subtitle for line in wrap(para, 9, width)]
-        foot = [line for para in footer for line in wrap(para, 8, width)]
-        self.top = 48 + 13.5 * len(sub)
+        self.top = 48
         self.bottom = self.top + body
-        self.w, self.h = WIDTH, self.bottom + 12 * len(foot) + 16
+        self.w, self.h = WIDTH, self.bottom + 16
         self.fig = m.Figure(figsize=(self.w / 72, self.h / 72), dpi=72)
         m.Canvas(self.fig)
         self.text(MARGIN, 28, title, size=14, weight="bold", color=t["ink"])
-
-        for i, line in enumerate(sub):
-            self.text(MARGIN, 47 + 13.5 * i, line, size=9, color=t["ink2"])
-
-        for i, line in enumerate(foot):
-            self.text(MARGIN, self.bottom + 10 + 12 * i, line, size=8, color=t["ink2"])
 
     def text(self, x: float, y: float, s: str, **kwargs):
         kwargs.setdefault("va", "baseline")
@@ -1771,17 +1808,8 @@ def draw_cold_matched(data: dict, chart: dict, t: dict, path: Path) -> None:
     modeled = [r for r in rows if r["modeled"]]
     slots = measured + ([None] if modeled else []) + modeled
     row_h, left, plot_w = 31.0, 300.0, 290.0
-    dataset = chart["dataset"] if isinstance(chart["dataset"], str) else ", ".join(chart["dataset"])
-    recalls = [r["recall10_warm"] for r in measured if r.get("recall10_warm") is not None]
-    reach = (f"Each row runs at a setting picked to reach recall@10 {chart['target_recall10']:.2f} warm, and its "
-             f"warm recall is {min(recalls):.3f} to {max(recalls):.3f} over "
-             f"{fmt_count([r.get('recall10_warm_queries') for r in measured])} queries. ") if recalls else ""
-    subtitle = chart.get("subtitle") or (
-        f"{millions(chart['n'])} vectors of {dataset} ({DATASETS.get(dataset, dataset)}), on one "
-        f"{data['machine'].get('chip', 'machine')} in a quiet window. Each dot is the p50 of "
-        f"{fmt_range([r['trials'] for r in measured])} trials, and its line runs to the p99. {reach}Log scale.")
-    page = Page(t, chart["title"] + (" (preliminary)" if chart.get("preliminary", True) else ""), [subtitle],
-                34 + row_h * len(slots) + 42, [chart["footer"]])
+    page = Page(t, chart["title"] + (" (preliminary)" if chart.get("preliminary", False) else ""),
+                34 + row_h * len(slots) + 42)
     top = page.top + 34
     ax = page.axes(left, top, plot_w, row_h * len(slots))
     lo = 10 ** math.floor(math.log10(min(r["p50_us"] for r in rows) / 1.2))
@@ -1836,26 +1864,10 @@ def draw_cold_matched(data: dict, chart: dict, t: dict, path: Path) -> None:
 
 def draw_warm_leaderboard(data: dict, chart: dict, t: dict, path: Path) -> None:
     m = _mpl()
-    boards, curves = chart["boards"], chart.get("curves", [])
-    points = [p for c in curves for p in c["points"]]
-    calls = [p["overhead_us"] for c in curves for p in c["points"] if p.get("overhead_us")]
-    busy = busy_note([c["machine_state"] for c in curves], [c["system"] == "coldivf" for c in curves])
+    boards = chart["boards"]
     # The value each row ranks by, the warm p50 by default, where lower is faster, or queries per second.
     value = chart.get("value", "p50_us")
     qps = value == "qps"
-    foot = [chart["footer"]] if chart.get("footer") else []
-
-    if chart.get("left_out"):
-        foot.append(f"Left off, since no setting of its grid reaches recall@10 {boards[0]['recall10']:.2f}: "
-                    + ", ".join(f"{g['label']}, whose best is {g['best_recall10']:.3f}" for g in chart["left_out"])
-                    + ".")
-
-    if calls:
-        foot.append(f"{binding_note(curves)} One call on a 1,000-vector index takes them {fmt_us(min(calls))} to "
-                    f"{fmt_us(max(calls))}.")
-
-    if busy:
-        foot.append(busy)
 
     longest = max(len(b["rows"]) for b in boards)
     every = [r[value] for b in boards for r in b["rows"]]
@@ -1874,17 +1886,9 @@ def draw_warm_leaderboard(data: dict, chart: dict, t: dict, path: Path) -> None:
     gone = chart.get("not_reached_text", "Not reached in its grid")
     short = [wrap(f"{gone}: {', '.join(r['label'] for r in b['not_reached'])}.", 7.5, panel_w - 4)
              if b["not_reached"] else [] for b in boards]
-    grid = [len(c["points"]) for c in curves if len(c["points"]) > 1]
-    title = chart["title"] if not chart.get("preliminary", True) else \
+    title = chart["title"] if not chart.get("preliminary", False) else \
         f"{chart['title']} at {millions(chart['n'])} vectors (preliminary)"
-    page = Page(t, title, [chart["subtitle"]] if chart.get("subtitle") else [
-        f"First {millions(chart['n'])} rows of {chart['dataset']} ({DATASETS.get(chart['dataset'], '')}). Each panel "
-        "ranks the systems by warm p50 at one recall@10, read off each system's grid of "
-        f"{fmt_range(grid)} settings between the two around it, linear in the log of the latency. A system whose "
-        "every setting is above a target shows its fastest, marked *. Smoke grids at 1 thread over "
-        f"{fmt_range([p['queries'] for p in points])} queries, {fmt_range([p['passes'] for p in points])} timed "
-        "passes each, with every index read into memory first. The three panels share one log scale."
-    ], 30 + row_h * longest + 36 + 10 * max(len(lines) for lines in short) + 4, [" ".join(foot)])
+    page = Page(t, title, 30 + row_h * longest + 36 + 10 * max(len(lines) for lines in short) + 4)
 
     for b, board in enumerate(boards):
         x0 = MARGIN + b * (panel_w + gap)
@@ -1967,25 +1971,7 @@ def _place_labels(ax, points: list[tuple], obstacles: list[tuple]) -> None:
 
 def draw_cold_smoke(data: dict, chart: dict, t: dict, path: Path) -> None:
     points = [p for p in chart["points"] if p["recall10_warm"] is not None]
-    busy = busy_note([p["machine_state"] for p in points], [p["system"] == "coldivf" for p in points])
-    threads = sorted({p["threads"] for p in points if p["threads"]})
-    foot = []
-
-    if len(threads) > 1:
-        many = [p["label"].split(" (")[0] for p in points if p["threads"] == max(threads)]
-        foot.append(f"{', '.join(many)} ran on {max(threads)} threads, its default pool, and the rest on "
-                    f"{min(threads)}.")
-
-    if busy:
-        foot.append(busy)
-
-    page = Page(t, f"{chart['title']} (preliminary)", [
-        f"First {millions(chart['n'])} rows of {chart['dataset']} ({DATASETS.get(chart['dataset'], '')}). Each trial "
-        f"is a fresh process with the index evicted, {fmt_range([p['trials'] for p in points])} trials per system, "
-        "on a prewarmed core. Recall isn't matched. Each system runs one setting near its defaults, and the recall is "
-        f"that setting's warm recall@10 over {fmt_range([p['recall10_warm_queries'] for p in points])} tune queries. "
-        "Dots are the median, whiskers span the trials. Log scale."
-    ], 330, [" ".join(foot)])
+    page = Page(t, f"{chart['title']} (preliminary)", 330)
     left, width, height = 70.0, WIDTH - 70 - 30, 284.0
     ax = page.axes(left, page.top + 8, width, height)
     xs = [p["recall10_warm"] for p in points]
@@ -2017,25 +2003,16 @@ def draw_cold_smoke(data: dict, chart: dict, t: dict, path: Path) -> None:
 
 
 def draw_memory(data: dict, chart: dict, t: dict, path: Path) -> None:
+    """A memory chart's panels: with `panels` "memory", the cold and the warm memory side by side under one legend,
+    with "build", the build's peak and the index's bytes per vector, and else all four."""
     m = _mpl()
     rows = chart["rows"]
     row_h, label_w, plot_w, gap_x = 14.5, 104.0, 196.0, 70.0
     panel_h = row_h * len(rows)
-    exact = [r["label"] for r in rows if (r["disk"] or {}).get("exact_f32_stored")]
-    subtitle = chart.get("subtitle") or (
-        f"First {millions(chart['n'])} rows of {chart['dataset']}, from the smoke runs. Cold is the median "
-        f"of {fmt_range([r['cold']['trials'] for r in rows])} trials. Warm is at the cold setting, after every index "
-        f"file was read. Warm process memory comes {process_note(rows)}. Builds ran on "
-        f"{fmt_range([(r['build'] or {}).get('threads') for r in rows])} threads.")
-    foot = [f"The indexes that keep every float32 row on disk: {', '.join(exact)}."] if exact else []
-    foot += [chart["footer"]] if chart.get("footer") else []
-    page = Page(t, chart["title"] + (" (preliminary)" if chart.get("preliminary", True) else ""), [subtitle],
-                2 * (28 + panel_h + 30) + 6, foot)
-    # The cold panel splits a row's memory into the process and the index pages it brought into the page cache, as the
-    # warm panel does, where the row has both, and else plots the footprint the open and the first query added.
-    cold_title = chart.get("cold_title", "Added by the open and the first cold query")
 
     def cold(r: dict) -> tuple:
+        """A row's process memory and the index pages its open and first query brought into the page cache, where it
+        has both, and else the footprint the open and the first query added."""
         c = r["cold"]
 
         if c.get("process") is not None:
@@ -2043,21 +2020,34 @@ def draw_memory(data: dict, chart: dict, t: dict, path: Path) -> None:
 
         return (c.get("footprint_delta") or {}).get("median"), None
 
-    panels = [
-        (cold_title, "", cold, False, fmt_bytes),
-        (chart.get("warm_title", "Warm: process memory plus cached index pages"), "",
+    every = [
+        ("Cold: the open and the first query", "", cold, False, fmt_bytes),
+        ("Warm: every index file read first", "",
          lambda r: ((r["warm"] or {}).get("process_bytes"), (r["warm"] or {}).get("resident_file_bytes")), False,
          fmt_bytes),
-        ("Peak footprint while building", "", lambda r: ((r["build"] or {}).get("peak_footprint"), None), False,
+        ("Build: the peak while building", "", lambda r: ((r["build"] or {}).get("peak_footprint"), None), False,
          fmt_bytes),
-        ("Index bytes per vector on disk", "", lambda r: ((r["disk"] or {}).get("bytes_per_vector"), None), False,
+        ("Disk: index bytes per vector", "", lambda r: ((r["disk"] or {}).get("bytes_per_vector"), None), False,
          lambda v: f"{v:,.0f} B"),
     ]
+    which = chart.get("panels", "all")
+    panels = every[:2] if which == "memory" else every[2:] if which == "build" else every
+    # One legend sits above the panels that split memory into the process and the index's pages.
+    legend_h = 20.0 if which != "build" else 0.0
+    page = Page(t, chart["title"] + (" (preliminary)" if chart.get("preliminary", False) else ""),
+                legend_h + math.ceil(len(panels) / 2) * (28 + panel_h + 30) + 6)
+
+    if legend_h:
+        handles = [m.Patch(facecolor=t["rest"], label="Process memory"),
+                   m.Patch(facecolor=t["rest_tint"], label="Index pages in the page cache"),
+                   m.Patch(facecolor=t["coldivf"], label="ColdIVF")]
+        page.fig.legend(handles=handles, loc="upper left", ncol=3, handlelength=1.2, columnspacing=1.8,
+                        borderaxespad=0, borderpad=0, bbox_to_anchor=page.anchor(MARGIN, page.top + 2))
 
     for i, (title, note, value, log, fmt) in enumerate(panels):
         r_i, k = divmod(i, 2)
         left = MARGIN + label_w + k * (label_w + plot_w + gap_x)
-        top = page.top + 26 + r_i * (panel_h + 58)
+        top = page.top + legend_h + 26 + r_i * (panel_h + 58)
         ax = page.axes(left, top, plot_w, panel_h)
         # A log axis can't show 0, so a log panel leaves out what measured nothing.
         have = sorted(((r, *value(r)) for r in rows if value(r)[0] is not None and (value(r)[0] > 0 or not log)),
@@ -2117,13 +2107,6 @@ def draw_memory(data: dict, chart: dict, t: dict, path: Path) -> None:
         if note:
             ax.text(1, 1 + 12 / panel_h, note, transform=ax.transAxes, size=8, color=t["ink2"], va="bottom",
                     ha="right")
-
-        if i == 1:
-            handles = [m.Patch(facecolor=t["rest"], label="process memory"),
-                       m.Patch(facecolor=t["rest_tint"], label="index pages in the page cache")]
-            # Below the panel's ticks, since the rows and their labels can fill the panel to its right edge.
-            ax.legend(handles=handles, loc="upper right", ncol=2, handlelength=1.2, columnspacing=1.2, borderaxespad=0,
-                      bbox_to_anchor=(1, -22 / panel_h))
 
     page.save(path)
 

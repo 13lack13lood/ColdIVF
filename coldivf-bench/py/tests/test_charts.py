@@ -414,8 +414,13 @@ class HeadToHeadChartsTest(unittest.TestCase):
         self.phase.tearDown()
 
     def test_each_chart_is_there_and_final(self):
-        self.assertEqual(list(self.by_id), ["cold-10m-95", "cold-10m-90", "warm-10m", "qps-10m", "memory-10m"])
+        self.assertEqual(list(self.by_id),
+                         ["cold-10m-95", "cold-10m-90", "warm-10m", "qps-10m", "memory-10m", "build-10m"])
         self.assertFalse(any(c["preliminary"] for c in self.charts))
+        # The README shows memory and build as two images of the same rows.
+        memory, build = self.by_id["memory-10m"], self.by_id["build-10m"]
+        self.assertEqual((memory["panels"], build["panels"]), ("memory", "build"))
+        self.assertIs(memory["rows"], build["rows"])
 
     def test_a_cold_chart_ranks_each_systems_pick_against_coldivf(self):
         rows = self.by_id["cold-10m-95"]["rows"]
@@ -492,7 +497,7 @@ class HeadToHeadChartsTest(unittest.TestCase):
 
         self.assertEqual([(c["id"], c["kind"]) for c in made],
                          [("cold-1m-95", "h2h-cold"), ("cold-1m-90", "h2h-cold"), ("warm-1m", "h2h-warm"),
-                          ("qps-1m", "h2h-qps"), ("memory-1m", "h2h-memory")])
+                          ("qps-1m", "h2h-qps"), ("memory-1m", "h2h-memory"), ("build-1m", "h2h-memory")])
         self.assertTrue(all(c["subtitle"].startswith("The first 0.001M rows of tiny-16-cosine") for c in made))
         self.assertTrue(self.by_id["cold-10m-95"]["subtitle"].startswith("0.001M vectors of tiny-16-cosine"))
         # Every kind has a drawing.
@@ -522,6 +527,28 @@ class HeadToHeadChartsTest(unittest.TestCase):
         both_off = [{"label": x, "build": {"peak_footprint": 1, "malloc_cache": "off"}} for x in ("a", "b")]
         self.assertEqual(charts.malloc_note(both_off), "Every build ran with macOS malloc's cache of freed large "
                                                        "blocks off, so no build peak holds freed memory.")
+
+    def test_each_partial_warm_mode_says_what_stays_on_disk(self):
+        self.assertEqual(charts.warm_reads_note({"index": ["LanceDB IVF_RQ"], "pq": ["DiskANN"]}),
+                         "LanceDB IVF_RQ caches only its index files, so its rows are read from its table. DiskANN "
+                         "keeps only its PQ codes in memory and reads every sector from the disk, since its index "
+                         "doesn't fit in memory.")
+        self.assertEqual(charts.warm_reads_note({"pq": ["a", "b"]}),
+                         "a and b keep only their PQ codes in memory and read every sector from the disk, since their "
+                         "index doesn't fit in memory.")
+
+        def row(label: str, mode: str, stored: int, index: int) -> dict:
+            return {"full_label": label, "warm": {"mode": mode}, "build": {"stored_vector_bytes": stored},
+                    "disk": {"index_bytes": index}}
+
+        rows = [row("ColdIVF", "whole", 9_000_000_000, 9_430_000_000),
+                row("LanceDB IVF_RQ", "index", 30_720_000_000, 31_900_000_000),
+                row("DiskANN", "pq", 31_680_000_000, 41_930_000_000)]
+        self.assertEqual(charts.warm_left_note(rows),
+                         "LanceDB's warm runs cache only its index files and leave its 30.7 GB table on disk. "
+                         "DiskANN's warm runs keep only its PQ codes in memory and read the sectors of its 41.9 GB "
+                         "index from the disk.")
+        self.assertEqual(charts.warm_left_note(rows[:1]), "")
 
     def test_rows_of_fewer_queries_get_a_note_on_their_subsets(self):
         self.assertNotIn("subset", self.by_id["cold-10m-95"]["footer"])
