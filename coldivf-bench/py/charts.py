@@ -595,24 +595,26 @@ def h2h_warm_row(r: dict, folder: Path, repo: Path) -> dict:
     }
 
 
-def h2h_qps_rows(entry: dict, folder: Path, repo: Path) -> list[dict]:
-    """A head-to-head QPS panel's rows: each system's queries per second on 6 threads at its point for the target, on
-    the test split, with every search parameter of its setting and how its queries ran side by side."""
-    rows = []
-
-    for r in entry["rows"]:
-        if r["qps"].get(6) is not None:
-            lines = [x for x in r["_warm"] if x.get("threads") == 6]
-            rows.append({"system": r["system"], "variant": r["variant"], "label": short_label(r),
-                         "full_label": r["label"], "config_id": r["config_id"], "qps": r["qps"][6],
-                         "setting": r["setting"], "recall10": r["recall10"], "mode": r["warm_mode"],
-                         "method": (r.get("qps_method") or {}).get(6),
-                         "invalid": [t for t in r["warm_invalid"] if t == 6],
-                         "setting_text": every_setting(r["setting"]),
-                         "source": rel(folder / f"{r['system']}.jsonl", repo), "machine_state": driver_state(lines),
-                         "code": code_of(lines, repo)})
-
-    return sorted(rows, key=lambda x: x["qps"], reverse=True)
+def h2h_qps_row(r: dict, folder: Path, repo: Path) -> dict:
+    """One system's row of a head-to-head QPS chart, in the shape of the warm charts' rows: its queries per second on 6
+    and on 12 threads at its point for the target, on the test split, how those queries ran side by side, and the
+    recall of its setting at 1 thread, with every search parameter. Its mode, machine state and code are those of its
+    6-thread line, and machine_state_12 and code_12 those of its 12-thread line, or None without one."""
+    lines = [x for x in r["_warm"] if x.get("threads") == 6]
+    twelve = [x for x in r["_warm"] if x.get("threads") == 12]
+    first = lines[0] if lines else {}
+    method = r.get("qps_method") or {}
+    return {
+        "label": r["label"], "short": short_label(r),
+        "group": "coldivf" if r["system"] == "coldivf" else "system", "harness": "driver", "system": r["system"],
+        "variant": r["variant"], "config_id": r["config_id"], "setting": r["setting"], "dataset": first.get("dataset"),
+        "n": first.get("n"), "mode": first.get("mode"), "threads": 6, "setting_text": every_setting(r["setting"]),
+        "qps": r["qps"][6], "qps_12": r["qps"][12], "method": method.get(6), "method_12": method.get(12),
+        "recall10_warm": r["recall10"], "recall10_warm_queries": r["warm_queries"], "recall10_warm_split": "test",
+        "invalid": [t for t in r["warm_invalid"] if t in (6, 12)], "source": rel(folder / f"{r['system']}.jsonl", repo),
+        "machine_state": driver_state(lines), "code": code_of(lines, repo),
+        "machine_state_12": driver_state(twelve) if twelve else None, "code_12": code_of(twelve, repo),
+    }
 
 
 def h2h_memory_row(r: dict, target: float | None, folder: Path, repo: Path) -> dict:
@@ -635,14 +637,14 @@ def h2h_memory_row(r: dict, target: float | None, folder: Path, repo: Path) -> d
     }
 
 
-def method_note(boards: list[dict]) -> str:
-    """How the systems of a QPS chart ran their queries side by side on 6 threads, by name."""
+def method_note(rows: list[dict]) -> str:
+    """How the systems of a QPS chart ran their queries side by side on 6 threads, by their short names, and which of
+    them ran their 12 threads another way."""
     by = defaultdict(list)
 
-    for b in boards:
-        for r in b["rows"]:
-            if r["label"] not in by[r.get("method")]:
-                by[r.get("method")].append(r["label"])
+    for r in rows:
+        if r["short"] not in by[r.get("method")]:
+            by[r.get("method")].append(r["short"])
 
     def verb(names: list[str]) -> str:
         return "searches" if len(names) == 1 else "search"
@@ -661,6 +663,14 @@ def method_note(boards: list[dict]) -> str:
 
     if "ColdIVF" in by.get("threads", []):
         parts.append("ColdIVF's module has no batch call.")
+
+    ways = {"batch call": "through a call for a batch of queries", "processes": "from 12 processes",
+            "threads": "from 12 threads in one process"}
+    other = [f"{r['short']} searches {ways[r['method_12']]}" for r in rows
+             if r.get("method_12") in ways and r["method_12"] != r.get("method")]
+
+    if other:
+        parts.append(f"On 12 threads, {listed(other)}.")
 
     return " ".join(parts)
 
@@ -686,6 +696,18 @@ def warm_reads_note(names_by_mode: dict[str, list[str]]) -> str:
             parts.append(f"{listed(names)} {'runs' if one else 'run'} in warm mode {mode}.")
 
     return " ".join(parts)
+
+
+def partial_reads_note(rows: list[dict]) -> str:
+    """The sentences of warm_reads_note on the rows of a warm or QPS chart whose mode leaves part of the index on disk,
+    after a space, or nothing when every row reads its whole index."""
+    partial = defaultdict(list)
+
+    for r in rows:
+        if r["mode"] not in (None, "whole"):
+            partial[r["mode"]].append(r["label"])
+
+    return f" {warm_reads_note(partial)}" if partial else ""
 
 
 def warm_left_note(rows: list[dict]) -> str:
@@ -725,8 +747,9 @@ def malloc_note(rows: list[dict]) -> str:
 
 def h2h_charts(suite_path: Path, repo: Path, scale: str = "10m") -> tuple[list[dict], dict]:
     """A head-to-head's charts from its suite's results, by headtohead.py's picks: the cold first query and the warm
-    query at 1 thread at recall@10 0.95 and 0.90, queries per second at each target, and memory, named by `scale`, eg.
-    cold-1m-95 and warm-1m-90. It returns them with the machine their lines recorded."""
+    query at 1 thread at recall@10 0.95 and 0.90, queries per second on 6 and 12 threads at each target where ColdIVF
+    has a number on 6 threads, and memory, named by `scale`, eg. cold-1m-95, warm-1m-90 and qps-1m-95. It returns them
+    with the machine their lines recorded."""
     import driver
     import headtohead
 
@@ -806,13 +829,7 @@ def h2h_charts(suite_path: Path, repo: Path, scale: str = "10m") -> tuple[list[d
                                       if r["warm_p50_us"] is not None), key=lambda r: r["p50_us"]),
                               lambda r: r["p50_us"])
         recalls = [r["recall10_warm"] for r in rows if r["recall10_warm"] is not None]
-        partial = defaultdict(list)
-
-        for r in rows:
-            if r["mode"] not in (None, "whole"):
-                partial[r["mode"]].append(r["label"])
-
-        reads = f" {warm_reads_note(partial)}" if partial else ""
+        reads = partial_reads_note(rows)
         charts.append({
             "id": f"warm-{scale}-{round(t * 100)}", "kind": "h2h-warm",
             "title": f"Warm query at {millions(n)} vectors, recall@10 {t:.2f}",
@@ -831,27 +848,43 @@ def h2h_charts(suite_path: Path, repo: Path, scale: str = "10m") -> tuple[list[d
             "rows": rows, "not_reached": missing(rows), "reference": entry["reference"],
         })
 
-    def board(t: float) -> dict:
-        rows = one_per_system(h2h_qps_rows(data["targets"][t], folder, repo), lambda r: -r["qps"])
-        return {"recall10": t, "rows": rows, "not_reached": missing(rows)}
+    for t in sorted(headtohead.TARGETS, reverse=True):
+        entry = data["targets"][t]
+        rows = one_per_system(sorted((h2h_qps_row(r, folder, repo) for r in entry["rows"] if r["qps"][6] is not None),
+                                     key=lambda r: r["qps"], reverse=True), lambda r: -r["qps"])
 
-    # Only the targets ColdIVF reaches, since a panel without ColdIVF compares nothing the README is about (user,
-    # 2026-10-11), eg. recall@10 0.99 at 10M.
-    reached = [t for t in headtohead.TARGETS if any(r["system"] == "coldivf" for r in data["targets"][t]["rows"])]
-    boards = [board(t) for t in reached]
-    # The panels stand one above the other, so each fills the page's width.
-    label_w, value_w = 276.0, 60.0
-    charts.append({
-        "id": f"qps-{scale}", "kind": "h2h-qps", "title": f"Queries per second at {millions(n)} vectors, 6 threads",
-        "unit": "queries per second", "dataset": dataset, "n": n, "preliminary": False,
-        "not_reached_text": "Not reached",
-        "layout": {"label_w": label_w, "plot_w": WIDTH - 2 * MARGIN - label_w - value_w, "value_w": value_w},
-        "subtitle": f"{about} Each panel ranks the systems by queries per second on 6 threads, the M3 Pro's "
-                    "performance cores, at their pick for one recall@10 target, the median of 3 runs of 10 s each. "
-                    "Higher is faster. The panels share one log scale.",
-        "footer": method_note(boards),
-        "boards": boards,
-    })
+        # A target gets a chart only where ColdIVF has a number on 6 threads, since a chart without ColdIVF compares
+        # nothing the README is about (user, 2026-10-11), eg. recall@10 0.99 at 10M, which ColdIVF doesn't reach.
+        if not any(r["system"] == "coldivf" for r in rows):
+            continue
+
+        recalls = [r["recall10_warm"] for r in rows if r["recall10_warm"] is not None]
+        reads = partial_reads_note(rows)
+        charts.append({
+            "id": f"qps-{scale}-{round(t * 100)}", "kind": "h2h-qps",
+            "title": f"Queries per second at {millions(n)} vectors, recall@10 {t:.2f}",
+            "dataset": dataset, "n": n, "unit": "queries per second", "target_recall10": t, "preliminary": False,
+            "legend": ["ColdIVF", "Other systems"],
+            "subtitle": f"{about} Each dot is a system's queries per second on 6 threads, the M3 Pro's performance "
+                        "cores, with every index read into memory first. The columns give them on 6 threads and on "
+                        "12, as many as the M3 Pro has cores. Each is the median of 3 runs of 10 s each, which keep "
+                        f"no time per query, so a dot has no line to a p99.{reads} Each system runs at its pick for "
+                        f"recall@10 {t:.2f}, whose recall over the "
+                        f"{fmt_count([r['recall10_warm_queries'] for r in rows])} test queries at 1 thread is "
+                        f"{min(recalls):.3f} to {max(recalls):.3f}. Higher is faster. Log scale.",
+            "footer": method_note(rows),
+            "notes": ["Each row is headtohead.py's pick for the target, pick.py's verdict rule on the tune split, "
+                      "measured on the test split. Of a system's configurations it is the one with the most queries "
+                      "per second on 6 threads, which can differ from the ones its cold and warm charts show, and "
+                      "ColdIVF's is its Python module's.",
+                      "invalid lists the thread counts, of 6 and 12, whose line swap-ins or compressions elsewhere on "
+                      "the machine made invalid. The chart writes (invalid) after such a 12-thread number, as the "
+                      "README's tables flag such a line, and a dash for a row without a 12-thread line.",
+                      "mode, machine_state and code are those of the 6-thread line, and machine_state_12 and code_12 "
+                      "those of the 12-thread line, or null without one."],
+            "rows": rows, "not_reached": missing(rows), "reference": entry["reference"],
+        })
+
     rows, seen = [], set()
     shown = {r["label"] for c in charts if c["kind"] == "h2h-cold" for r in c["rows"]}
 
@@ -1102,20 +1135,20 @@ def h2h_warm_table(data: dict, scale: str) -> str:
     at each target, as the charts show them, and how its 6-thread queries ran side by side. The rows follow the warm
     p50 at the highest target. A cell from another configuration than the row's own names it."""
     warm = [c for c in data["charts"] if c.get("kind") == "h2h-warm" and c["id"].startswith(f"warm-{scale}-")]
-    qps = chart_of(data, f"qps-{scale}")
-    # The warm charts show fixed targets and the QPS panels those ColdIVF reaches, so the table takes every one of both.
-    targets = sorted({c["target_recall10"] for c in warm} | {b["recall10"] for b in qps["boards"]})
+    qps = [c for c in data["charts"] if c.get("kind") == "h2h-qps" and c["id"].startswith(f"qps-{scale}-")]
+    # The warm charts show fixed targets and the QPS charts those where ColdIVF has a number on 6 threads, so the table
+    # takes every one of both.
+    targets = sorted({c["target_recall10"] for c in warm + qps})
     cells = defaultdict(dict)
 
-    # A warm chart's row names its system in full and a QPS panel's in short, so each cell holds both names.
-    for c in warm:
-        for r in c["rows"]:
-            cells[r["system"]][(c["target_recall10"], "p50_us")] = {"label": r["short"], "full_label": r["label"],
-                                                                    "p50_us": r["p50_us"]}
+    # Each cell holds its row's full name, which names the table's row, and its short one, which names a cell of
+    # another configuration than its row's.
+    for c in warm + qps:
+        value = "p50_us" if c["kind"] == "h2h-warm" else "qps"
 
-    for b in qps["boards"]:
-        for r in b["rows"]:
-            cells[r["system"]][(b["recall10"], "qps")] = r
+        for r in c["rows"]:
+            cells[r["system"]][(c["target_recall10"], value)] = {"label": r["short"], "full_label": r["label"],
+                                                                 value: r[value], "method": r.get("method")}
 
     def order(system: str) -> tuple:
         p50 = [(t, cells[system][(t, "p50_us")]["p50_us"]) for t in reversed(targets) if (t, "p50_us") in cells[system]]
@@ -1228,11 +1261,9 @@ def _mpl() -> SimpleNamespace:
         def get_transform(self):
             return IdentityTransform()
 
-    scratch = Figure(figsize=(1, 1), dpi=72)
-    FigureCanvasAgg(scratch)
     return SimpleNamespace(matplotlib=matplotlib, Figure=Figure, Canvas=FigureCanvasAgg, Line2D=Line2D, Patch=Patch,
                            Bar=Bar, FixedLocator=FixedLocator, MaxNLocator=MaxNLocator, NullLocator=NullLocator,
-                           blended=blended_transform_factory, scratch=scratch)
+                           blended=blended_transform_factory)
 
 
 def _rc(t: dict) -> dict:
@@ -1245,35 +1276,10 @@ def _rc(t: dict) -> dict:
         "ytick.labelcolor": t["ink2"], "xtick.labelsize": 8.5, "ytick.labelsize": 8.5, "legend.labelcolor": t["ink2"],
         "legend.fontsize": 8.5, "legend.frameon": False, "lines.solid_capstyle": "round",
         "lines.solid_joinstyle": "round",
-        # Hinted glyphs at 72 dots per inch come out up to 7% narrower or wider than a browser draws them, which breaks
-        # the wrapping and the label placement, so text is measured unhinted.
+        # Hinted glyphs at 72 dots per inch come out up to 7% narrower or wider than a browser draws them, so text is
+        # measured unhinted.
         "text.hinting": "no_hinting",
     }
-
-
-def text_width(s: str, size: float, weight: str = "normal") -> float:
-    """The width of `s` in points, as matplotlib lays it out at 72 dots per inch."""
-    m = _mpl()
-    text = m.scratch.text(0, 0, s, size=size, weight=weight)
-    width = text.get_window_extent(m.scratch.canvas.get_renderer()).width
-    text.remove()
-    return width
-
-
-def wrap(text: str, size: float, width: float) -> list[str]:
-    """`text` broken at spaces into lines of at most `width` points."""
-    lines, line = [], ""
-
-    for word in text.split():
-        trial = f"{line} {word}" if line else word
-
-        if line and text_width(trial, size) > width:
-            lines.append(line)
-            line = word
-        else:
-            line = trial
-
-    return lines + ([line] if line else [])
 
 
 class Page:
@@ -1336,7 +1342,9 @@ def _dot(ax, x: float, y: float, color: str, t: dict, size: float, z: float = 3)
 
 
 def _row_detail(r: dict) -> str:
-    """The line under a row's label: its setting, its recall and the trials or, for a warm row, the queries it timed."""
+    """The line under a row's label: its setting, its recall and the trials, or for a warm row the queries it timed,
+    or for a QPS row how its 6-thread queries ran side by side, eg. "batch call". When a row's 12 threads ran another
+    way, the QPS chart's footer says so, since naming both here would leave the widest settings no room."""
     parts = [fmt_setting(r)]
 
     if r.get("recall10_warm") is not None:
@@ -1347,14 +1355,17 @@ def _row_detail(r: dict) -> str:
         parts.append(f"{r['trials']} trials{threads}")
     elif r.get("queries") is not None:
         parts.append(f"{r['queries']:,} queries")
+    elif r.get("method") is not None:
+        parts.append(r["method"])
 
     return " · ".join(parts)
 
 
-def draw_matched(data: dict, chart: dict, t: dict, path: Path, axis: str = "Cold first query (ms), log scale",
-                 fmt=fmt_ms) -> None:
-    """A dot at each row's p50 with a line to its p99, on a log scale labeled `axis`. The two times, written by `fmt`,
-    stand in columns on the right under one header."""
+def _dot_chart(chart: dict, t: dict, path: Path, axis: str, ticks, dot: str, line: str | None,
+               columns: tuple) -> None:
+    """A dot at each row's `dot` value with a line to its p99, the value `line` names, or no lines when `line` is None,
+    on a log scale labeled `axis` with ticks written by `ticks`. Each row's name and detail stand on the left, and the
+    two `columns` on the right, each a header and the text it gives a row."""
     m = _mpl()
     rows = chart["rows"]
     row_h, left, plot_w = 31.0, 300.0, 290.0
@@ -1362,8 +1373,10 @@ def draw_matched(data: dict, chart: dict, t: dict, path: Path, axis: str = "Cold
                 34 + row_h * len(rows) + 42)
     top = page.top + 34
     ax = page.axes(left, top, plot_w, row_h * len(rows))
-    lo = 10 ** math.floor(math.log10(min(r["p50_us"] for r in rows) / 1.2))
-    hi = 10 ** math.ceil(math.log10(max(r["p99_us"] or r["p50_us"] for r in rows)))
+    # A chart without lines leaves its last dot the room it leaves its first.
+    ends = [r[line] or r[dot] for r in rows] if line else [r[dot] * 1.2 for r in rows]
+    lo = 10 ** math.floor(math.log10(min(r[dot] for r in rows) / 1.2))
+    hi = 10 ** math.ceil(math.log10(max(ends)))
     # The axis's length in points per power of ten, to tell when a p99 falls under its dot.
     per = plot_w / math.log10(hi / lo)
     ax.set_xscale("log")
@@ -1371,12 +1384,13 @@ def draw_matched(data: dict, chart: dict, t: dict, path: Path, axis: str = "Cold
     ax.set_ylim(len(rows) - 0.5, -0.5)
     ax.yaxis.set_major_locator(m.NullLocator())
     ax.spines["left"].set_visible(False)
-    _log_ticks(ax, lo, hi, fmt=lambda v: f"{v / 1000:,g}")
+    _log_ticks(ax, lo, hi, fmt=ticks)
     ax.set_xlabel(axis, labelpad=6)
     _grid(ax, t)
     rowpos = m.blended(ax.transAxes, ax.transData)
+    (first_head, first), (second_head, second) = columns
 
-    for x, name in ((14, "p50"), (76, "p99")):
+    for x, name in ((14, first_head), (76, second_head)):
         page.text(left + plot_w + x, top - 3, name, size=8.5, color=t["ink2"])
 
     for i, r in enumerate(rows):
@@ -1387,28 +1401,40 @@ def draw_matched(data: dict, chart: dict, t: dict, path: Path, axis: str = "Cold
 
         # A row without a p99, eg. of a warm line that recorded only its p50, shows only its dot, and so does one whose
         # p99 lands within 6 pt of its p50, where the dot would hide the tick. Its column still gives the p99.
-        if r["p99_us"] is not None and per * math.log10(r["p99_us"] / r["p50_us"]) > 6:
-            ax.plot([r["p50_us"], r["p99_us"]], [i, i], color=color, linewidth=1.5, zorder=2, solid_capstyle="butt")
-            ax.plot([r["p99_us"]], [i], marker="|", markersize=9, markeredgewidth=1.5, color=color, zorder=2)
+        if line and r[line] is not None and per * math.log10(r[line] / r[dot]) > 6:
+            ax.plot([r[dot], r[line]], [i, i], color=color, linewidth=1.5, zorder=2, solid_capstyle="butt")
+            ax.plot([r[line]], [i], marker="|", markersize=9, markeredgewidth=1.5, color=color, zorder=2)
 
-        _dot(ax, r["p50_us"], i, color, t, 10)
+        _dot(ax, r[dot], i, color, t, 10)
         ax.text(-0.02, i - 0.1, r["label"], transform=rowpos, ha="right", va="bottom", size=9.5, color=t["ink"],
                 weight=weight)
         ax.text(-0.02, i + 0.1, _row_detail(r), transform=rowpos, ha="right", va="top", size=8, color=t["ink2"])
-        ax.text(1 + 14 / plot_w, i, fmt(r["p50_us"]), transform=rowpos, ha="left", va="center", size=9.5,
-                color=t["ink"], weight=weight)
-        ax.text(1 + 76 / plot_w, i, fmt(r["p99_us"]) if r["p99_us"] is not None else "-", transform=rowpos,
-                ha="left", va="center", size=8.5, color=t["ink2"])
+        ax.text(1 + 14 / plot_w, i, first(r), transform=rowpos, ha="left", va="center", size=9.5, color=t["ink"],
+                weight=weight)
+        ax.text(1 + 76 / plot_w, i, second(r), transform=rowpos, ha="left", va="center", size=8.5, color=t["ink2"])
 
-    dot = {"marker": "o", "markersize": 8, "linestyle": "none"}
+    style = {"marker": "o", "markersize": 8, "linestyle": "none"}
     ours_label, rest_label = chart["legend"]
-    handles = [m.Line2D([], [], markerfacecolor=t["coldivf"], markeredgecolor=t["surface"], label=ours_label, **dot),
-               m.Line2D([], [], markerfacecolor=t["rest"], markeredgecolor=t["surface"], label=rest_label, **dot),
-               m.Line2D([], [], color=t["rest"], marker="|", markersize=9, markeredgewidth=1.5, linewidth=1.5,
-                        label="Line to the p99")]
-    page.fig.legend(handles=handles, loc="upper left", ncol=3, handlelength=1.6, columnspacing=1.8,
+    handles = [m.Line2D([], [], markerfacecolor=t["coldivf"], markeredgecolor=t["surface"], label=ours_label, **style),
+               m.Line2D([], [], markerfacecolor=t["rest"], markeredgecolor=t["surface"], label=rest_label, **style)]
+
+    # The legend shows only what the chart draws.
+    if line:
+        handles.append(m.Line2D([], [], color=t["rest"], marker="|", markersize=9, markeredgewidth=1.5, linewidth=1.5,
+                                label="Line to the p99"))
+
+    page.fig.legend(handles=handles, loc="upper left", ncol=len(handles), handlelength=1.6, columnspacing=1.8,
                     borderaxespad=0, borderpad=0, bbox_to_anchor=page.anchor(MARGIN, page.top + 4))
     page.save(path)
+
+
+def draw_matched(data: dict, chart: dict, t: dict, path: Path, axis: str = "Cold first query (ms), log scale",
+                 fmt=fmt_ms) -> None:
+    """A dot at each row's p50 with a line to its p99, on a log scale labeled `axis`. The two times, written by `fmt`,
+    stand in columns on the right under one header."""
+    _dot_chart(chart, t, path, axis, lambda v: f"{v / 1000:,g}", "p50_us", "p99_us",
+               (("p50", lambda r: fmt(r["p50_us"])),
+                ("p99", lambda r: fmt(r["p99_us"]) if r["p99_us"] is not None else "-")))
 
 
 def draw_warm_matched(data: dict, chart: dict, t: dict, path: Path) -> None:
@@ -1417,67 +1443,22 @@ def draw_warm_matched(data: dict, chart: dict, t: dict, path: Path) -> None:
     draw_matched(data, chart, t, path, "Warm query at 1 thread (ms), log scale", warm_ms)
 
 
-def draw_leaderboard(data: dict, chart: dict, t: dict, path: Path) -> None:
-    """A QPS chart's panels, one per recall target, one above the other on one log scale. Each ranks the systems by
-    queries per second, with each one's full name, as the warm charts name it, and its setting and recall under it."""
-    m = _mpl()
-    boards = chart["boards"]
-    every = [r["qps"] for b in boards for r in b["rows"]]
-    lo, hi = min(every) / 1.5, max(every) * 1.5
-    layout = chart["layout"]
-    row_h, gap = 25.0, 20.0
-    label_w, plot_w, value_w = layout["label_w"], layout["plot_w"], layout["value_w"]
-    gone = chart["not_reached_text"]
-    short = [wrap(f"{gone}: {', '.join(r['label'] for r in b['not_reached'])}.", 7.5, label_w + plot_w + value_w)
-             if b["not_reached"] else [] for b in boards]
-    # Each panel's height: its title, its rows, the axis under them and the systems that don't reach its target.
-    heights = [30 + row_h * len(b["rows"]) + 36 + 10 * len(lines) for b, lines in zip(boards, short)]
-    page = Page(t, chart["title"] + (" (preliminary)" if chart.get("preliminary", False) else ""),
-                sum(heights) + gap * (len(boards) - 1) + 4)
-    y = page.top
+def twelve_threads(r: dict) -> str:
+    """A QPS row's queries per second on 12 threads, eg. "10,668", with "(invalid)" after it when swap-ins or
+    compressions made its line invalid, as the README's tables flag such a line, or "-" when it has none."""
+    if r.get("qps_12") is None:
+        return "-"
 
-    for b, board in enumerate(boards):
-        rows = board["rows"]
-        ax = page.axes(MARGIN + label_w, y + 30, plot_w, row_h * len(rows))
-        ax.set_xscale("log")
-        ax.set_xlim(lo, hi)
-        ax.set_ylim(len(rows) - 0.5, -0.5)
-        ax.yaxis.set_major_locator(m.NullLocator())
-        ax.spines["left"].set_visible(False)
-        _log_ticks(ax, lo, hi, fmt=lambda v: f"{v:,.0f}")
-        ax.tick_params(axis="x", labelsize=7.5)
-        ax.set_xlabel("queries per second, log scale", size=8, labelpad=3)
-        _grid(ax, t)
-        page.text(MARGIN, y + 18, f"Recall@10 {board['recall10']:.2f}", size=10, weight="bold", color=t["ink"])
-        pos = m.blended(ax.transAxes, ax.transData)
+    return f"{r['qps_12']:,.0f}" + (" (invalid)" if 12 in (r.get("invalid") or []) else "")
 
-        for i, r in enumerate(rows):
-            ours = r["system"] == "coldivf"
-            color = t["coldivf"] if ours else t["rest"]
-            ink = t["coldivf"] if ours else t["ink"]
-            weight = "bold" if ours else "normal"
-            recall = f" · recall {r['recall10']:.3f}" if r.get("recall10") is not None else ""
-            ax.plot([lo, r["qps"]], [i, i], color=color, linewidth=2 if ours else 1.2, zorder=2,
-                    solid_capstyle="butt")
-            ax.plot([r["qps"]], [i], marker="o", markersize=6 if ours else 4.5, color=color,
-                    markeredgecolor=t["surface"], markeredgewidth=0.8, zorder=3)
-            # The rank stands just before the name, which ends at the plot.
-            name_w = text_width(r["full_label"], 8.5, weight)
-            ax.text((-8 - name_w - 6) / plot_w, i - 0.1, f"{i + 1}", transform=pos, ha="right", va="bottom", size=7.5,
-                    color=t["ink2"])
-            ax.text(-8 / plot_w, i - 0.1, r["full_label"], transform=pos, ha="right", va="bottom", size=8.5, color=ink,
-                    weight=weight)
-            ax.text(-8 / plot_w, i + 0.1, fmt_setting(r) + recall, transform=pos, ha="right", va="top", size=7.5,
-                    color=t["ink2"])
-            ax.text(1 + value_w / plot_w, i, f"{r['qps']:,.0f}", transform=pos, ha="right", va="center", size=8.5,
-                    color=ink, weight=weight)
 
-        for k, line in enumerate(short[b]):
-            page.text(MARGIN, y + 30 + row_h * len(rows) + 40 + 10 * k, line, size=7.5, color=t["ink2"])
-
-        y += heights[b] + gap
-
-    page.save(path)
+def draw_qps(data: dict, chart: dict, t: dict, path: Path) -> None:
+    """A QPS chart, drawn as the warm ones are: a dot at each system's queries per second on 6 threads, with no line,
+    since each setting has one number, and its numbers on 6 and on 12 threads in the columns. The ticks are written in
+    full, eg. "1,000,000", where "g" would write "1e+06"."""
+    _dot_chart(chart, t, path, "Queries per second on 6 threads, log scale",
+               lambda v: f"{v:,.0f}" if v >= 1 else f"{v:g}", "qps", None,
+               (("6 threads", lambda r: f"{r['qps']:,.0f}"), ("12 threads", twelve_threads)))
 
 
 def draw_memory(data: dict, chart: dict, t: dict, path: Path) -> None:
@@ -1583,7 +1564,7 @@ def draw_memory(data: dict, chart: dict, t: dict, path: Path) -> None:
 
 # How each chart is drawn, by its id, or by its kind for the head-to-head's charts of every scale.
 DRAW = {"cold-coldivf": draw_matched, "h2h-cold": draw_matched, "h2h-warm": draw_warm_matched,
-        "h2h-qps": draw_leaderboard, "h2h-memory": draw_memory}
+        "h2h-qps": draw_qps, "h2h-memory": draw_memory}
 
 
 def draw(data: dict, out: Path) -> list[Path]:
@@ -1593,7 +1574,7 @@ def draw(data: dict, out: Path) -> list[Path]:
 
     with m.matplotlib.rc_context(_rc(THEME)):
         for chart in data["charts"]:
-            if not (chart.get("rows") or chart.get("boards")):
+            if not chart.get("rows"):
                 print(f"no lines for the {chart['id']} chart, so it isn't drawn", file=sys.stderr)
                 continue
 
