@@ -1093,7 +1093,8 @@ def malloc_note(rows: list[dict]) -> str:
     on = [r["label"] for r in rows if r["build"]["peak_footprint"] is not None and r["build"]["malloc_cache"] == "on"]
 
     if off and not on:
-        return "Every build ran with macOS malloc's cache of freed large blocks off, so no build peak holds freed memory."
+        return ("Every build ran with macOS malloc's cache of freed large blocks off, so no build peak holds freed "
+                "memory.")
 
     if off and on:
         whose = f"{off[0]}'s build" if len(off) == 1 else f"The builds of {listed(off)}"
@@ -1296,9 +1297,9 @@ H2H_CHECKS = {"1m": Path("coldivf-bench") / "suites" / "bench-1m-same-batch.toml
 
 def same_batch(suite_path: Path, repo: Path) -> dict | None:
     """A same-batch check's cells: each one's C0 p50 and p99 over its ok trials, and each other cell against ColdIVF's
-    module, the ratio of the p50s and the median of per-query ratios with its 95% interval. It also gives the test recall
-    of each warm line the check ran, and the drift references at the batch's start and end. It is None until the check's
-    cells have trials."""
+    module, the ratio of the p50s and the median of per-query ratios with its 95% interval. It also gives the test
+    recall of each warm line the check ran, and the drift references at the batch's start and end. It is None until the
+    check's cells have trials."""
     import driver
     import headtohead
 
@@ -2030,13 +2031,20 @@ def draw_memory(data: dict, chart: dict, t: dict, path: Path) -> None:
     foot += [chart["footer"]] if chart.get("footer") else []
     page = Page(t, chart["title"] + (" (preliminary)" if chart.get("preliminary", True) else ""), [subtitle],
                 2 * (28 + panel_h + 30) + 6, foot)
-    # The cold panel plots a row's total, process plus index pages, where it has one, else the footprint the open and
-    # the first query added.
+    # The cold panel splits a row's memory into the process and the index pages it brought into the page cache, as the
+    # warm panel does, where the row has both, and else plots the footprint the open and the first query added.
     cold_title = chart.get("cold_title", "Added by the open and the first cold query")
+
+    def cold(r: dict) -> tuple:
+        c = r["cold"]
+
+        if c.get("process") is not None:
+            return c["process"], c.get("pages")
+
+        return (c.get("footprint_delta") or {}).get("median"), None
+
     panels = [
-        (cold_title, "log scale",
-         lambda r: (r["cold"].get("total") if r["cold"].get("total") is not None
-                    else (r["cold"].get("footprint_delta") or {}).get("median"), None), True, fmt_bytes),
+        (cold_title, "", cold, False, fmt_bytes),
         (chart.get("warm_title", "Warm: process memory plus cached index pages"), "",
          lambda r: ((r["warm"] or {}).get("process_bytes"), (r["warm"] or {}).get("resident_file_bytes")), False,
          fmt_bytes),
@@ -2112,7 +2120,7 @@ def draw_memory(data: dict, chart: dict, t: dict, path: Path) -> None:
 
         if i == 1:
             handles = [m.Patch(facecolor=t["rest"], label="process memory"),
-                       m.Patch(facecolor=t["rest_tint"], label="cached index pages")]
+                       m.Patch(facecolor=t["rest_tint"], label="index pages in the page cache")]
             # Below the panel's ticks, since the rows and their labels can fill the panel to its right edge.
             ax.legend(handles=handles, loc="upper right", ncol=2, handlelength=1.2, columnspacing=1.2, borderaxespad=0,
                       bbox_to_anchor=(1, -22 / panel_h))
