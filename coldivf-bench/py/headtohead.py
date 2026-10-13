@@ -528,8 +528,8 @@ def fmt_ratio(against: dict | None, name: str) -> str:
 
 
 SPEED = ("| System | Setting | Test Recall@10 | Warm p50 ms | QPS on 6 Threads | QPS on 12 Threads | QPS Method "
-         "| C0 p50 ms | C0 p99 ms | C0 Trials (Queries) | C0 p50 at Exactly the Target ms "
-         "| C0 Against ColdIVF, Paired by Query |")
+         "| Cold p50 ms | Cold p99 ms | Cold Trials (Queries) | Cold p50 at Exactly the Target ms "
+         "| Cold Against ColdIVF, Paired by Query |")
 MEMORY = ("| System | Setting | Open and First Query: Process + Index Pages | Warm Mode | Warm: Process + Cached Pages "
           "| Build Minutes | Build Peak | Build Malloc Cache | Index Size | Bytes per Vector |")
 
@@ -589,7 +589,7 @@ def markdown(data: dict) -> str:
     cold = [c for c in data["controls"] if c["kind"] == "cold"]
 
     if cold:
-        out += ["\n### Control Cells\n", "| Build | Group | Setting | Fresh Clone | Trials | C0 p50 ms | C0 p99 ms |",
+        out += ["\n### Control Cells\n", "| Build | Group | Setting | Fresh Clone | Trials | Cold p50 ms | Cold p99 ms |",
                 "|---|---|---|---|---|---|---|"]
         out += [f"| {c['label']} {c['config_id']} | {c['group']} | {setting_text(c['setting'])} "
                 f"| {'yes' if c['fresh_clone'] else 'no'} | {c['trials']} | {fmt_ms(c['c0_p50_us'])} "
