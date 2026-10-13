@@ -8,6 +8,9 @@ The cluster count is `nlist` or `vectors_per_list`, and a shared partition bring
 A search takes `nprobe` and, optionally, `high_accuracy`, which overrides the library's choice of scan precision. The
 index is one file, plus a .hnsw file when the library routes queries through a graph of the centers, which it does from
 20,000 clusters on. Both load whole at open.
+
+An add copies the whole index and grows it by its rows, so it needs no room made first. A removed row keeps its slot
+and its code, which searches still scan.
 """
 
 from __future__ import annotations
@@ -19,7 +22,9 @@ import numpy as np
 
 from adapters import inproc
 from adapters.base import BuildContext, main
-from adapters.rabitq_common import RabitqAdapter, cluster_count, code_bytes, library_metric, list_sizes
+from adapters.rabitq_common import (
+    RabitqAdapter, RabitqWrites, Writer, cluster_count, code_bytes, library_metric, list_sizes,
+)
 
 BITS = (*range(1, 10), 32)
 BUILD = {"bits": inproc.REQUIRED, "nlist": None, "vectors_per_list": None, "kmeans": None, "niter": 25,
@@ -36,7 +41,7 @@ def bits_of(value: Any) -> int:
     return bits
 
 
-class RabitqIvf(RabitqAdapter):
+class RabitqIvf(RabitqWrites, RabitqAdapter):
     system = "rabitq-ivf"
     file_name = "ivf.rabitq"
     kind = "IvfIndex"
@@ -92,6 +97,10 @@ class RabitqIvf(RabitqAdapter):
         ids, _ = index.search(queries, k=k, nprobe=int(params["nprobe"]), high_accuracy=params.get("high_accuracy"),
                               num_threads=threads)
         return ids
+
+    def pending(self, w: Writer) -> dict:
+        """The index's slots, the removed rows' among them."""
+        return {"slots": int(w.index.max_elements)}
 
 
 if __name__ == "__main__":

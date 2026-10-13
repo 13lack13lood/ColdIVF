@@ -10,6 +10,13 @@ Vectors are stored as i8 with cosine, which usearch's 8-bit codes are made for, 
 product, which ranks unit vectors as cosine does. A search takes expansion_search, the size of its candidate list, and
 runs on one thread. The batch call runs its own threads outside Python's lock, so queries per second (QPS) at several
 threads use it.
+
+Writes go to the index loaded whole, since a view can't change, with key lookups on, which remove needs. An insert is
+add with the stream's ids as keys and a delete is remove, one key or many per call, on the session's threads. A remove
+leaves the node in the graph with a free key, so searches still walk it and leave it out of their results, and a later
+add takes over the node and its vector slot. The durable point saves the whole file beside the old one, syncs it and
+renames it over the old one, since a save over a file that a view maps kills the viewing process. There is no
+maintenance action.
 """
 
 from __future__ import annotations
@@ -23,7 +30,7 @@ from typing import Any
 import numpy as np
 
 from adapters import graphs
-from adapters.base import Adapter, BuildContext, ServeContext, Unsupported, main
+from adapters.base import Adapter, BuildContext, ServeContext, Unsupported, WriteContext, main
 import schema
 
 FILE = "index.usearch"
@@ -113,10 +120,22 @@ class Handle:
     visited: int = 0
 
 
+@dataclass
+class Writer:
+    """The loaded index of a write session, the file its durable point replaces, and the threads its calls take."""
+
+    index: Any
+    file: Path
+    threads: int
+
+
 class USearch(Adapter):
     system = "usearch"
     batch_api = True
     workers = "its own threads, for batch searches"
+    write_role = "full"
+    durability = {"call": "memory", "sync": "power"}
+    sync_kind = "whole"
 
     def load(self) -> None:
         import usearch
@@ -237,6 +256,48 @@ class USearch(Adapter):
             out.append({"path": str(meta), "bytes": meta.stat().st_size, "ranges": []})
 
         return out
+
+    def writer_open(self, ctx: WriteContext, path: Path) -> Writer:
+        file = index_file(path)
+        index = self.Index.restore(str(file), view=False, enable_key_lookups=True)
+
+        if index is None:
+            raise FileNotFoundError(f"{file} isn't a usearch index")
+
+        # The file keeps the links per node, but not the candidate list of adds, which comes from the build's meta.
+        meta = file.parent / graphs.META
+        settings = graphs.read_meta(file.parent).get("settings", {}) if meta.is_file() else {}
+
+        if "expansion_add" in settings:
+            index.expansion_add = int(settings["expansion_add"])
+
+        return Writer(index=index, file=file, threads=max(1, ctx.threads))
+
+    def insert(self, w: Writer, ids: np.ndarray, rows: np.ndarray) -> None:
+        if len(ids) == 1:
+            w.index.add(int(ids[0]), rows[0], threads=w.threads)
+        else:
+            w.index.add(np.asarray(ids, dtype=np.uint64), rows, threads=w.threads)
+
+    def delete(self, w: Writer, ids: np.ndarray) -> None:
+        if len(ids) == 1:
+            removed = int(w.index.remove(int(ids[0])))
+        else:
+            removed = int(w.index.remove(np.asarray(ids, dtype=np.uint64)))
+
+        if removed != len(ids):
+            raise RuntimeError(f"usearch removed {removed} of {len(ids)} keys, so the index lacked some of them")
+
+    def sync(self, w: Writer) -> dict:
+        return graphs.save_whole(w.file, lambda tmp: w.index.save(tmp))
+
+    def pending(self, w: Writer) -> dict:
+        """The live keys and the graph's nodes, whose difference is the removed nodes that searches still walk."""
+        nodes = int(w.index.stats.nodes)
+        return {"live": len(w.index), "nodes": nodes, "removed_nodes": nodes - len(w.index)}
+
+    def writer_close(self, w: Writer) -> None:
+        w.index.reset()
 
 
 if __name__ == "__main__":

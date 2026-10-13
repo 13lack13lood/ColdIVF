@@ -1,14 +1,17 @@
-"""Helpers the graph adapters share, for usearch, qdrant-edge and AsterVec."""
+"""Helpers the graph adapters share, for usearch, qdrant-edge and AsterVec, and the whole-file durable point of usearch
+and RaBitQ-Library."""
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import numpy as np
 
 from adapters.base import Unsupported
+import writes
 
 META = "meta.json"
 
@@ -55,3 +58,30 @@ def write_meta(folder: Path, meta: dict) -> None:
 
 def read_meta(folder: Path) -> dict:
     return json.loads((Path(folder) / META).read_text())
+
+
+def save_whole(file: Path | str, save: Callable[[str], Any]) -> dict:
+    """The durable point of a library that only saves a whole file, which the harness makes survive a power loss.
+    `save` writes the index to a temporary file beside `file`. That file gets F_FULLFSYNC and a rename over `file`,
+    and then the folder gets F_FULLFSYNC, so the rename survives too. A file the library writes beside the temporary
+    one, eg. its name with ".hnsw" added, takes the same steps to the same name beside `file`. Nothing ever saves over
+    the old file, so a process that maps it keeps the old bytes. It returns the files and bytes it wrote."""
+    file = Path(file)
+    tmp = file.with_name(f"{file.name}.save-{os.getpid()}.tmp")
+    save(str(tmp))
+    written = sorted(p for p in file.parent.iterdir() if p.name.startswith(tmp.name))
+
+    if tmp not in written:
+        raise FileNotFoundError(f"the library's save left no file at {tmp}")
+
+    names, size = [], 0
+
+    for part in written:
+        target = file.with_name(file.name + part.name[len(tmp.name):])
+        size += part.stat().st_size
+        writes.fullfsync(part)
+        os.replace(part, target)
+        names.append(target.name)
+
+    writes.fullfsync(file.parent)
+    return {"call": "save", "files": names, "bytes": size, "sync": "F_FULLFSYNC", "rename": True}

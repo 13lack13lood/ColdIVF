@@ -10,6 +10,12 @@ class sets OMP_NUM_THREADS to match.
 An IVF (inverted file index) and an HNSW (hierarchical navigable small world) graph code every row relative to the
 center of its cluster, so their builds take a partition. It is a shared one from --clusters, or the library's own
 k-means, which trains on every row and then assigns each row to its nearest center.
+
+The IVF and the HNSW take writes on the loaded index, through `RabitqWrites`. An insert is add, which numbers the rows
+itself, the next ids after the last, and codes each row against the center nearest it, which doesn't move. A delete is
+remove, which leaves the row's code in place and only keeps it out of later results. The library saves only a whole
+file, so the durable point saves the index beside the old file, syncs it and renames it over the old one. SymphonyQG's
+index has no add or remove, so it keeps the base's rebuild-only role.
 """
 
 from __future__ import annotations
@@ -23,8 +29,8 @@ from typing import Any
 
 import numpy as np
 
-from adapters import inproc
-from adapters.base import Adapter, BuildContext, ServeContext, Unsupported
+from adapters import graphs, inproc
+from adapters.base import Adapter, BuildContext, ServeContext, Unsupported, WriteContext
 import data
 import schema
 
@@ -152,6 +158,15 @@ def code_bytes(rows: int, dim: int, bits: int) -> int:
     return rows * padded * bits // 8
 
 
+@dataclass
+class Writer:
+    """The loaded index of a write session, the file its durable point replaces, and the threads its calls take."""
+
+    index: Any
+    file: Path
+    threads: int
+
+
 class RabitqAdapter(Adapter):
     """One RaBitQ-Library index type. A subclass names its file and its library class, builds, and runs a batch of
     queries in `query`."""
@@ -228,3 +243,32 @@ class RabitqAdapter(Adapter):
         start = time.perf_counter()
         index.save(str(Path(out) / self.file_name))
         return time.perf_counter() - start
+
+
+class RabitqWrites:
+    """The write hooks of the indexes with add and remove, the IVF and the HNSW. Put it before RabitqAdapter among the
+    bases. The library numbers the rows an add takes, so `insert` returns those ids for the session to check."""
+
+    write_role = "full"
+    durability = {"call": "memory", "sync": "power"}
+    sync_kind = "whole"
+
+    def writer_open(self, ctx: WriteContext, path: Path) -> Writer:
+        file = self.index_file(path)
+        return Writer(index=getattr(self.lib, self.kind).load(str(file)), file=file, threads=max(1, ctx.threads))
+
+    def insert(self, w: Writer, ids: np.ndarray, rows: np.ndarray) -> np.ndarray:
+        """One add. The library has no call for a single row, so a batch of one is an add of one row."""
+        return w.index.add(np.ascontiguousarray(rows, dtype=np.float32), num_threads=w.threads)
+
+    def delete(self, w: Writer, ids: np.ndarray) -> None:
+        removed = int(w.index.remove(np.asarray(ids, dtype=np.int64)))
+
+        if removed != len(ids):
+            raise RuntimeError(f"{self.system} removed {removed} of {len(ids)} ids, so some were removed already")
+
+    def sync(self, w: Writer) -> dict:
+        return graphs.save_whole(w.file, w.index.save)
+
+    def writer_close(self, w: Writer) -> None:
+        w.index = None

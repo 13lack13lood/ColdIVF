@@ -6,6 +6,9 @@ coded relative to the center of its cluster, so a build clusters the rows first.
 `fast_quantization` (false). A shared partition from --clusters replaces the library's k-means, and a given `clusters`
 must match it. Clusters that no row of the prefix uses are dropped. The graph's random levels take the build's seed. A
 search takes `ef`. The index is one file, which loads whole at open.
+
+An add fails past the index's capacity, so each round of a write session first resizes it to the ids the round ends
+with, timed as an op of its own. A removed point stays in the graph, where searches still walk it.
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ import numpy as np
 
 from adapters import inproc
 from adapters.base import BuildContext, main
-from adapters.rabitq_common import RabitqAdapter, code_bytes, compact, library_metric, list_sizes
+from adapters.rabitq_common import RabitqAdapter, RabitqWrites, Writer, code_bytes, compact, library_metric, list_sizes
 
 BITS = tuple(range(1, 10))
 BUILD = {"bits": inproc.REQUIRED, "M": 16, "ef_construction": 200, "clusters": None, "niter": 25,
@@ -26,7 +29,7 @@ CLUSTERS = 16
 SEARCH = {"ef": inproc.REQUIRED}
 
 
-class RabitqHnsw(RabitqAdapter):
+class RabitqHnsw(RabitqWrites, RabitqAdapter):
     system = "rabitq-hnsw"
     file_name = "hnsw.rabitq"
     kind = "HnswIndex"
@@ -85,6 +88,17 @@ class RabitqHnsw(RabitqAdapter):
     def query(self, index: Any, queries: np.ndarray, k: int, params: dict, threads: int) -> np.ndarray:
         ids, _ = index.search(queries, k=k, ef=int(params["ef"]), num_threads=threads)
         return ids
+
+    def resize(self, w: Writer, capacity: int) -> bool:
+        if capacity <= int(w.index.max_elements):
+            return False
+
+        w.index.resize(int(capacity))
+        return True
+
+    def pending(self, w: Writer) -> dict:
+        """The graph's points, the removed ones among them, and its capacity."""
+        return {"points": int(w.index.num_points), "max_elements": int(w.index.max_elements)}
 
 
 if __name__ == "__main__":
