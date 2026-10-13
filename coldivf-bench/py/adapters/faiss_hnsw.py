@@ -12,6 +12,11 @@ the whole graph section, i.e. the levels, the offsets and the neighbor lists, ~2
 marks the graph section as routing data and the codes as bulk data, and the disk-resident steady state (C1) keeps the
 graph cached. Searches set efSearch and k_factor through search parameters, since this faiss can't downcast an
 IndexHNSWRaBitQ read back from a file.
+
+It takes inserts only. faiss's graph indexes have no remove_ids, and their one way to leave rows out is a search filter
+that still walks the deleted nodes. An insert is add on the index loaded whole, since a mapped one can't take writes,
+and faiss numbers the rows itself from its count, which a stream checks against the stream's ids. A search finds an
+insert at once. The durable point saves the whole file and rewrites meta.json with the new file's parts.
 """
 
 from __future__ import annotations
@@ -23,11 +28,12 @@ from typing import Any
 
 import numpy as np
 
-from adapters.base import BuildContext, ServeContext, Unsupported, main
+from adapters.base import BuildContext, ServeContext, Unsupported, WriteContext, main
 from adapters.faiss_common import (
-    META, TRAIN_ROWS, FaissAdapter, check_unit, faiss_metric, metric_type, parsed, parts_record, sample_rows,
-    set_threads, whole, write_meta,
+    META, TRAIN_ROWS, FaissAdapter, Writer, check_unit, faiss_metric, metric_type, parsed, parts_record,
+    sample_rows, set_threads, whole, write_meta,
 )
+from adapters.inproc import settings
 
 INDEX = "index.faiss"
 BUILD_KEYS = {"m", "storage", "bits", "refine", "ef_construction", "train_rows"}
@@ -120,6 +126,7 @@ def search_params(ef_search: int, k_factor: float, refine: bool) -> tuple[Any, l
 
 class FaissHNSW(FaissAdapter):
     system = "faiss-hnsw"
+    write_role = "inserts"
 
     def load(self) -> None:
         super().load()
@@ -260,6 +267,30 @@ class FaissHNSW(FaissAdapter):
             out.append(whole(f, "routing", loaded=True) if f.name == META else parsed(f))
 
         return out
+
+    def writer_open(self, ctx: WriteContext, path: Path) -> Writer:
+        """Reads the index whole, without a map, since faiss writes only to a loaded index."""
+        import faiss
+
+        settings(ctx.params, {}, "faiss HNSW write settings")
+        path = Path(path)
+        return Writer(folder=path, file=path / INDEX, top=faiss.read_index(str(path / INDEX)), meta=self.meta(path))
+
+    def insert(self, w: Writer, ids: np.ndarray, rows: np.ndarray) -> np.ndarray:
+        """One add, which links each row into the graph and numbers it from the index's count. It returns those
+        numbers, which a stream checks."""
+        x = np.ascontiguousarray(rows, dtype=np.float32)
+        start = int(w.top.ntotal)
+        w.top.add(x)
+        return np.arange(start, start + len(x), dtype=np.int64)
+
+    def pending(self, w: Writer) -> dict:
+        """What the loaded index holds. Each insert is in the graph at once, so nothing waits."""
+        return {"live_rows": int(w.top.ntotal)}
+
+    def saved_meta(self, w: Writer) -> dict:
+        return w.meta | {"parts": parts_record(w.folder, [INDEX]), "state_rows": int(w.top.ntotal),
+                         "live_rows": int(w.top.ntotal)}
 
 
 if __name__ == "__main__":

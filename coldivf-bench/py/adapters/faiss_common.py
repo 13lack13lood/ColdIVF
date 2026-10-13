@@ -1,5 +1,10 @@
 """What the faiss adapters share. That is the library's setup, the metric, training samples, shared partitions, the
-meta file of an index, file ranges, read-ahead and residency checks.
+meta file of an index, file ranges, read-ahead and residency checks, and the whole-file saves of a write session.
+
+faiss writes only to an index loaded whole, and its one durable point is write_index, which rewrites the whole file.
+So a save writes the index to a temporary file beside it, syncs it with F_FULLFSYNC and renames it over the index,
+then rewrites the meta file the same way with the new file's parts, and syncs the folder, so the renames survive a
+power loss too.
 
 faiss is imported inside the functions that use it, never at the top of a module, so the thread environment is set
 before the library starts its OpenMP (Open Multi-Processing) pool. The helpers that don't need faiss can be tested
@@ -24,6 +29,7 @@ from adapters.base import Adapter, ServeContext, Unsupported
 import data
 import evictor
 import schema
+import writes
 
 META = "meta.json"
 TRAIN_ROWS = 500_000
@@ -238,6 +244,62 @@ def resident_parts(folder: Path, parts: list[dict]) -> dict[str, int]:
     return out
 
 
+def temporary(path: Path) -> Path:
+    """The temporary file a save writes before it renames it over `path`. Its name marks it as one the driver removes
+    when the process that wrote it is gone."""
+    return path.with_name(f"{path.name}.{os.getpid()}.0.tmp")
+
+
+def save_index(index: Any, path: Path) -> int:
+    """Writes `index` whole to a temporary file beside `path`, syncs it with F_FULLFSYNC and renames it over `path`, so
+    a reader finds the old file or the new one, never part of one. It returns the new file's bytes."""
+    import faiss
+
+    path = Path(path)
+    tmp = temporary(path)
+
+    try:
+        faiss.write_index(index, str(tmp))
+        writes.fullfsync(tmp)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    return path.stat().st_size
+
+
+def save_meta(folder: Path, record: dict) -> None:
+    """Rewrites the meta file as a save does the index, then syncs the folder, so both renames survive a power loss."""
+    path = Path(folder) / META
+    tmp = temporary(path)
+
+    try:
+        tmp.write_text(json.dumps(schema.clean(record), indent=1, sort_keys=True) + "\n")
+        writes.fullfsync(tmp)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    writes.fullfsync(folder)
+
+
+@dataclass
+class Writer:
+    """An index loaded whole for writes, the file its saves replace and its meta record. For an IVF index `pre` is the
+    rotation with the IVF behind it, `ivf` the IVF itself and `rows` the SQ8 rows its refine index rescores with, where
+    each id is the position of its row. `cleared` counts the list slots a delete cleared, where that is on."""
+
+    folder: Path
+    file: Path
+    top: Any
+    meta: dict
+    pre: Any = None
+    ivf: Any = None
+    rows: Any = None
+    clear_removed: bool = False
+    cleared: int = 0
+
+
 class FaissAdapter(Adapter):
     """The parts every faiss adapter shares. A subclass names its files and builds and opens its indexes."""
 
@@ -245,6 +307,10 @@ class FaissAdapter(Adapter):
     # faiss's search takes many queries in one call, runs them on its OpenMP threads and releases Python's lock.
     batch_api = True
     workers = "OpenMP's pool, for batch searches"
+    # A write lands in the loaded index only, and the one call that makes it durable rewrites the whole file, so a
+    # stream saves once at its end and a latency run times whole saves.
+    durability = {"call": "memory", "sync": "power"}
+    sync_kind = "whole"
 
     def __init__(self) -> None:
         super().__init__()
@@ -310,3 +376,20 @@ class FaissAdapter(Adapter):
         self._first_query = False
         parts = self.meta(self._serving).get("parts") or []
         return {"resident_after_first": resident_parts(self._serving, parts)} if parts else {}
+
+    def sync(self, w: Writer) -> dict:
+        """Saves the whole index, and rewrites its meta file with the parts of the new file, since inserts and deletes
+        move them, eg. the list offsets the batched variant reads."""
+        size = save_index(w.top, w.file)
+        w.meta = self.saved_meta(w)
+        save_meta(w.folder, w.meta)
+        self._meta[str(w.folder)] = w.meta
+        return {"call": "write_index", "file": w.file.name, "bytes": size, "synced": [w.file.name, META]}
+
+    def saved_meta(self, w: Writer) -> dict:
+        """The meta record of the index just saved."""
+        return dict(w.meta)
+
+    def writer_close(self, w: Writer) -> None:
+        # The other parts point into the loaded index, which dropping it frees.
+        w.pre = w.ivf = w.rows = w.top = None

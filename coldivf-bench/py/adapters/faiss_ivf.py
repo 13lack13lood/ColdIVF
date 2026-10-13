@@ -28,6 +28,19 @@ longer read. files() marks the coarse table and every header as routing data, th
 what an open copies into memory as loaded. Each cold trial also reports how many bytes of each part were cached right
 after its first query, eg. how much of the coarse table it faulted in. A warm setting that leaves out a search setting
 searches with its value from the open, as a fresh open would.
+
+Writes go to the index loaded whole, since a mapped one can't take them, with the same calls in every layout that
+takes them. An insert is add_with_ids on the IVF behind the rotation with the next ids, then add on the SQ8 rows, so
+each id stays the position of the row its refine index rescores it with. A delete is remove_ids with an
+IDSelectorBatch on the IVF, which moves each list's last entries into the holes and leaves the SQ8 rows. A search
+finds a write at once. The durable point saves the whole file and rewrites meta.json with the new parts and list
+offsets, so the mapped open, the batched variant and FastScan's open search a state as they search a build. The
+on-disk layout takes no writes, since an insert into its lists corrupts them.
+
+FastScan's remove leaves the removed rows' codes in the slots it frees in a list's last block, and faiss 1.15.1's next
+add into that list packs its own codes over them without clearing them first, so a row added after a delete searches
+as another vector. A write entry's params may set clear_removed, which packs zero codes into those slots after each
+delete. It is off by default, since it calls the lists' own code packer, which faiss doesn't document for this.
 """
 
 from __future__ import annotations
@@ -41,13 +54,14 @@ from typing import Any
 import numpy as np
 
 from adapters import faiss_layout
-from adapters.base import BuildContext, ServeContext, Unsupported, main, now_ns
+from adapters.base import BuildContext, ServeContext, Unsupported, WriteContext, main, now_ns
 import evictor
 from adapters.faiss_common import (
-    CHUNK_ROWS, META, TRAIN_ROWS, FaissAdapter, Partition, check_unit, chunks, faiss_metric, merge_spans,
+    CHUNK_ROWS, META, TRAIN_ROWS, FaissAdapter, Partition, Writer, check_unit, chunks, faiss_metric, merge_spans,
     metric_type, parsed, parts_record, partition, read_ahead, read_meta, sample_rows, set_threads, whole,
     write_meta,
 )
+from adapters.inproc import settings
 
 # Each variant's file layout and coarse quantizer.
 VARIANTS = {
@@ -218,6 +232,40 @@ def add_assigned(ivf: Any, rotated: np.ndarray, lists: np.ndarray, start: int) -
     ivf.add_core(len(x), faiss.swig_ptr(x), faiss.swig_ptr(ids), faiss.swig_ptr(assign))
 
 
+def list_sizes(ivf: Any) -> np.ndarray:
+    lists = ivf.invlists
+    return np.array([lists.list_size(i) for i in range(ivf.nlist)], dtype=np.int64)
+
+
+def clear_vacated(ivf: Any, before: np.ndarray) -> int:
+    """Packs zero codes into the slots that a remove left in the last block of each FastScan list it shrank, and
+    returns how many it cleared. faiss 1.15.1 leaves the removed rows' codes in them, and its next add into the list
+    packs its own codes over those without clearing them, so without this a row added after a delete searches as
+    another vector."""
+    import faiss
+
+    lists = faiss.downcast_InvertedLists(ivf.invlists)
+    per, size = int(lists.n_per_block), int(lists.block_size)
+    zero = np.zeros(int(lists.packer.code_size), dtype=np.uint8)
+    after = list_sizes(ivf)
+    cleared = 0
+
+    for no in np.flatnonzero(after < before).tolist():
+        n = int(after[no])
+
+        if n % per == 0:
+            continue
+
+        blocks = faiss.rev_swig_ptr(lists.get_codes(no), (n // per + 1) * size).reshape(-1, size)
+
+        for slot in range(n % per, per):
+            lists.packer.pack_1(zero, slot, blocks[-1:])
+
+        cleared += per - n % per
+
+    return cleared
+
+
 def offsets_record(layout: faiss_layout.Layout) -> dict:
     """The offsets the batched variant needs, from the layout of index.faiss."""
     lists, rows = layout.lists, layout.part("refine")
@@ -242,6 +290,8 @@ class FaissIVF(FaissAdapter):
         self.name = variant_of(self.variant)
         self.layout, self.quantizer = VARIANTS[self.name]
         self._stats = faiss.cvar.indexIVF_stats
+        # An insert into faiss's on-disk lists corrupts them, so that layout takes the stream as a fresh build.
+        self.write_role = "rebuild" if self.layout == "ondisk" else "full"
 
         if self.name == "batched":
             # Its search is a Python routine over one query, so QPS runs one process per worker.
@@ -618,6 +668,80 @@ class FaissIVF(FaissAdapter):
                 out.append(parsed(f, frozenset({"rotation"})))
 
         return out
+
+    def writer_open(self, ctx: WriteContext, path: Path) -> Writer:
+        """Reads the index whole, without a map, since faiss writes only to a loaded index. The write entry's params
+        may set clear_removed for FastScan, which is off by default."""
+        import faiss
+
+        if self.layout == "ondisk":
+            raise Unsupported("an insert into faiss's on-disk lists corrupts them, so that layout takes no writes")
+
+        path = Path(path)
+        meta = self.prepared(path)
+        options = settings(ctx.params, {"clear_removed": False}, "faiss IVF write settings")
+
+        if meta.get("refine") != "sq8":
+            raise Unsupported("an insert takes the id of its SQ8 row, so an index without SQ8 rows takes no writes")
+
+        if options["clear_removed"] and self.layout != "fastscan":
+            raise ValueError("clear_removed mends FastScan's lists, and the plain lists need no mending")
+
+        top = faiss.read_index(str(path / INDEX))
+        pre = faiss.downcast_index(top.base_index)
+        return Writer(folder=path, file=path / INDEX, top=top, meta=meta, pre=pre,
+                      ivf=faiss.downcast_index(faiss.extract_index_ivf(pre)),
+                      rows=faiss.downcast_index(top.refine_index), clear_removed=bool(options["clear_removed"]))
+
+    def insert(self, w: Writer, ids: np.ndarray, rows: np.ndarray) -> np.ndarray:
+        """Adds the rows to the IVF behind the rotation with the next ids, then to the SQ8 rows, so each id is the
+        position of the row the refine index rescores it with. It returns those ids, which a stream checks."""
+        x = np.ascontiguousarray(rows, dtype=np.float32)
+        given = np.arange(w.rows.ntotal, w.rows.ntotal + len(x), dtype=np.int64)
+        w.pre.add_with_ids(x, given)
+        w.rows.add(x)
+        w.top.ntotal = w.rows.ntotal
+        return given
+
+    def delete(self, w: Writer, ids: np.ndarray) -> None:
+        """Removes the ids from their lists, which moves each list's last entries into the holes. Their SQ8 rows stay,
+        since the refine index finds a row by its position."""
+        import faiss
+
+        ids = np.ascontiguousarray(ids, dtype=np.int64)
+        before = list_sizes(w.ivf) if w.clear_removed else None
+        removed = w.pre.remove_ids(faiss.IDSelectorBatch(len(ids), faiss.swig_ptr(ids)))
+
+        if removed != len(ids):
+            raise RuntimeError(f"faiss removed {removed} of {len(ids)} ids, so the others weren't in the index")
+
+        if before is not None:
+            w.cleared += clear_vacated(w.ivf, before)
+
+    def pending(self, w: Writer) -> dict:
+        """What the loaded index holds. faiss puts each insert in its list at once and takes each delete out of it, so
+        nothing waits, but deleted ids keep their SQ8 rows, and the lists grow unevenly."""
+        sizes = list_sizes(w.ivf)
+        out = {"live_rows": int(w.ivf.ntotal), "state_rows": int(w.rows.ntotal),
+               "dead_rows": int(w.rows.ntotal - w.ivf.ntotal), "largest_list": int(sizes.max(initial=0)),
+               "imbalance": float(w.ivf.invlists.imbalance_factor())}
+
+        if w.clear_removed:
+            out["cleared_slots"] = w.cleared
+
+        return out
+
+    def saved_meta(self, w: Writer) -> dict:
+        """The meta record of the saved index: its new parts, the list offsets the batched variant reads, and its ids
+        and live rows."""
+        meta = dict(w.meta)
+        meta["parts"] = parts_record(w.folder, [INDEX], loaded=self.layout == "fastscan")
+
+        if self.layout == "mapped":
+            meta["offsets"] = offsets_record(faiss_layout.read(w.file))
+
+        meta.update(state_rows=int(w.rows.ntotal), live_rows=int(w.ivf.ntotal))
+        return meta
 
 
 def rescore(rows: np.ndarray, query: np.ndarray, ids: np.ndarray, k: int, metric: str) -> np.ndarray:
