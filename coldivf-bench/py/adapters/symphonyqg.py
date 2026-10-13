@@ -4,7 +4,7 @@ search scores a whole neighbor list in one batch.
 The config takes `degree` (32), a multiple of 32 below the row count, `ef_construction` (200), `quantization_bits`
 (0, which keeps raw float32 rows, or 4 or 8 for codes) and `init` ("pipnn" or "random"). The library's build takes no
 seed, so two builds of one config differ. A search takes `ef`, which must be at least k. The index is one file, which
-loads whole at open.
+loads whole at open. The library has no call that adds or removes a row, so the write benchmark rebuilds it.
 
 A cosine dataset runs as L2 distance on its unit vectors, which ranks them as the cosine does. With "ip" the library's
 default PiPNN build links a much weaker graph. On 10,000 Cohere rows it reached recall@10 0.59 at ef 64, against 0.97
@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 
 from adapters import inproc
-from adapters.base import BuildContext, Unsupported, main
+from adapters.base import Adapter, BuildContext, Unsupported, main
 from adapters.rabitq_common import RabitqAdapter
 
 BUILD = {"degree": 32, "ef_construction": 200, "quantization_bits": 0, "init": "pipnn"}
@@ -48,6 +48,10 @@ class SymphonyQG(RabitqAdapter):
     system = "symphonyqg"
     file_name = "symqg.rabitq"
     kind = "SymqgIndex"
+    # SymqgIndex has no add or remove, so it keeps the base's rebuild-only role in place of the writes the other
+    # RaBitQ-Library indexes share.
+    write_role = "rebuild"
+    writer_open = Adapter.writer_open
 
     def overhead_config(self) -> dict:
         return {"degree": 32, "ef_construction": 64}

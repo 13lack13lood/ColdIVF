@@ -608,14 +608,14 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(got[-1]["event"], "unsupported")
 
     def test_a_rebuild_only_system_has_no_write_call(self):
-        got = subprocess.run([helpers.python(), "-m", "adapters.flat", "write", "--index", str(self.index),
+        got = subprocess.run([helpers.python(), "-m", "adapters.diskann", "write", "--index", str(self.index),
                               "--stream", str(self.cfg.stream), "--round", "1", "--data", str(self.ds.base_path),
                               "--rows", "5000"], capture_output=True, text=True, cwd=helpers.PY, env=helpers.env(),
                              timeout=300)
         last = json.loads(got.stdout.splitlines()[-1])
         self.assertEqual(last["event"], "unsupported")
         self.assertIn("fresh build", last["message"])
-        info = json.loads(subprocess.run([helpers.python(), "-m", "adapters.flat", "info"], capture_output=True,
+        info = json.loads(subprocess.run([helpers.python(), "-m", "adapters.diskann", "info"], capture_output=True,
                                          text=True, cwd=helpers.PY, env=helpers.env(), timeout=300).stdout)
         self.assertEqual((info["write_role"], info["sync_kind"], info["maintenance_actions"]), ("rebuild", "whole", []))
 
