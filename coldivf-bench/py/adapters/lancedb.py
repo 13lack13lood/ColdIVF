@@ -859,13 +859,9 @@ class LanceDB(Adapter):
         db = self.ldb.connect(str(path))
         return Writer(path=Path(path), meta=self.meta(path), db=db, table=db.open_table(TABLE))
 
-    def resize(self, w: Writer, capacity: int) -> bool:
-        """Lists the table's files before the session's first write, for the harness's sync. It returns False, so the
-        session times none of it."""
-        if w.files is None:
-            w.files = listing(w.path)
-
-        return False
+    def prepare_writes(self, w: Writer) -> None:
+        """Lists the table's files before the session's first write, untimed, for the harness's sync."""
+        w.files = listing(w.path)
 
     def rows_table(self, ids: np.ndarray, rows: np.ndarray) -> Any:
         pa = self.pa

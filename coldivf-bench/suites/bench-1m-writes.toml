@@ -313,8 +313,9 @@ python = "${COLDIVF_BENCH_VENVS}/venv-coldivf/bin/python3"
 
 
 # LanceDB's IVF_RQ at 1 bit, with full writes through Table.add and Table.delete, one commit per call. Searches keep
-# Lance's default, which scans the rows it hasn't indexed yet. Its actions are Table.optimize() and
-# Table.optimize(retrain=True). Its cold cells run on Lance's default pool of 10 threads, as in the head-to-head.
+# Lance's default, which scans the rows it hasn't indexed yet. Its actions are optimize, Table.optimize(), and retrain,
+# Table.optimize() then pylance's optimize_indices(retrain=True), since lancedb 0.40 ignores retrain=True. Its cold
+# cells run on Lance's default pool of 10 threads, as in the head-to-head.
 [[system]]
 name = "lancedb"
 adapter = "lancedb"
@@ -541,7 +542,7 @@ adapter = "sqlite_vec"
   config_id = "default"
   actions = ["vacuum"]
   threads = 10
-  disk_gb = 5
+  disk_gb = 8
 
   # Every state at both picks.
   [[system.warm]]

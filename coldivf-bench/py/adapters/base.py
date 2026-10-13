@@ -311,7 +311,8 @@ class OpTimer:
     def call(self, fn: Any, rows: int = 0, timed: bool = True, keep: Any = None) -> Any:
         """Runs `fn`, one call of `rows` rows, and times it unless it is a warm-up call. `keep` may look at what the
         call returned and drop its sample, eg. a resize that had nothing to do. The first call counts as `first_us`,
-        warm-up or not."""
+        warm-up or not. A dict the call returns, eg. what a sync did, goes to the op's extra as "returned", the last
+        call's."""
         before, logical, vm = rusage.Usage.now(), logical_writes(), rusage.vm_counts()
         t0 = now_ns()
         out = fn()
@@ -321,6 +322,9 @@ class OpTimer:
 
         if keep is not None and not keep(out):
             return out
+
+        if isinstance(out, dict):
+            self.extra["returned"] = out
 
         if self.first_us is None:
             self.first_us = (t1 - t0) / 1e3
@@ -437,6 +441,12 @@ class Adapter:
     sync_kind = "whole"
     # The actions `maintain` takes, eg. ("fold", "auto", "major", "job"). A compaction is one of them.
     maintenance_actions: tuple[str, ...] = ()
+    # Whether a write overwrites bytes of a file that is already there, eg. a database's pages, rather than only
+    # appending to files or writing new ones. The driver then gives the system's write sessions plain copies, never
+    # clones. A write to a clone's shared block goes to a new block elsewhere on the disk, so the files would end up
+    # scattered and slower to read cold, which a deployment that writes in place never sees. A file of one block, eg.
+    # ColdIVF's root slots, can't scatter, so it doesn't count.
+    writes_in_place = False
 
     def __init__(self) -> None:
         self.children: set[subprocess.Popen] = set()
@@ -565,6 +575,10 @@ class Adapter:
         that closes the library, eg. AsterVec's close, opens it again into the same handle."""
         return self.sync(w)
 
+    def prepare_writes(self, w: Any) -> None:
+        """Untimed work a session does once after the open and before its first call, eg. listing the files a later
+        sync compares against. It does nothing by default."""
+
     def resize(self, w: Any, capacity: int) -> bool:
         """Makes room for ids up to `capacity` before a round's inserts, for a library that needs it, eg.
         RaBitQ-Library's HNSW. It returns whether it did anything, and the session times it as an op of its own when it
@@ -650,10 +664,12 @@ class Adapter:
                        args: argparse.Namespace) -> list[OpTimer]:
         """A latency run: single inserts of reserved rows and single deletes of base ids, each timed after warm-up
         calls, then the cost of making one write durable. That is an insert and a sync after it, timed together and the
-        sync alone, where the sync writes only what changed, or else `saves` durable points."""
+        sync alone, where the sync writes only what changed, or else `saves` durable points. An untimed sync comes
+        before the durable inserts, so the first of them doesn't pay for the calls before it."""
         plan = writes.latency_plan(stream, args.round, ctx.pass_name != "inserts", args.reserve, args.warmup,
                                    args.calls, args.durable_calls, args.seed)
         call, sync = self.durability.get("call"), self.durability.get("sync")
+        self.prepare_writes(w)
         grow = OpTimer("resize", 0, call)
         held = stream.base_rows + sum(len(r.inserts) for r in stream.rounds[: args.round])
         grow.call(lambda: self.resize(w, held + len(plan.inserts)), keep=bool)
@@ -689,12 +705,18 @@ class Adapter:
             marks[0] = now_ns()
             return self.sync(w)
 
+        if plan.durable:
+            self.sync(w)
+
         for i in range(plan.durable):
             at = plan.warmup + plan.calls + i
             ids = plan.inserts[at : at + 1]
             rows = writes.vectors(ctx.dataset, ids)
-            both.call(lambda: pair(ids, rows), 1)
+            done = both.call(lambda: pair(ids, rows), 1)
             alone.add((both.last[1] - marks[0]) / 1e3, 1)
+
+            if isinstance(done, dict):
+                alone.extra["returned"] = done
 
         return [grow, ins, dels, both, alone]
 
@@ -706,6 +728,7 @@ class Adapter:
         durable point among them, and what the done event carries."""
         rounds = writes.stream_calls(stream, ctx.pass_name, args.from_round, args.round, args.batch)
         call, sync = self.durability.get("call"), self.durability.get("sync")
+        self.prepare_writes(w)
         ins, dels = OpTimer("insert", args.batch, call), OpTimer("delete", args.batch, call)
         syncs, grow = OpTimer("sync", args.batch, sync), OpTimer("resize", 0, call)
         capacity = stream.base_rows + sum(len(r.inserts) for r in stream.rounds[: args.from_round])
@@ -1270,6 +1293,7 @@ class Adapter:
             "durability": dict(self.durability),
             "sync_kind": self.sync_kind,
             "maintenance_actions": list(self.maintenance_actions),
+            "writes_in_place": self.writes_in_place,
         }
 
 

@@ -9,7 +9,8 @@ references again and writes a batch summary.
 A suite with a [writes] table also runs the write benchmark's phases after the builds. The stream phase replays the
 stream on clones of each build and keeps a clone of the work folder as each state, the latency phase times single
 writes on throwaway clones of the latency states, and the maintain phase runs each maintenance action on a clone of
-S10. Warm and cold entries with states then search every state as an index of its own.
+S10. A system that writes its files in place takes plain copies instead of clones, and each round's work folder becomes
+its state. Warm and cold entries with states then search every state as an index of its own.
 Every adapter is a child process of this one, started with the suite's interpreter and never in a new session, so a
 memory cap on this process group covers it. Lines go to <results>/<phase>/<system>.jsonl, and a rerun skips every run
 key that is already done. README.md describes the suite file.
@@ -96,7 +97,7 @@ OVERHEAD_ROWS = 1000
 OVERHEAD_TIMEOUT_S = 900.0
 # What the batch line keeps of each system's info event, eg. which threads it runs and at which QoS class.
 INFO_KEYS = ("system", "system_version", "binding", "regimes", "batch_api", "qps_mode", "workers", "worker_qos",
-             "write_role", "sync_kind")
+             "write_role", "sync_kind", "writes_in_place")
 # How often a build's folder is measured, in seconds, so files that live a fraction of a second are still seen.
 DISK_SAMPLE_S = 0.02
 
@@ -968,6 +969,13 @@ def work_marker(work: Path) -> Path:
     return work.with_name(f"{work.name}.work.json")
 
 
+def drop_cache(path: Path, wait: float) -> evictor.Residency:
+    """Drops the cached pages of a new copy, which its writes left there, so a session finds the files on disk, as it
+    finds a new clone's. It returns the pages still cached after a second drop `wait` seconds later."""
+    with evictor.Evictor([path]) as ev:
+        return ev.make_cold(wait)
+
+
 def moved_files(files: list[dict], src: Path, dst: Path) -> list[dict]:
     """An index's file list with every path under `src` moved under `dst`, eg. for a clone of the index."""
     return [f | {"path": str(f["path"]).replace(str(src), str(dst), 1)} for f in files]
@@ -1115,6 +1123,9 @@ class Driver:
         self._stream: writes.Stream | None = None
         self._stream_sha: str | None = None
         self._state_recalls: dict[tuple, data.Recall | None] = {}
+        # For a system that writes in place, each pass's work folder by path and the index key of the state its last
+        # session in this batch made, whose copy for the next round may keep its cached pages.
+        self.copied: dict[str, str] = {}
 
     def selected(self, system: System) -> bool:
         """Whether --systems names the system, by its name for every variant of it, or as name:variant for one."""
@@ -1671,7 +1682,8 @@ class Driver:
     def place_state(self, build: Build, source: Path, record: dict, move: bool = False) -> dict:
         """Makes the folder of state `build` from `source`, as an APFS clone, or with `move` by a rename, and writes its
         record beside it. The folder appears whole under its name or not at all, and the record comes after it, so a
-        folder without a record is a state that a crash cut short, which is made again."""
+        folder without a record is a state that a crash cut short, which is made again. The record also counts the
+        runs of contiguous disk blocks its files take, which show how scattered its writes left them."""
         cfg, target = self.suite.writes, build.index
         tmp = target.with_name(f"{target.name}.tmp-{os.getpid()}")
         writes.remove_tree(tmp)
@@ -1690,7 +1702,8 @@ class Driver:
                 "state": build.state, "stream": str(cfg.stream), "stream_sha256": self.stream_sha(),
                 "inserts": spec.inserts, "deletes": spec.deletes, "live": cfg.live_count(build.state),
                 "index_key": f"{ident['bytes']}:{ident['files']}:{ident['mtime_ns']}:{ident['inode']}",
-                "identity": ident, "batch_id": self.batch_id, "made": schema.utc_now()} | record
+                "identity": ident, "extents": writes.extents(target), "unshared": False, "batch_id": self.batch_id,
+                "made": schema.utc_now()} | record
         writes.write_json(writes.record_path(target), full)
         self.identities.pop(str(target), None)
         return full
@@ -1738,6 +1751,28 @@ class Driver:
 
     def maintain_job(self, system: System, build: Build) -> MaintainJob | None:
         return next((m for m in system.maintains if m.build is build), None)
+
+    def unshared(self, system: System, build: Build) -> bool:
+        """Whether the write sessions of a build run on plain copies rather than clones. A system that writes its files
+        in place does, since its writes to a clone would each move a block elsewhere on the disk, and a state made that
+        way reads slower cold than the same bytes written in place. The exact reference keeps clones, since only its
+        recall counts and a copy of its rows for every state would take ~20 GB at 1M."""
+        return bool(self.info(system).get("writes_in_place")) and role_of(system, build) != "exact"
+
+    def scratch(self, source: Path, dest: Path, unshared: bool, cached: bool = False) -> None:
+        """Makes `dest` from `source` for a session to write to: a clone, or with `unshared` a plain copy whose cached
+        pages are dropped unless `cached`, so the session finds its files on disk as it finds a new clone's."""
+        if not unshared:
+            writes.clone_tree(source, dest)
+            return
+
+        writes.copy_tree(source, dest)
+
+        if not cached:
+            left = drop_cache(dest, self.suite.wait_s)
+
+            if left.resident_pages:
+                self.log(f"{left.resident_pages} pages of the copy {dest} stayed cached")
 
     def session(self, system: System, args: list[str], threads: int, timeout_s: float,
                 terminal: str = "done") -> tuple[list[dict], dict | None]:
@@ -1821,24 +1856,35 @@ class Driver:
 
         return self.state_done(target)
 
-    def prepare_work(self, start: Build, work: Path) -> None:
+    def prepare_work(self, start: Build, work: Path, unshared: bool = False) -> None:
         """Leaves the work folder holding `start`. It goes on from where the last session left it when that was
-        `start` and nothing changed it since, and is cloned from `start` again otherwise, eg. after a killed round."""
+        `start` and nothing changed it since, and is cloned from `start` again otherwise, eg. after a killed round.
+
+        With `unshared` every round gets a plain copy of `start`, since the last session's folder became `start`. The
+        copy keeps its cached pages where the session before it in this batch made `start`, as a work folder that goes
+        on keeps its own, and drops them otherwise, as a new clone has none."""
         marker = writes.read_json(work_marker(work))
 
-        if (marker is not None and work.is_dir() and marker.get("holds") == start.state
+        if (not unshared and marker is not None and work.is_dir() and marker.get("holds") == start.state
                 and marker.get("key") == self._index_key(start) and marker.get("work_key") == folder_key(work)):
             return
 
         writes.remove_tree(work_marker(work))
         writes.remove_tree(work)
-        writes.clone_tree(start.index, work)
+        cached = unshared and self.copied.pop(str(work), None) == self._index_key(start)
+        self.scratch(start.index, work, unshared, cached)
 
     def stream_session(self, job: WriteJob, pass_name: str, start: Build, target: Build, work: Path,
                        key: str) -> None:
+        """One round of a pass on its work folder, which becomes the state. A clone of the folder becomes the state
+        and the folder goes on to the next round, or for a system that writes in place the folder itself becomes the
+        state by a rename. Its files then hold exactly what its writes left on blocks of their own, and the next round
+        copies them again. A plain copy into the state would rewrite every file in one piece, which the writes in place
+        of a real index never do."""
         cfg, system = self.suite.writes, job.system
         spec, origin = cfg.spec(target.state), cfg.spec(start.state)
-        self.prepare_work(start, work)
+        unshared = self.unshared(system, job.build)
+        self.prepare_work(start, work, unshared)
         args = ["write", *self.data_args(cfg.n, job.threads, system), "--index", str(work), "--stream",
                 str(cfg.stream), "--mode", "stream", "--pass", pass_name, "--round", str(spec.round), "--from-round",
                 str(origin.round), "--batch", str(cfg.batch), "--params", json.dumps(job.params)]
@@ -1861,9 +1907,14 @@ class Driver:
         lines = self.session_lines(job, "stream", start, target, events, session)
         made = self.place_state(target, work, {"pass": pass_name, "round": spec.round, "from_state": start.state,
                                                "from_key": self._index_key(start), "session": session,
-                                               "keys": [x["run_key"] for x in lines], "sealed": end.get("sealed")})
-        writes.write_json(work_marker(work), {"holds": target.state, "key": made["index_key"],
-                                              "work_key": folder_key(work)})
+                                               "keys": [x["run_key"] for x in lines], "sealed": end.get("sealed"),
+                                               "unshared": unshared}, move=unshared)
+
+        if unshared:
+            self.copied[str(work)] = made["index_key"]
+        else:
+            writes.write_json(work_marker(work), {"holds": target.state, "key": made["index_key"],
+                                                  "work_key": folder_key(work)})
 
         for line in lines:
             self.write(system.name, line)
@@ -1885,7 +1936,8 @@ class Driver:
                         self.latency_step(job, target)
 
     def latency_step(self, job: WriteJob, target: Build) -> None:
-        """Times single writes on a throwaway clone of a state, again after a failure until the attempts run out."""
+        """Times single writes on a throwaway clone of a state, or a plain copy for a system that writes in place, again
+        after a failure until the attempts run out."""
         cfg, system = self.suite.writes, job.system
         spec = cfg.spec(target.state)
         key = self.session_key(job, "latency", target, target)
@@ -1896,7 +1948,7 @@ class Driver:
 
             folder = self.suite.index_root / "clones.noindex" / f"{os.getpid()}-latency-{os.urandom(3).hex()}"
             clone = folder / target.index.name
-            writes.clone_tree(target.index, clone)
+            self.scratch(target.index, clone, self.unshared(system, job.build))
             args = ["write", *self.data_args(cfg.n, job.threads, system), "--index", str(clone), "--stream",
                     str(cfg.stream), "--mode", "latency", "--pass", spec.pass_name or "joint", "--round",
                     str(spec.round), "--calls", str(cfg.latency_calls), "--warmup", str(cfg.warmup_calls),
@@ -1952,12 +2004,14 @@ class Driver:
             self.maintain_session(job, action, source, target, key)
 
     def maintain_session(self, job: MaintainJob, action: str, source: Build, target: Build, key: str) -> None:
-        """One action on a clone of the source state, in a fresh adapter process, whose folder becomes the state
-        <source>-<action>. The driver measures the folder for its peak disk use, as for a build."""
+        """One action on a clone of the source state, or a plain copy for a system that writes in place, in a fresh
+        adapter process, whose folder becomes the state <source>-<action>. The driver measures the folder for its peak
+        disk use, as for a build."""
         cfg, system, threads = self.suite.writes, job.system, job.threads_of(action)
         work = job.build.out.parent / _slug(f"{job.build.config_id}-work-{action}")
+        unshared = self.unshared(system, job.build)
         writes.remove_tree(work)
-        writes.clone_tree(source.index, work)
+        self.scratch(source.index, work, unshared)
         floor, free = float(self.suite.gate["disk_floor_gb"]), free_gib(REPO)
         fields: dict = {"action": action, "threads": threads, "params": job.params}
 
@@ -1996,7 +2050,8 @@ class Driver:
         rel = os.path.relpath(data_file, work) if data_file and Path(data_file).is_relative_to(work) else data_file
         self.place_state(target, work, {"pass": "", "round": cfg.spec(target.state).round, "action": action,
                                         "from_state": source.state, "from_key": self._index_key(source),
-                                        "session": session, "keys": [line["run_key"]], "data_file": rel}, move=True)
+                                        "session": session, "keys": [line["run_key"]], "data_file": rel,
+                                        "unshared": unshared}, move=True)
 
         if action in job.same_file:
             line["extra"]["same_file"] = self.same_file(job, action, job.same_file[action], rel)

@@ -209,6 +209,8 @@ class SqliteVec(Adapter):
     durability = {"call": "process", "sync": "power"}
     sync_kind = "incremental"
     maintenance_actions = ("vacuum",)
+    # A checkpoint writes each changed page back over the old one in vec0.db.
+    writes_in_place = True
 
     def __init__(self) -> None:
         super().__init__()

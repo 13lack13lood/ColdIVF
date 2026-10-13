@@ -20,6 +20,8 @@ benchmark:
 - "writecrash" dies like a killed process at the insert of the row that the file crash.once beside the system's index
   folders names, and removes the file first, so the round's next try runs through.
 - "misnumber" numbers its inserts itself, one past their rows, which a stream session must refuse.
+- "inplace" says it writes its files in place, as the exact reference does, so the driver gives its sessions plain
+  copies. Every other variant says it doesn't, so its sessions and states are clones.
 """
 
 from __future__ import annotations
@@ -52,8 +54,12 @@ class Fake(HarnessWrites, Flat):
     system = "fake"
     write_role = "full"
     maintenance_actions = ("compact", "recompact")
+    writes_in_place = False
 
     def load(self) -> None:
+        if self.variant == "inplace":
+            self.writes_in_place = True
+
         if self.variant == "noisy":
             print("noise on stdout from a library")
 

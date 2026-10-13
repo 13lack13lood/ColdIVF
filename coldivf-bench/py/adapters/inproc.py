@@ -178,6 +178,8 @@ class HarnessWrites:
     write_role = "exact"
     durability = {"call": "process", "sync": "power"}
     sync_kind = "incremental"
+    # A delete writes its id's byte of live.bin, and an insert the count in the header of inserts.fbin.
+    writes_in_place = True
 
     def writer_open(self, ctx: Any, path: Path) -> LiveRows:
         meta = json.loads((Path(path) / "meta.json").read_text())

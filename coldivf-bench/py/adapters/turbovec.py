@@ -83,6 +83,8 @@ class TurboVec(Adapter):
         if self.idmap:
             self.write_role, self.sync_kind = "full", "incremental"
             self.durability = {"call": "memory", "sync": "power"}
+            # A sync writes the rows that changed and both headers over their old bytes in index.tvim.
+            self.writes_in_place = True
 
     @property
     def idmap(self) -> bool:

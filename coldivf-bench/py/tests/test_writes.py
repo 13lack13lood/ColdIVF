@@ -1,6 +1,10 @@
+import argparse
+import fcntl
 import json
+import os
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +14,7 @@ from unittest import mock
 import numpy as np
 
 from tests import helpers
+from adapters.base import Adapter, WriteContext
 from adapters.inproc import LiveRows
 import data
 import writes
@@ -28,6 +33,43 @@ WRITES = {
 
 def config(n: int = 5000, **over) -> writes.WritesConfig:
     return writes.parse_writes(WRITES | over, n, "tiny-16-cosine")
+
+
+def first_block(path: Path) -> int | None:
+    """Where the file's first byte sits on the disk, which a clone shares and a plain copy doesn't, or None off
+    macOS."""
+    if sys.platform != "darwin":
+        return None
+
+    fd = os.open(path, os.O_RDONLY)
+
+    try:
+        asked = struct.pack("=Iqq", 0, os.fstat(fd).st_size, 0)
+        return struct.unpack("=Iqq", fcntl.fcntl(fd, writes.F_LOG2PHYS_EXT, asked))[2]
+    finally:
+        os.close(fd)
+
+
+class Recorder(Adapter):
+    """A writer that only records the calls a session makes, in order."""
+
+    write_role, sync_kind = "full", "incremental"
+
+    def writer_open(self, ctx: WriteContext, path: Path) -> list:
+        return []
+
+    def prepare_writes(self, w: list) -> None:
+        w.append("prepare")
+
+    def insert(self, w: list, ids: np.ndarray, rows: np.ndarray) -> None:
+        w.append("insert")
+
+    def delete(self, w: list, ids: np.ndarray) -> None:
+        w.append("delete")
+
+    def sync(self, w: list) -> dict:
+        w.append("sync")
+        return {"call": "sync", "calls": len(w)}
 
 
 class RngTest(unittest.TestCase):
@@ -475,6 +517,64 @@ class FilesTest(unittest.TestCase):
         writes.remove_tree(self.root / "b")
         self.assertFalse((self.root / "b").exists())
 
+    def test_a_plain_copy_has_blocks_of_its_own_and_keeps_holes(self):
+        src = self.root / "a"
+        (src / "sub").mkdir(parents=True)
+        (src / "sub" / "f").write_bytes(np.random.default_rng(1).bytes(1 << 20))
+
+        # A file of 32 MiB that holds 3 MiB, as qdrant makes its log segments and vector chunks.
+        with open(src / "sparse", "wb") as f:
+            f.truncate(32 << 20)
+            f.seek(8 << 20)
+            f.write(np.random.default_rng(3).bytes(3 << 20))
+
+        os.utime(src / "sub" / "f", ns=(1_700_000_000_123_456_789, 1_700_000_000_987_654_321))
+        writes.copy_tree(src, self.root / "b")
+        writes.clone_tree(src, self.root / "c")
+        self.assertEqual((self.root / "b" / "sub" / "f").read_bytes(), (src / "sub" / "f").read_bytes())
+        self.assertEqual((self.root / "b" / "sparse").read_bytes(), (src / "sparse").read_bytes())
+        self.assertLess((self.root / "b" / "sparse").stat().st_blocks * 512, 16 << 20)
+        # A copy keeps each file's change time to the nanosecond, as a clone does, which a sealed store checks.
+        for name in ("b", "c"):
+            self.assertEqual((self.root / name / "sub" / "f").stat().st_mtime_ns, 1_700_000_000_987_654_321)
+
+        if first_block(src / "sub" / "f") is not None:
+            self.assertNotEqual(first_block(self.root / "b" / "sub" / "f"), first_block(src / "sub" / "f"))
+            self.assertEqual(first_block(self.root / "c" / "sub" / "f"), first_block(src / "sub" / "f"))
+            # The data of the file with holes goes in one piece, where macOS's cp takes ~24 even on a quiet disk.
+            self.assertLessEqual(writes.file_extents(self.root / "b" / "sparse"), 2)
+
+        with self.assertRaises(FileExistsError):
+            writes.copy_tree(src, self.root / "b")
+
+    def test_extents_count_the_runs_of_disk_blocks(self):
+        path = self.root / "f"
+        path.write_bytes(np.random.default_rng(2).bytes(4 << 20))
+
+        if writes.extents(path) is None:
+            self.skipTest("this system has no F_LOG2PHYS_EXT")
+
+        whole = writes.extents(path)
+        self.assertEqual((whole["files"], whole["most"]), (1, "f"))
+        self.assertLessEqual(whole["total"], 4)
+        # Writes in place to a clone move each block they write, which a plain copy never does.
+        writes.clone_tree(path, self.root / "clone")
+        writes.copy_tree(path, self.root / "copy")
+
+        for name in ("clone", "copy"):
+            with open(self.root / name, "r+b") as f:
+                for block in range(0, 1024, 16):
+                    f.seek(block * 4096)
+                    f.write(b"y" * 4096)
+
+                f.flush()
+                os.fsync(f.fileno())
+
+        self.assertGreater(writes.extents(self.root / "clone")["total"], 30)
+        self.assertLessEqual(writes.extents(self.root / "copy")["total"], 4)
+        folder = writes.extents(self.root)
+        self.assertEqual((folder["files"], folder["most"]), (3, "clone"))
+
     def test_live_rows(self):
         folder = self.root / "idx"
         folder.mkdir()
@@ -549,6 +649,11 @@ class SessionTest(unittest.TestCase):
         self.assertNotIn("open_us", ops["delete"])
         self.assertGreater(ops["durable_point"]["index_bytes_after"], ops["insert"]["index_bytes_before"])
         self.assertGreater(ops["durable_point"]["extra"]["rows_per_s_durable"], 0)
+        # Each op keeps what its last call returned, eg. the files a sync synced.
+        self.assertEqual(ops["sync"]["extra"]["returned"], {"files": [LiveRows.INSERTS, LiveRows.LIVE],
+                                                            "call": "F_FULLFSYNC"})
+        self.assertTrue(ops["durable_point"]["extra"]["returned"]["meta"])
+        self.assertNotIn("returned", ops["insert"]["extra"])
         _, live = LiveRows.view(self.index)
         self.assertTrue(np.array_equal(live, writes.state_mask(self.cfg, writes.read_stream(self.cfg.stream),
                                                                "s5")[:5250]))
@@ -575,6 +680,19 @@ class SessionTest(unittest.TestCase):
                          "--durable-calls", "0", "--reserve", "5540", variant="inserts")
         ops = {e["fields"]["op"]: e["fields"] for e in got if e["event"] == "op"}
         self.assertIn("no delete", ops["delete"]["unsupported"])
+
+    def test_a_latency_run_syncs_once_untimed_before_its_durable_inserts(self):
+        adapter = Recorder()
+        ctx = WriteContext(index=self.index, dataset=self.ds, rows=5000, metric="cosine", threads=1, variant="",
+                           mode="latency")
+        args = argparse.Namespace(round=0, reserve=5500, warmup=1, calls=2, durable_calls=2, seed=2, saves=2)
+        w = adapter.writer_open(ctx, self.index)
+        ops = {op.op: op for op in adapter._latency_calls(ctx, w, writes.read_stream(self.cfg.stream), args)}
+        # The untimed work, then the timed single writes, the sync that no op times, and the durable inserts.
+        self.assertEqual(w, ["prepare"] + ["insert"] * 3 + ["delete"] * 3 + ["sync"] + ["insert", "sync"] * 2)
+        self.assertEqual([len(ops[k].times) for k in ("insert", "delete", "insert_sync", "sync")], [2, 2, 2, 2])
+        self.assertEqual(ops["insert_sync"].extra["returned"], {"call": "sync", "calls": 12})
+        self.assertEqual(ops["sync"].extra["returned"], {"call": "sync", "calls": 12})
 
     def test_the_policy_pass_maintains_whenever_a_run_is_due(self):
         got = self.write("--mode", "stream", "--pass", "policy", "--round", "3", "--batch", "100", "--policy",

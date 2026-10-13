@@ -102,6 +102,8 @@ class AsterVec(stores.StoreAdapter):
     # A write lives in memory until close, which syncs RocksDB but not vectors.bin. There is no sync call.
     durability = {"call": "memory", "durable_point": "process"}
     sync_kind = "whole"
+    # An insert writes its vector's page of vectors.bin in place, while RocksDB writes new files.
+    writes_in_place = True
 
     def load(self) -> None:
         import astervec

@@ -12,6 +12,7 @@ from unittest import mock
 import numpy as np
 
 from tests import helpers
+from tests.test_writes import first_block
 from adapters.inproc import LiveRows
 import data
 import driver
@@ -964,6 +965,15 @@ class WriteBatchTest(unittest.TestCase):
         for name in ("s1", "s5", "s10", "s1i", "s5i", "s10i"):
             self.check_state(name)
 
+        # A system that writes nothing in place keeps clones, which share the rows no write changed.
+        records = {name: writes.read_json(writes.record_path(self.folder(name))) for name in ("s0", "s1", "s10")}
+        self.assertEqual({r["unshared"] for r in records.values()}, {False})
+
+        if first_block(self.folder("s0") / "vectors.npy") is not None:
+            self.assertEqual(first_block(self.folder("s1") / "vectors.npy"),
+                             first_block(self.folder("s0") / "vectors.npy"))
+            self.assertGreaterEqual(records["s10"]["extents"]["total"], records["s10"]["extents"]["files"] - 1)
+
         self.assertEqual(sorted(p.name for p in self.folder("s0").parent.iterdir() if "work" in p.name), [])
         stream = [x for x in lines if x["kind"] == "write" and x["mode"] == "stream"]
         ops = {(x["state_from"], x["state_to"]): sorted(y["op"] for y in stream if
@@ -1023,6 +1033,33 @@ class WriteBatchTest(unittest.TestCase):
         again = self.batch()
         self.assertEqual(len(self.lines()), len(lines))
         self.assertGreater(again.resumed, 0)
+
+    def test_a_system_that_writes_in_place_takes_plain_copies(self):
+        self.batch({"build", "stream", "latency", "maintain", "warm"}, variant="inplace")
+        lines = self.lines()
+        self.assertEqual([(x["kind"], x.get("op"), x["error"]) for x in lines if x["status"] != "ok"], [])
+        self.assertEqual({tuple(schema.validate(x)) for x in lines}, {()})
+
+        for name in ("s1", "s5", "s10", "s1i", "s5i", "s10i"):
+            self.check_state(name, "inplace")
+
+        # S0 is a clone of the build, which nothing writes. Every state the writes made has blocks of its own: each
+        # round's work folder was a plain copy of the state before it and became the state by a rename.
+        names = ("s0", "s1", "s5", "s10", "s1i", "s10i", "s10p", "s10-compact")
+        records = {name: writes.read_json(writes.record_path(self.folder(name, "inplace"))) for name in names}
+        self.assertEqual([name for name, r in records.items() if r["unshared"]], list(names[1:]))
+        blocks = {name: first_block(self.folder(name, "inplace") / "vectors.npy") for name in names}
+
+        if blocks["s0"] is not None:
+            self.assertEqual(len(set(blocks.values())), len(names))
+
+        work = [p.name for p in self.folder("s0", "inplace").parent.iterdir() if "work" in p.name]
+        self.assertEqual(work, [])
+        self.assertEqual(list((self.root / "indexes" / "clones.noindex").iterdir()), [])
+        warm = [x for x in lines if x["kind"] == "warm"]
+        self.assertTrue(warm and all(x["recall10"] == 1.0 and x["dead_returned"] == 0.0 for x in warm))
+        info = [x for x in self.lines("batch")][-1]["extra"]["systems"]
+        self.assertEqual({v["writes_in_place"] for v in info.values()}, {True})
 
     def test_a_killed_round_starts_again_from_a_clone_of_the_last_state(self):
         # The fake dies like a killed process at the insert of row 5100, in round 2 of the joint pass.

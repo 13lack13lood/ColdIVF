@@ -144,6 +144,9 @@ class QdrantEdge(stores.StoreAdapter):
     durability = {"call": "memory", "sync": "power"}
     sync_kind = "incremental"
     maintenance_actions = ("optimize",)
+    # A write goes into files of a set size that qdrant made earlier, eg. the log's segments, the vector chunks and the
+    # flags of deleted points.
+    writes_in_place = True
 
     def __init__(self) -> None:
         super().__init__()
@@ -318,14 +321,12 @@ class QdrantEdge(stores.StoreAdapter):
         return Writer(shard=shard, store=store, folder=store.data, meta=meta, ops=int(meta.get("log_ops", 0)),
                       fixup=fixup_ops(int(meta["rows"])))
 
-    def resize(self, w: Writer, capacity: int) -> bool:
-        """Sends the version fix-up before a session's first write, as deletes of an absent id, while the log holds
-        fewer operations than the build's upserts numbered. It returns False, so the session times none of it."""
+    def prepare_writes(self, w: Writer) -> None:
+        """Sends the version fix-up before a session's first write, untimed, as deletes of an absent id, while the log
+        holds fewer operations than the build's upserts numbered."""
         while w.ops < w.fixup:
             w.shard.update(self.qe.UpdateOperation.delete_points([ABSENT_ID]))
             w.ops, w.fixed = w.ops + 1, w.fixed + 1
-
-        return False
 
     def insert(self, w: Writer, ids: np.ndarray, rows: np.ndarray) -> None:
         points = [self.qe.Point(id=i, vector=row.tolist()) for i, row in zip(ids.tolist(), rows)]

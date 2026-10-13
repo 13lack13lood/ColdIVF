@@ -146,8 +146,9 @@ class HelpersTest(unittest.TestCase):
 
 class WriteCase(unittest.TestCase):
     """One system's write path on a tiny build, as the driver runs it: the stream's two rounds on one work folder, a
-    latency run on a clone of the build and on one of the last state, and each maintenance action on a clone of the
-    last state. Subclasses name the adapter, its build and the search settings that check the states."""
+    latency run on a copy of the build and on one of the last state, and each maintenance action on a copy of the last
+    state. Each copy is a plain copy for a system that writes in place and a clone for any other, as the driver makes
+    them. Subclasses name the adapter, its build and the search settings that check the states."""
 
     module = ""
     cls_name = ""
@@ -171,7 +172,7 @@ class WriteCase(unittest.TestCase):
         cls.make().build(BuildContext(config=cls.config, data_path=cls.ds.base_path, rows=cls.n, out=cls.build,
                                       clusters=None, threads=2, seed=1, metric="cosine", variant="", dataset=cls.ds))
         cls.work = cls.root / "work"
-        writes.clone_tree(cls.build, cls.work)
+        cls.scratch(cls.build, cls.work)
         cls.rounds = [cls.write(cls.work, "--mode", "stream", "--round", "1", "--from-round", "0"),
                       cls.write(cls.work, "--mode", "stream", "--round", "2", "--from-round", "1")]
         cls.info = cls.call("info")[-1]
@@ -179,6 +180,11 @@ class WriteCase(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
+
+    @classmethod
+    def scratch(cls, source: Path, dest: Path) -> None:
+        """A folder for a session to write to: a plain copy for a system that writes in place, else a clone."""
+        (writes.copy_tree if cls.make().writes_in_place else writes.clone_tree)(source, dest)
 
     @classmethod
     def make(cls):
@@ -211,7 +217,7 @@ class WriteCase(unittest.TestCase):
     def latency(self, source: Path, round_: int) -> dict:
         clone = self.root / f"latency-{round_}"
         writes.remove_tree(clone)
-        writes.clone_tree(source, clone)
+        self.scratch(source, clone)
         got = self.write(clone, "--mode", "latency", "--round", str(round_), "--calls", "6", "--warmup", "2",
                          "--durable-calls", "4", "--saves", "2", "--reserve", str(self.cfg.reserve_from), "--seed",
                          "2")
@@ -312,7 +318,7 @@ class WriteCase(unittest.TestCase):
     def maintained(self, action: str) -> tuple[Path, dict]:
         folder = self.root / f"s10-{action}"
         writes.remove_tree(folder)
-        writes.clone_tree(self.work, folder)
+        self.scratch(self.work, folder)
         got = self.call("maintain", "--index", str(folder), "--action", action, "--threads", "2")
         self.assertEqual(got[-1]["event"], "maintain")
         fields = got[-1]["fields"]
@@ -418,7 +424,7 @@ class AsterVecWritesTest(WriteCase):
     def test_a_held_store_fails_a_write_session(self):
         folder = self.root / "held"
         writes.remove_tree(folder)
-        writes.clone_tree(self.work, folder)
+        self.scratch(self.work, folder)
         store = stores.Store(folder, "store")
         self.assertTrue(store.claim())
 

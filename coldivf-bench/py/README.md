@@ -18,7 +18,7 @@ the same way. The driver reads a suite file, starts one adapter process per job,
 | `pick.py` | Each system's cold cells from its warm grid and its screening trials, written into its section of a suite |
 | `headtohead.py` | A phase's head-to-head: each system's pick for each recall target, its warm, cold and memory numbers on the test split, and how ColdIVF compares |
 | `adapters/base.py` | The `Adapter` base class and the adapter's end of the wire |
-| `adapters/flat.py` | Exact search with numpy, the smallest complete adapter |
+| `adapters/flat.py` | Exact search with numpy, the smallest complete adapter, and the write benchmark's exact reference |
 | `adapters/coldivf.py` | ColdIVF through its release binaries |
 | `adapters/coldivf_py.py` | ColdIVF through its Python module, in the adapter's process as every other system runs |
 | `adapters/lancedb.py` | LanceDB through pylance's scanner, or through lancedb's query builder where pylance is missing |
@@ -422,29 +422,48 @@ action on S10 makes the state `s10-<action>`. S0 is a clone of the build, and a 
 Each state is a folder `<config_id>-<state>` beside its build's, under the suite's index root, with a record
 `<config_id>-<state>.state.json` beside it. The record names the stream and its hash, the pass, round and counts, the
 state it came from and that state's key, the index key the driver took when it made the state, and the run keys of the
-session that made it. Every run key of a state's searches uses that index key, since searches change some states'
-files. A state is done once its folder and record are there, the state it came from is the one it came from, and every
-line of its session is done.
+session that made it, whether its folder has disk blocks of its own, `unshared`, and `extents`, the runs of contiguous
+disk blocks its files take, from macOS's `F_LOG2PHYS_EXT`. Every run key of a state's searches uses that index key,
+since searches change some states' files. A state is done once its folder and record are there, the state it came from
+is the one it came from, and every line of its session is done.
+
+### Clones and Plain Copies
+
+A clone on the Apple File System (APFS) shares its disk blocks with its source until a write changes one, and that write
+goes to a new block elsewhere on the disk. That doesn't matter for a system that only appends to its files or writes new
+ones, eg. ColdIVF's log and maintenance files, LanceDB's fragments and the whole-file saves of faiss, usearch and
+RaBitQ-Library, so its sessions and states are clones. A system whose adapter sets `writes_in_place` overwrites bytes of
+its files, eg. sqlite-vec's pages, turbovec's rows, AsterVec's vectors and qdrant-edge's log segments and vector chunks.
+On a clone each such write would scatter the file a little more, so each state would read slower cold than the same
+bytes written in place, which APFS keeps where they are. So its sessions run on plain copies, made by
+`writes.copy_tree`, which writes each run of a file's data in pieces of up to 16 MiB at its own offset and syncs it, so
+a hole stays a hole, and keeps each file's change time, as a clone does, which a sealed store checks. macOS's `cp`
+copies a file with holes a few KiB at a time, so other writes in between left qdrant-edge's vector chunks in hundreds of
+pieces. Each round's work folder is a plain copy of the state it starts from and becomes the next state by a rename, so
+a state holds exactly what its writes left, and nothing rewrites its files in one piece. A copy's cached pages are
+dropped unless it continues the session before it in the batch, so a session finds its files on disk as it would a new
+clone's. The exact reference keeps clones, since only its recall counts.
 
 ### Phases
 
 | Phase | What It Does | Lines |
 |---|---|---|
-| `stream` | For each pass, the joint ladder, the inserts alone and the policy pass, makes each state from the last one by one session on the pass's work folder, which it clones as the state | `write`, and `maintain` for a policy pass's runs |
-| `latency` | For each latency state, times single writes on a throwaway clone of it | `write` |
-| `maintain` | For each action, runs it on a clone of S10 in a fresh process, and keeps the clone as `s10-<action>` | `maintain` |
+| `stream` | For each pass, the joint ladder, the inserts alone and the policy pass, makes each state from the last one by one session on the pass's work folder, which it clones as the state, or renames into it for a system that writes in place | `write`, and `maintain` for a policy pass's runs |
+| `latency` | For each latency state, times single writes on a throwaway clone of it, or a plain copy | `write` |
+| `maintain` | For each action, runs it on a clone of S10, or a plain copy, in a fresh process, and keeps that folder as `s10-<action>` | `maintain` |
 
 A session's lines are written after its state's folder and record, so a crash or a sleep never leaves lines for a state
 that isn't there. A session that fails writes one `write` line of op `session`, which counts its attempts, and its work
-folder is cloned again from the last state for the next try. A state without its record, eg. after a crash between
+folder is made again from the last state for the next try. A state without its record, eg. after a crash between
 the two, is made again, and every state after it with it. `--dry-run` lists each pass, latency run and action and
 whether it is done.
 
 A stream session opens the writer, makes its rounds' calls, a batch of inserts then a batch of deletes, syncs after
 each call when `sync_kind` is "incremental", and ends with the durable point, then closes the writer and seals the state.
 A latency run makes `warmup_calls` untimed and `latency_calls` timed single inserts of reserved rows, then as many
-single deletes of base ids the state holds, then `durable_calls` inserts each followed by a sync, timed together and the
-sync alone, or `saves` durable points where a sync rewrites the index.
+single deletes of base ids the state holds, then one untimed sync, so the first durable insert doesn't pay for the calls
+before it, then `durable_calls` inserts each followed by a sync, timed together and the sync alone, or `saves` durable
+points where a sync rewrites the index.
 
 ### Scoring
 
@@ -479,7 +498,9 @@ first, or behind only rows at the same distance.
 | `durability` | The level a write call reaches and the level `sync` reaches, eg. `{"call": "process", "sync": "power"}`, and `durable_point` where it differs |
 | `sync_kind` | `incremental` when a sync writes only what changed, or `whole` when it rewrites the index |
 | `maintenance_actions` | The actions `maintain` takes |
+| `writes_in_place` | Whether a write overwrites bytes of a file already there, which gives the system plain copies rather than clones |
 | `writer_open(ctx, path)` | Opens the index for writes and returns a handle |
+| `prepare_writes(w)` | Untimed work once before a session's first call, eg. qdrant-edge's version fix-up or LanceDB's first file listing. Nothing by default |
 | `insert(w, ids, rows)` | One call, of len(ids) rows. A library that numbers its inserts returns the ids it gave them, which a stream session checks |
 | `delete(w, ids)` | One call. Inserts-only systems keep the default, which raises `Unsupported` |
 | `sync(w)` | Brings every change so far to the `sync` level, and returns what it did |
@@ -494,9 +515,10 @@ first, or behind only rows at the same distance.
 `WriteContext` has `index`, `dataset`, `rows`, `metric`, `threads`, `variant`, `mode`, `pass_name`, `params`, `policy`,
 `maintain_threads` and `maintain_params`. The base class times each call on the calling thread at the user-interactive
 class with garbage collection off, and reads `proc_pid_rusage` and the machine's swap counts around each call, outside
-the timer. The exact reference mixes in `inproc.HarnessWrites`, whose writes the harness makes in `inserts.fbin` and
-`live.bin` beside the build's files, and its search reads `inproc.LiveRows.view` of the folder. An adapter that
-overrides `warm_run` calls `probe` for the findability check, or leaves it out.
+the timer. A dict a call returns, eg. the files a sync synced, goes to the op's `extra.returned`, the last call's. The
+exact reference mixes in `inproc.HarnessWrites`, whose writes the harness makes in `inserts.fbin` and `live.bin` beside
+the build's files, and its search reads `inproc.LiveRows.view` of the folder. An adapter that overrides `warm_run` calls
+`probe` for the findability check, or leaves it out.
 
 ## ColdIVF Adapter
 
@@ -547,6 +569,17 @@ groups, for other systems to import as shared clusters. The files go in a folder
 `<index folder>.clusters/partition.*`, so a suite's `clusters` for another system is
 `<index folder>.clusters/partition`. The index folder holds the index alone, and a dummy build of the same config saves
 its own partition beside its own folder. Build lines record the stem in `extra.export_clusters`.
+
+For the write benchmark, `adapters/coldivf_py.py` writes through the module's `Writer`: `insert` and `delete` for a
+batch of 1, `insert_many` and `delete_many` for larger ones, and `sync`, an `F_FULLFSYNC` of the log, as both the sync
+and the durable point. Each change is one append to the log beside the index, so it survives the process dying. Apart
+from its two 4 KiB root slots and its activity word, it never writes over a file, so its states are clones. The actions
+are the writer's runs `fold`, `auto` and `major`, and `job`, which runs `begin_compact`, the job's `run` and its
+`finish` on the adapter's thread. Every run and every status call takes the suite's params, eg. the build's 320 vectors
+per list where the module's default is 160, and its threads, since the module's `threads=0` takes `RAYON_NUM_THREADS`.
+The policy pass asks `status()` after every call. After its first run the index is the folder `index.coldivf.d`, which
+holds each generation's data file and log, the root slots, the record of runs and the activity word, and `files` follows
+the index there.
 
 ## LanceDB Adapter
 

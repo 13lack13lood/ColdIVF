@@ -75,6 +75,8 @@ TRUTH_K = 100
 CHUNK = 65536
 TRUTH_CHUNK = 8192
 DRIFT_CHUNK = 16384
+# The most bytes of a file that one write of a plain copy takes.
+COPY_CHUNK = 1 << 24
 
 
 class StreamError(ValueError):
@@ -1091,6 +1093,132 @@ def clone_tree(src: Path | str, dst: Path | str) -> None:
         shutil.copytree(src, dst, copy_function=shutil.copy2)
     else:
         shutil.copy2(src, dst)
+
+
+def copy_file(src: Path | str, dst: Path | str) -> None:
+    """Copies one file into disk blocks of its own, each run of data in writes of up to COPY_CHUNK bytes at its own
+    offset, so a hole stays a hole, then syncs it, so its blocks are placed before anything else is written. Files
+    with holes are common here, eg. qdrant's log segments and vector chunks, which it makes at a set size and mostly
+    empty. macOS's cp copies such a file a few KiB at a time, so another process's writes in between leave the copy in
+    hundreds of pieces, and shutil's copy fills the holes in. The copy keeps the file's mode and times."""
+    with open(src, "rb") as fin, open(dst, "wb") as fout:
+        size, at = os.fstat(fin.fileno()).st_size, 0
+
+        while at < size:
+            try:
+                start = os.lseek(fin.fileno(), at, os.SEEK_DATA)
+            except OSError:
+                break
+
+            end = min(size, os.lseek(fin.fileno(), start, os.SEEK_HOLE))
+
+            while start < end:
+                block = os.pread(fin.fileno(), min(COPY_CHUNK, end - start), start)
+
+                if not block:
+                    break
+
+                os.pwrite(fout.fileno(), block, start)
+                start += len(block)
+
+            at = end
+
+        os.ftruncate(fout.fileno(), size)
+        os.fsync(fout.fileno())
+
+    shutil.copystat(src, dst)
+
+
+def copy_tree(src: Path | str, dst: Path | str) -> None:
+    """Copies the folder or file `src` to `dst`, which mustn't exist, byte for byte into disk blocks of its own, where
+    clone_tree shares them. A write to the copy then lands on its own block in place. Each file goes whole, holes and
+    all, through copy_file, and keeps its change time, as a clone does, since a sealed store finds a changed file by its
+    size and change time."""
+    src, dst = Path(src), Path(dst)
+
+    if dst.exists():
+        raise FileExistsError(f"{dst} is there already")
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    if not src.is_dir():
+        copy_file(src, dst)
+        return
+
+    for root, dirs, files in os.walk(src):
+        here = dst / Path(root).relative_to(src)
+        here.mkdir(exist_ok=True)
+
+        for name in dirs + files:
+            if (Path(root) / name).is_symlink():
+                os.symlink(os.readlink(Path(root) / name), here / name)
+
+        for name in files:
+            if not (Path(root) / name).is_symlink():
+                copy_file(Path(root) / name, here / name)
+
+    # Folders take their times last, since each file made in one changes them.
+    for root, dirs, _ in sorted(os.walk(src), key=lambda x: -len(Path(x[0]).parts)):
+        for name in dirs:
+            if not (Path(root) / name).is_symlink():
+                shutil.copystat(Path(root) / name, dst / Path(root, name).relative_to(src))
+
+    shutil.copystat(src, dst)
+
+
+# The fcntl call of macOS that maps a file's bytes to where they sit on the disk.
+F_LOG2PHYS_EXT = 65
+
+
+def file_extents(path: Path | str) -> int | None:
+    """How many runs of contiguous disk blocks hold the file's bytes, from F_LOG2PHYS_EXT, or None where the call
+    isn't there. A hole takes none."""
+    if sys.platform != "darwin":
+        return None
+
+    fd = os.open(path, os.O_RDONLY)
+
+    try:
+        size, at, runs, end = os.fstat(fd).st_size, 0, 0, None
+
+        while at < size:
+            asked = struct.pack("=Iqq", 0, size - at, at)
+            _, length, disk = struct.unpack("=Iqq", fcntl.fcntl(fd, F_LOG2PHYS_EXT, asked))
+
+            if length <= 0:
+                break
+
+            if disk >= 0 and disk != end:
+                runs += 1
+
+            end = disk + length if disk >= 0 else None
+            at += length
+
+        return runs
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def extents(path: Path | str) -> dict | None:
+    """The runs of contiguous disk blocks of every file under `path`, in all and for the file with the most. A file
+    written in one go takes a few, and one whose blocks writes to a clone moved can take thousands, which a cold read
+    pays for. None where the count isn't there."""
+    path = Path(path)
+    files = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file() and not p.is_symlink())
+    counts = {}
+
+    for p in files:
+        n = file_extents(p)
+
+        if n is None:
+            return None
+
+        counts[str(p.relative_to(path)) if p != path else p.name] = n
+
+    most = max(counts, key=counts.get) if counts else None
+    return {"total": sum(counts.values()), "files": len(counts), "most": most, "most_extents": counts.get(most, 0)}
 
 
 def remove_tree(path: Path | str) -> None:
