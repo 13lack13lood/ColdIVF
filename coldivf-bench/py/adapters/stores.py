@@ -16,6 +16,11 @@ Only one process opens the store in place at a time, the one that holds the lock
 can't share the store, eg. RocksDB locks its folder, and its restore would undo the first one's session. So it opens a
 private copy under <index>.sessions/ instead. The copy hard-links the bulk data a search reads, so both processes read
 the same cached pages, and clones the rest, eg. the lock files that two processes can't share.
+
+A write session of the write benchmark changes the store for good, eg. an insert writes AsterVec's vectors.bin in
+place. So it opens a full clone of a state in place, never a private copy, whose bulk files are hard links to a sealed
+store, and `clone_full` gives any file that still shares its inode a clone of its own first. Once the session is done,
+`seal` seals the state's store again, as a build seals its own.
 """
 
 from __future__ import annotations
@@ -92,6 +97,25 @@ class Layout:
     def sizes(self) -> dict[str, tuple[int, int]]:
         """Each file's size and change time, which a restore brings back. Inodes change with every restore."""
         return {rel: (size, mtime) for rel, (_, size, mtime) in self.files.items()}
+
+
+def clone_full(folder: Path) -> list[str]:
+    """Gives every file under `folder` that shares its inode with another path, eg. a hard link of a private copy, a
+    clone of its own with the same size and change time, so a write to it reaches no other folder. It returns the
+    files it unshared, by path relative to `folder`."""
+    unshared = []
+
+    for path in sorted(Path(folder).rglob("*")):
+        if path.is_symlink() or not path.is_file() or path.stat().st_nlink < 2:
+            continue
+
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.unshare")
+        tmp.unlink(missing_ok=True)
+        clone(path, tmp)
+        os.replace(tmp, path)
+        unshared.append(path.relative_to(folder).as_posix())
+
+    return unshared
 
 
 def changed_by(before: Layout, after: Layout) -> list[str]:
@@ -207,7 +231,7 @@ class Store:
     def seal(self, session: Callable[[Path], None]) -> dict:
         """Learns which files a session changes, stashes them and writes the record. `session` opens the store in the
         folder it gets, eg. runs one search, and closes it. It runs on a copy made of clones, so the store itself stays
-        as the build left it."""
+        as the build left it. A store sealed before, eg. a state that writes changed, gets a new stash and record."""
         scratch = self.index / LEARN
         shutil.rmtree(scratch, ignore_errors=True)
         before = Layout.of(self.data)
@@ -222,6 +246,8 @@ class Store:
                                f"files by absolute paths and can't be copied")
 
         changed = changed_by(start, end)
+        # A stash of an earlier seal holds the files as they were before the writes.
+        shutil.rmtree(self.stash, ignore_errors=True)
 
         for rel in changed:
             clone(self.data / rel, self.stash / rel)
@@ -398,6 +424,36 @@ class StoreAdapter(Adapter):
             store.release()
         else:
             store.drop(folder)
+
+    def write_store(self, path: Path) -> Store:
+        """The store at `path` for a write session, which opens it in place, claimed and restored. The folder is a
+        full clone of a state, and any file that still shares its inode gets a clone of its own, so no write reaches a
+        sealed store. A store that another process holds fails the session, since the private copy it would get
+        shares the sealed store's bulk files."""
+        store = self.store(path)
+        clone_full(store.data)
+
+        if not store.claim():
+            raise RuntimeError(f"another process holds the store at {store.data}, and a write session never opens a "
+                               f"private copy")
+
+        store.restore()
+        return store
+
+    def reseal(self, path: Path, session: Callable[[Path], None]) -> dict:
+        """Seals the store at `path` again once a write session has closed it, as its build sealed it, and returns
+        what the seal found. `session` is the build's session, eg. one search."""
+        store = self.store(path)
+        claimed = store.claimed or store.claim()
+
+        try:
+            record = store.seal(session)
+        finally:
+            if claimed:
+                store.release()
+
+        return {"stash": record["stash"], "made": record["made"], "store_bytes": store.store_bytes(),
+                "stash_bytes": store.stash_bytes()}
 
     def cold_setup(self, ctx: ServeContext) -> None:
         for path in (ctx.index, ctx.dummy):

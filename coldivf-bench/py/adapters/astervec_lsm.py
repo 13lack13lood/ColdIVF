@@ -10,6 +10,13 @@ Caches are set when the store opens. "default" keeps the library's caches, a 32 
 for vectors and 100,000 edge lists. "minimal" sets all three to 0. A search takes ef, the size of its candidate list,
 and runs on the calling thread. Searches from several Python threads don't run in parallel in this binding, so queries
 per second (QPS) at several threads run one process per worker.
+
+For the write benchmark it takes full writes with its default caches: `insert` and `delete` of one id per call, so a
+batch is a loop. A write lives in memory until the store closes, and close syncs RocksDB but never vectors.bin, so
+close is the durable point, at the process level, timed with the open after it. A write session opens a full clone of
+a state in place, never a private copy, since an insert writes vectors.bin in place. A state then takes one more open
+and close, which moves RocksDB's log into its tables, and is sealed again, as the build is. RocksDB compacts on its own,
+so there is no maintenance action.
 """
 
 from __future__ import annotations
@@ -23,7 +30,7 @@ from typing import Any
 import numpy as np
 
 from adapters import graphs, stores
-from adapters.base import BuildContext, ServeContext, Unsupported, main
+from adapters.base import BuildContext, ServeContext, Unsupported, WriteContext, main
 import schema
 
 DB = "db"
@@ -74,10 +81,27 @@ class Handle:
     params: dict | None = None
 
 
+@dataclass
+class Writer:
+    """A store open for writes, in place in a write session's folder."""
+
+    db: Any
+    store: stores.Store
+    folder: Path
+    meta: dict
+    inserts: int = 0
+    deletes: int = 0
+    reopens: int = 0
+
+
 class AsterVec(stores.StoreAdapter):
     system = "astervec"
     data = "store"
     qps_mode = "processes"
+    write_role = "full"
+    # A write lives in memory until close, which syncs RocksDB but not vectors.bin. There is no sync call.
+    durability = {"call": "memory", "durable_point": "process"}
+    sync_kind = "whole"
 
     def load(self) -> None:
         import astervec
@@ -191,6 +215,54 @@ class AsterVec(stores.StoreAdapter):
 
     def files(self, path: Path) -> list[dict]:
         return self.store_files(Path(path), self.meta(path))
+
+    def open_store(self, folder: Path, meta: dict) -> Any:
+        """The store in `folder` with the build's settings and the library's default caches."""
+        return self.av.AsterVecDB.open(str(folder / DB), self.options(folder, meta["settings"], meta["dim"], {}))
+
+    def writer_open(self, ctx: WriteContext, path: Path) -> Writer:
+        meta = self.meta(path)
+        store = self.write_store(path)
+        return Writer(db=self.open_store(store.data, meta), store=store, folder=store.data, meta=meta)
+
+    def insert(self, w: Writer, ids: np.ndarray, rows: np.ndarray) -> None:
+        for i, row in zip(ids.tolist(), rows):
+            w.db.insert(i, row)
+
+        w.inserts += len(ids)
+
+    def delete(self, w: Writer, ids: np.ndarray) -> None:
+        for i in ids.tolist():
+            w.db.delete(i)
+
+        w.deletes += len(ids)
+
+    def durable_point(self, w: Writer) -> dict:
+        """Closes the store, which syncs RocksDB but not vectors.bin, and opens it again into the same handle."""
+        w.db.close()
+        w.db = self.open_store(w.folder, w.meta)
+        w.reopens += 1
+        return {"call": "close, then open", "reopens": w.reopens}
+
+    def pending(self, w: Writer) -> dict:
+        """The library's tombstone counts, and this session's writes."""
+        return {"delete_stats": dict(w.db.delete_stats()), "inserts": w.inserts, "deletes": w.deletes}
+
+    def writer_close(self, w: Writer) -> None:
+        w.db.close()
+        w.store.release()
+
+    def seal_state(self, ctx: WriteContext, path: Path) -> dict:
+        """One more open and close, which moves RocksDB's log into its tables, then the build's seal."""
+        meta = self.meta(path)
+        store = self.store(path)
+
+        if not store.claim():
+            raise RuntimeError(f"another process holds the store at {store.data}")
+
+        self.open_store(store.data, meta).close()
+        query = np.asarray(ctx.dataset.queries[0], dtype=np.float32)
+        return self.reseal(path, lambda folder: self._session(folder, meta, query))
 
 
 if __name__ == "__main__":

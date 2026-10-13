@@ -21,6 +21,15 @@ distances rank them. `mmap_size` and `cache_size` set those pragmas on the conne
 read-only, loads the extension and runs the query. The extension is also loaded once at start, so its library is
 already mapped, as in any process that has used it before. A connection serves one thread, so queries per second (QPS)
 at several threads run one process per worker.
+
+For the write benchmark it takes full writes, INSERT and DELETE by rowid, one transaction per call, on a read-write
+connection with a write-ahead log (WAL), synchronous NORMAL and checkpoint_fullfsync. A commit then survives the
+process dying, and the sync, wal_checkpoint(FULL), survives a power loss. A latency run's inserts that each must survive
+a power loss commit with synchronous FULL and fullfsync instead, so their sync has nothing left to do. The durable point
+sets journal_mode DELETE again, which checkpoints and removes the log, since WAL mode stays in the file and a read-only
+connection would then need its side files. So every state opens as the build does. vec0 never moves a row, and puts a
+new one only in its last chunk, so the slots a scan reads hold deleted rows too. A state's meta.json records its slots
+and its live rows, which the scan counts read. Its one maintenance action is VACUUM.
 """
 
 from __future__ import annotations
@@ -35,8 +44,9 @@ from urllib.parse import quote
 import numpy as np
 
 from adapters import inproc
-from adapters.base import Adapter, BuildContext, ServeContext, Unsupported, main
+from adapters.base import Adapter, BuildContext, ServeContext, Unsupported, WriteContext, main
 import schema
+import writes
 
 DB = "vec0.db"
 META = "meta.json"
@@ -51,6 +61,12 @@ RESCORE = ("vec0", "aux")
 BUILD = {"codes": "f32", "page_size": None, "chunk_size": None, "rescore": "vec0"}
 SEARCH = {"codes": None, "oversample": 1, "mmap_size": None, "cache_size": None}
 PRAGMAS = ("mmap_size", "cache_size")
+# A write session's connection. A commit reaches the log, which survives the process dying, and a checkpoint syncs
+# with F_FULLFSYNC, which survives a power loss.
+WRITER = ("journal_mode = WAL", "synchronous = NORMAL", "checkpoint_fullfsync = ON")
+# A commit that syncs the log with F_FULLFSYNC, for inserts that each must survive a power loss.
+DURABLE = ("synchronous = FULL", "fullfsync = ON")
+DELETE_SQL = f"delete from {TABLE} where rowid = ?"
 
 
 def code_list(value: Any) -> list[str]:
@@ -110,15 +126,30 @@ def query_args(code: str, vector: bytes, k: int, oversample: int) -> tuple:
     return (vector, k * oversample, vector, k)
 
 
-def scan_counts(code: str, rows: int, dim: int, k: int, oversample: int) -> dict:
-    """The distances one search computes and the vector bytes it reads. Every scan reads every row of its column, and
-    a coarse scan then reads the float32 vectors of its candidates."""
+def scan_counts(code: str, rows: int, dim: int, k: int, oversample: int, slots: int | None = None) -> dict:
+    """The distances one search computes and the vector bytes it reads. Every scan reads every slot of its column,
+    `slots`, which holds deleted rows too and is `rows` without deletes, and computes the distances of the live `rows`.
+    A coarse scan then reads the float32 vectors of its candidates."""
+    slots = rows if slots is None else slots
+
     if code == "f32":
-        return {"dist_evals": rows, "bytes_scanned": rows * column_bytes("f32", dim)}
+        return {"dist_evals": rows, "bytes_scanned": slots * column_bytes("f32", dim)}
 
     candidates = min(rows, k * oversample)
     return {"dist_evals": rows + candidates,
-            "bytes_scanned": rows * column_bytes(code, dim) + candidates * column_bytes("f32", dim)}
+            "bytes_scanned": slots * column_bytes(code, dim) + candidates * column_bytes("f32", dim)}
+
+
+def vec0_slots(db: Any) -> tuple[int, int]:
+    """The slots of the vec0 table that hold a row or held a deleted one, and the live rows, from vec0's chunk and
+    rowid tables. A new row goes to the first free slot of the last chunk, so the slots are every earlier chunk's and
+    the last chunk's up to its highest row."""
+    chunks, size = db.execute(f"select count(*), max(size) from {TABLE}_chunks").fetchone()
+    last = db.execute(f"select max(chunk_offset) from {TABLE}_rowids where chunk_id = "
+                      f"(select max(chunk_id) from {TABLE}_chunks)").fetchone()[0]
+    live = db.execute(f"select count(*) from {TABLE}_rowids").fetchone()[0]
+    slots = max(0, int(chunks or 0) - 1) * int(size or 0) + (int(last) + 1 if last is not None else 0)
+    return slots, int(live)
 
 
 def search_settings(params: dict, codes: list[str], rescore: str = "vec0") -> dict:
@@ -152,10 +183,32 @@ class Handle:
     k: int = 10
 
 
+@dataclass
+class Writer:
+    """A read-write connection of a write session. In a latency run the inserts after the deletes are the ones that
+    each must survive a power loss, so they commit with `DURABLE`, and `durable` says that they do."""
+
+    db: Any
+    folder: Path
+    meta: dict
+    sql: str
+    copies: int
+    latency: bool
+    deleted: bool = False
+    durable: bool = False
+    inserts: int = 0
+    deletes: int = 0
+    checkpoints: int = 0
+
+
 class SqliteVec(Adapter):
     system = "sqlite-vec"
     binding = "python"
     qps_mode = "processes"
+    write_role = "full"
+    durability = {"call": "process", "sync": "power"}
+    sync_kind = "incremental"
+    maintenance_actions = ("vacuum",)
 
     def __init__(self) -> None:
         super().__init__()
@@ -291,10 +344,128 @@ class SqliteVec(Adapter):
         return inproc.as_ids([row[0] for row in found], k)
 
     def stats(self, handle: Handle) -> dict:
-        return scan_counts(handle.code, handle.meta["rows"], handle.meta["dim"], handle.k, handle.oversample)
+        meta = handle.meta
+        return scan_counts(handle.code, meta.get("live_rows", meta["rows"]), meta["dim"], handle.k, handle.oversample,
+                           meta.get("slots"))
 
     def close(self, handle: Handle) -> None:
         handle.db.close()
+
+    def writer_open(self, ctx: WriteContext, path: Path) -> Writer:
+        meta = self.meta(path)
+        db = self.connect(str(Path(path) / DB))
+
+        for pragma in WRITER:
+            db.execute(f"pragma {pragma}")
+
+        mode = db.execute("pragma journal_mode").fetchone()[0]
+
+        if mode != "wal":
+            db.close()
+            raise RuntimeError(f"SQLite kept journal mode {mode}, not wal")
+
+        return Writer(db=db, folder=Path(path), meta=meta, sql=insert_sql(meta["codes"]), copies=1 + len(meta["codes"]),
+                      latency=ctx.mode == "latency")
+
+    def insert(self, w: Writer, ids: np.ndarray, rows: np.ndarray) -> None:
+        if w.latency and w.deleted and not w.durable:
+            # A latency run's deletes come before its inserts that each sync, so these commit with F_FULLFSYNC.
+            for pragma in DURABLE:
+                w.db.execute(f"pragma {pragma}")
+
+            w.durable = True
+
+        args = [(i, *[row.tobytes()] * w.copies) for i, row in zip(ids.tolist(), rows)]
+
+        with w.db:
+            if len(args) == 1:
+                w.db.execute(w.sql, args[0])
+            else:
+                w.db.executemany(w.sql, args)
+
+        w.inserts += len(args)
+
+    def delete(self, w: Writer, ids: np.ndarray) -> None:
+        w.deleted = True
+        args = [(i,) for i in ids.tolist()]
+
+        with w.db:
+            if len(args) == 1:
+                w.db.execute(DELETE_SQL, args[0])
+            else:
+                w.db.executemany(DELETE_SQL, args)
+
+        w.deletes += len(args)
+
+    def sync(self, w: Writer) -> dict:
+        """wal_checkpoint(FULL), which syncs the log, copies it into the database and syncs that, with F_FULLFSYNC. A
+        commit with synchronous FULL synced the log already, so there is nothing left to do."""
+        if w.durable:
+            return {"call": "commit", "synchronous": "full", "fullfsync": True}
+
+        busy, frames, done = w.db.execute("pragma wal_checkpoint(FULL)").fetchone()
+
+        if busy:
+            raise RuntimeError("a checkpoint found the database busy")
+
+        w.checkpoints += 1
+        return {"call": "wal_checkpoint(FULL)", "frames": frames, "checkpointed": done}
+
+    def durable_point(self, w: Writer) -> dict:
+        """journal_mode DELETE, which checkpoints the log with F_FULLFSYNC and removes it, so the state opens as the
+        build does."""
+        return self.rollback_mode(w)
+
+    def rollback_mode(self, w: Writer) -> dict:
+        mode = w.db.execute("pragma journal_mode = DELETE").fetchone()[0]
+
+        if mode != "delete":
+            raise RuntimeError(f"SQLite kept journal mode {mode}, not delete")
+
+        return {"call": "journal_mode = DELETE"}
+
+    def maintain(self, w: Writer, action: str, threads: int, params: dict) -> dict:
+        """VACUUM, which rebuilds the database through the log, then journal_mode DELETE, which copies the log into the
+        database with F_FULLFSYNC and removes it. Each step's seconds go in the report."""
+        if action not in self.maintenance_actions:
+            raise Unsupported(f"{self.system} has no maintenance action {action}")
+
+        t0 = time.perf_counter()
+        w.db.execute("vacuum")
+        t1 = time.perf_counter()
+        self.rollback_mode(w)
+        t2 = time.perf_counter()
+        slots, live = vec0_slots(w.db)
+        return {"rows_live": live, "durability": "power", "data_file": str(w.folder / DB), "vacuum_seconds": t1 - t0,
+                "checkpoint_seconds": t2 - t1, "slots": slots}
+
+    def pending(self, w: Writer) -> dict:
+        wal = w.folder / f"{DB}-wal"
+        return {"inserts": w.inserts, "deletes": w.deletes, "checkpoints": w.checkpoints,
+                "wal_bytes": wal.stat().st_size if wal.exists() else 0, "durable_commits": w.durable}
+
+    def writer_close(self, w: Writer) -> None:
+        """Closes the connection, in journal mode DELETE again where the session had no durable point, eg. a latency
+        run's."""
+        if w.db.execute("pragma journal_mode").fetchone()[0] != "delete":
+            self.rollback_mode(w)
+
+        w.db.close()
+
+    def seal_state(self, ctx: WriteContext, path: Path) -> dict:
+        """Writes the state's slots and live rows into meta.json, which the scan counts read."""
+        db = self.connect(f"file:{quote(str(Path(path) / DB))}?mode=ro", uri=True)
+
+        try:
+            slots, live = vec0_slots(db)
+        finally:
+            db.close()
+
+        meta = self.meta(path) | {"slots": slots, "live_rows": live}
+        writes.write_json(Path(path) / META, meta)
+        writes.fullfsync(Path(path) / META)
+        self.metas[str(path)] = meta
+        return {"slots": slots, "live_rows": live}
 
 
 if __name__ == "__main__":

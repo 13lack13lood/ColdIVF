@@ -12,23 +12,35 @@ also rewrites the shard's config and a few flag files, so the shard is a sealed 
 
 Searches run on one thread, which the build sets in the shard's config. Searches from several Python threads don't run
 in parallel in this binding, so queries per second (QPS) at several threads run one process per worker.
+
+For the write benchmark it takes full writes, `upsert_points` and `delete_points`, one operation per call, which live
+in memory until `flush`, the sync. Its one maintenance action, `optimize`, merges every point into one segment with the
+build's config, so it rebuilds the whole graph. A write session opens a full clone of a state in place, never a private
+copy. qdrant applies an operation to a point only when the operation's number is at least the point's version. A log
+the build removed starts again at 0, while the base points keep the numbers of the build's upserts, so before its
+first write a session on such a log sends deletes of an absent id, untimed, until the next number is past them. The
+states keep their log, since qdrant never truncates it, and a load replays it. So a state records in meta.json the
+operations its log holds, and its lines record the log's bytes. A state then takes one more load and close, as the
+build does, and is sealed again.
 """
 
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import platform
 import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 
 from adapters import graphs, stores
-from adapters.base import BuildContext, ServeContext, Unsupported, main
+from adapters.base import BuildContext, ServeContext, Unsupported, WriteContext, main
 import schema
+import writes
 
 CODES = ("sq8", "bq2")
 BUILD_KEYS = ("codes", "inline", "m", "ef_construct", "quantile")
@@ -39,6 +51,10 @@ UPSERT_BATCH = 2000
 # every point in one segment.
 THRESHOLD_KB = 1
 MAX_SEGMENT_KB = 10**9
+# The id the version fix-up deletes, which no state holds.
+ABSENT_ID = 1 << 62
+WAL = "wal"
+CONFIG = "edge_config.json"
 
 
 def library_distance(metric: str, unit: bool) -> str:
@@ -81,6 +97,19 @@ def folder_bytes(path: Path) -> int:
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file()) if path.is_dir() else 0
 
 
+def fixup_ops(rows: int) -> int:
+    """The operations a log the build removed must hold before a delete of any base point applies. The build's last
+    upsert numbered its points ceil(rows / UPSERT_BATCH) - 1, and one more makes room, eg. 501 at 1M rows."""
+    return -(-rows // UPSERT_BATCH) + 1
+
+
+def log_bytes(shard: Path) -> dict:
+    """The size of qdrant's log in the shard folder and its files. qdrant makes each file of its log 32 MB at once and
+    fills it, so the size is the log's to within one file."""
+    files = [p for p in (Path(shard) / WAL).rglob("*") if p.is_file()] if (Path(shard) / WAL).is_dir() else []
+    return {"wal_bytes": sum(p.stat().st_size for p in files), "wal_files": len(files)}
+
+
 @dataclass
 class Handle:
     shard: Any
@@ -90,10 +119,35 @@ class Handle:
     request: Any = None
 
 
+@dataclass
+class Writer:
+    """A shard open for writes, in place in a write session's folder. `ops` counts the operations its log holds since
+    the build removed it, and `fixup` is how many it needs before a delete of a base point applies."""
+
+    shard: Any
+    store: stores.Store
+    folder: Path
+    meta: dict
+    ops: int
+    fixup: int
+    fixed: int = 0
+    inserts: int = 0
+    deletes: int = 0
+
+
 class QdrantEdge(stores.StoreAdapter):
     system = "qdrant-edge"
     data = "shard"
     qps_mode = "processes"
+    write_role = "full"
+    # A write lives in memory until flush, even with its log, and flush syncs with F_FULLFSYNC.
+    durability = {"call": "memory", "sync": "power"}
+    sync_kind = "incremental"
+    maintenance_actions = ("optimize",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.logs: dict[str, dict] = {}
 
     def load(self) -> None:
         import qdrant_edge
@@ -223,6 +277,128 @@ class QdrantEdge(stores.StoreAdapter):
 
     def files(self, path: Path) -> list[dict]:
         return self.store_files(Path(path), self.meta(path))
+
+    def prepare(self, path: Path) -> None:
+        super().prepare(path)
+        self.log_of(path)
+
+    def log_of(self, path: Path) -> dict:
+        """The size of the log of the index at `path` as the state left it, read once, for the lines' extra."""
+        key = str(path)
+
+        if key not in self.logs:
+            self.logs[key] = log_bytes(self.store(path).data) | {"log_ops": self.meta(path).get("log_ops", 0)}
+
+        return self.logs[key]
+
+    def stats(self, handle: Handle) -> dict:
+        return super().stats(handle) | self.log_of(handle.store.index)
+
+    def warm_run(self, ctx: ServeContext, grid: list[dict], qids: np.ndarray, ids_dir: Path, passes: int,
+                 warmup: int, qps_seconds: float, qps_repeats: int) -> Iterator[dict]:
+        # The log as the state left it, once the claim has restored the store.
+        self.claim(ctx.index)
+        log = self.log_of(ctx.index)
+
+        for result in super().warm_run(ctx, grid, qids, ids_dir, passes, warmup, qps_seconds, qps_repeats):
+            result["fields"]["extra"] = (result["fields"].get("extra") or {}) | log
+            yield result
+
+    def writer_open(self, ctx: WriteContext, path: Path) -> Writer:
+        """Loads the shard of a state for writes. A maintenance run, the only session at more than 1 thread, loads it
+        with the build's config at its own indexing threads, which qdrant writes into the shard."""
+        meta = self.meta(path)
+        store = self.write_store(path)
+        config = None
+
+        if ctx.threads > 1 and indexing_threads(store.data) != ctx.threads:
+            config = self.edge_config(meta["settings"], meta["dim"], ctx.threads)
+
+        shard = self.qe.EdgeShard.load(str(store.data), config)
+        return Writer(shard=shard, store=store, folder=store.data, meta=meta, ops=int(meta.get("log_ops", 0)),
+                      fixup=fixup_ops(int(meta["rows"])))
+
+    def resize(self, w: Writer, capacity: int) -> bool:
+        """Sends the version fix-up before a session's first write, as deletes of an absent id, while the log holds
+        fewer operations than the build's upserts numbered. It returns False, so the session times none of it."""
+        while w.ops < w.fixup:
+            w.shard.update(self.qe.UpdateOperation.delete_points([ABSENT_ID]))
+            w.ops, w.fixed = w.ops + 1, w.fixed + 1
+
+        return False
+
+    def insert(self, w: Writer, ids: np.ndarray, rows: np.ndarray) -> None:
+        points = [self.qe.Point(id=i, vector=row.tolist()) for i, row in zip(ids.tolist(), rows)]
+        w.shard.update(self.qe.UpdateOperation.upsert_points(points))
+        w.ops, w.inserts = w.ops + 1, w.inserts + len(ids)
+
+    def delete(self, w: Writer, ids: np.ndarray) -> None:
+        w.shard.update(self.qe.UpdateOperation.delete_points(ids.tolist()))
+        w.ops, w.deletes = w.ops + 1, w.deletes + len(ids)
+
+    def sync(self, w: Writer) -> dict:
+        w.shard.flush()
+        return {"call": "flush"}
+
+    def maintain(self, w: Writer, action: str, threads: int, params: dict) -> dict:
+        """optimize with the build's one-segment config, which merges every point into one new segment and builds its
+        whole graph again, then flush, which makes it survive a power loss. Each step's seconds go in the report."""
+        if action not in self.maintenance_actions:
+            raise Unsupported(f"{self.system} has no maintenance action {action}")
+
+        before = w.shard.info()
+        t0 = time.perf_counter()
+        w.shard.optimize()
+        t1 = time.perf_counter()
+        w.shard.flush()
+        t2 = time.perf_counter()
+        after = w.shard.info()
+        return {
+            "rows_live": int(after.points_count), "durability": "power", "rebuild": True,
+            "optimize_seconds": t1 - t0, "flush_seconds": t2 - t1, "indexing_threads": indexing_threads(w.folder),
+            "points": int(after.points_count), "indexed_before": int(before.indexed_vectors_count),
+            "indexed_after": int(after.indexed_vectors_count), "segments_before": int(before.segments_count),
+            "segments_after": int(after.segments_count),
+        }
+
+    def pending(self, w: Writer) -> dict:
+        """The points qdrant holds and has indexed, the log, and this session's writes and fix-up."""
+        info = w.shard.info()
+        return {"points": int(info.points_count), "indexed": int(info.indexed_vectors_count),
+                "segments": int(info.segments_count), "log_ops": w.ops, "fixup_ops": w.fixed, "inserts": w.inserts,
+                "deletes": w.deletes} | log_bytes(w.folder)
+
+    def writer_close(self, w: Writer) -> None:
+        w.shard.close()
+        w.store.release()
+        meta = self.meta(w.store.index)
+
+        if meta.get("log_ops", 0) != w.ops:
+            self._meta[str(w.store.index)] = meta | {"log_ops": w.ops}
+
+    def seal_state(self, ctx: WriteContext, path: Path) -> dict:
+        """Records the log's operations in meta.json, then one more load and close, as the build does, and the
+        build's seal."""
+        meta = self.meta(path)
+        writes.write_json(Path(path) / graphs.META, meta)
+        writes.fullfsync(Path(path) / graphs.META)
+        store = self.store(path)
+
+        if not store.claim():
+            raise RuntimeError(f"another process holds the store at {store.data}")
+
+        self.qe.EdgeShard.load(str(store.data)).close()
+        query = np.asarray(ctx.dataset.queries[0], dtype=np.float32)
+        return self.reseal(path, lambda folder: self._session(folder, query)) | log_bytes(store.data) | \
+            {"log_ops": meta.get("log_ops", 0)}
+
+
+def indexing_threads(shard: Path) -> int | None:
+    """The indexing threads in the shard's config, or None where it doesn't say."""
+    try:
+        return int(json.loads((Path(shard) / CONFIG).read_text())["hnsw_config"]["max_indexing_threads"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 if __name__ == "__main__":

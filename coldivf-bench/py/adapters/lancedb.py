@@ -25,27 +25,37 @@ A warm run in mode "whole" reads every file first, as for every system. Mode "in
 under the table's _indices folder, and leaves the table's data files to the queries. It is the warm state of a table
 too large to cache whole, eg. the 30.7 GB of vectors at 10M rows. The warm-up searches then leave the refine rows and
 ids of the queries they search cached, and nothing else of the table.
+
+For the write benchmark it takes full writes through lancedb's Table: `add`, one commit and one fragment per call, and
+`delete` by id, one commit that writes a deletion file for each fragment it touches. A commit survives the process
+dying, but Lance never syncs, so the sync is the harness's own: an fsync of every file the commits since the last sync
+made, and of their folders, then one F_FULLFSYNC. Searches keep Lance's default, which scans the rows the index doesn't
+hold yet exactly. The actions are `optimize`, Table.optimize(), which compacts, prunes old versions and adds the new
+rows to the index's partitions, and `retrain`, which also trains the partitions again. lancedb 0.40 ignores
+Table.optimize(retrain=True), so `retrain` is Table.optimize() and then pylance's optimize_indices(retrain=True).
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import platform
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
 
-from adapters.base import Adapter, BuildContext, ServeContext, Unsupported, main, read_except
+from adapters.base import Adapter, BuildContext, ServeContext, Unsupported, WriteContext, main, read_except
 import data
 import schema
 
 TABLE = "t"
 META = "meta.json"
+INDEX = "vector_idx"
 BATCH_ROWS = 65536
 # Lance trains its clusters on sample_rate rows per partition, 256 by default. The rate is capped so the training
 # sample stays near this many rows. IVF_PQ also builds at most rows / sample_rate partitions.
@@ -208,8 +218,9 @@ def nearest(query: np.ndarray, k: int, params: dict) -> dict:
 
 def kind_of(relative: str) -> str:
     """Whether a file of an index folder is routing data, which every query reads and C1 keeps, or bulk data. Routing
-    is meta.json, the manifests and index.idx, which holds the index's centroids. Bulk is the partitions in
-    auxiliary.idx, the data files and the transaction files."""
+    is meta.json, the manifests, index.idx, which holds the index's centroids, and the deletion files, which every
+    query reads to skip deleted rows. Bulk is the partitions in auxiliary.idx, the data files and the transaction
+    files."""
     parts = Path(relative).parts
     name = parts[-1] if parts else ""
 
@@ -219,7 +230,58 @@ def kind_of(relative: str) -> str:
     if "_indices" in parts and name == "index.idx":
         return "routing"
 
+    if "_deletions" in parts:
+        return "routing"
+
     return "bulk"
+
+
+def listing(root: Path) -> dict[str, int]:
+    """Every file under `root` by path, with its inode, from the folders' entries alone. A file Lance rewrites
+    through a rename, eg. the version hint, gets a new inode."""
+    out: dict[str, int] = {}
+    folders = [str(root)]
+
+    while folders:
+        with os.scandir(folders.pop()) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    folders.append(entry.path)
+                elif entry.is_file(follow_symlinks=False):
+                    out[entry.path] = entry.inode()
+
+    return out
+
+
+def sync_new(before: dict[str, int], after: dict[str, int]) -> dict:
+    """Makes the files of `after` that `before` lacks survive a power loss: an fsync of each and of each folder that
+    holds one, then one F_FULLFSYNC, which empties the drive's cache of all of them."""
+    new = sorted(path for path, inode in after.items() if before.get(path) != inode)
+    folders = sorted({os.path.dirname(path) for path in new})
+    size = 0
+
+    for path in new + folders:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except FileNotFoundError:
+            # Gone since the listing, so nothing of it needs to survive.
+            continue
+
+        try:
+            os.fsync(fd)
+            size += os.fstat(fd).st_size if path in after else 0
+        finally:
+            os.close(fd)
+
+    if new:
+        fd = os.open(os.path.dirname(new[-1]), os.O_RDONLY)
+
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+        finally:
+            os.close(fd)
+
+    return {"files": len(new), "folders": len(folders), "bytes": size}
 
 
 def parse_value(text: str, key: str = "") -> float | None:
@@ -369,11 +431,31 @@ class Handle:
     plan: list | None = None
 
 
+@dataclass
+class Writer:
+    """A table open for writes through lancedb. `files` lists the table's files as the last sync left them, by path
+    with their inodes, or is None until the session's first write takes it."""
+
+    path: Path
+    meta: dict
+    db: Any
+    table: Any
+    files: dict[str, int] | None = None
+    inserts: int = 0
+    deletes: int = 0
+    synced: dict = field(default_factory=lambda: {"syncs": 0, "files": 0, "folders": 0, "bytes": 0})
+
+
 class LanceDB(Adapter):
     system = "lancedb"
     # A search releases Python's lock, so queries per second (QPS) at several threads come from threads over one table.
     qps_mode = "threads"
     workers = "Lance's compute and IO pools"
+    write_role = "full"
+    # A commit survived kill -9. Lance never syncs, so the sync is the harness's.
+    durability = {"call": "process", "sync": "power"}
+    sync_kind = "incremental"
+    maintenance_actions = ("optimize", "retrain")
 
     def __init__(self) -> None:
         super().__init__()
@@ -398,6 +480,10 @@ class LanceDB(Adapter):
             lance = None
 
         self.lance = lance
+
+        # Retraining the index takes pylance's optimize_indices.
+        if lance is None:
+            self.maintenance_actions = ("optimize",)
 
     @property
     def pylance(self) -> bool:
@@ -768,6 +854,92 @@ class LanceDB(Adapter):
                 fields["dist_evals"] = summary["index_comparisons"]
 
             yield result
+
+    def writer_open(self, ctx: WriteContext, path: Path) -> Writer:
+        db = self.ldb.connect(str(path))
+        return Writer(path=Path(path), meta=self.meta(path), db=db, table=db.open_table(TABLE))
+
+    def resize(self, w: Writer, capacity: int) -> bool:
+        """Lists the table's files before the session's first write, for the harness's sync. It returns False, so the
+        session times none of it."""
+        if w.files is None:
+            w.files = listing(w.path)
+
+        return False
+
+    def rows_table(self, ids: np.ndarray, rows: np.ndarray) -> Any:
+        pa = self.pa
+        dim = rows.shape[1]
+        vectors = pa.FixedSizeListArray.from_arrays(pa.array(np.ascontiguousarray(rows, dtype=np.float32).reshape(-1)),
+                                                    dim)
+        return pa.Table.from_arrays([pa.array(np.asarray(ids, dtype=np.int64)), vectors], schema=self.table_schema(dim))
+
+    def insert(self, w: Writer, ids: np.ndarray, rows: np.ndarray) -> None:
+        w.table.add(self.rows_table(ids, rows))
+        w.inserts += len(ids)
+
+    def delete(self, w: Writer, ids: np.ndarray) -> None:
+        values = ids.tolist()
+        w.table.delete(f"id = {values[0]}" if len(values) == 1 else f"id IN ({', '.join(map(str, values))})")
+        w.deletes += len(values)
+
+    def sync(self, w: Writer) -> dict:
+        """The harness's sync, since Lance never syncs: every file the commits since the last sync made, and their
+        folders, then one F_FULLFSYNC."""
+        before = w.files if w.files is not None else {}
+        w.files = listing(w.path)
+        done = sync_new(before, w.files)
+        w.synced["syncs"] += 1
+
+        for key in ("files", "folders", "bytes"):
+            w.synced[key] += done[key]
+
+        return done | {"by": "harness"}
+
+    def counts(self, w: Writer) -> dict:
+        """Lance's own counts of the table: its version, rows, fragments, deleted rows and the rows its index doesn't
+        hold yet."""
+        stats = dict(w.table.stats())
+        index = next((i for i in w.table.list_indices() if i.name == INDEX), None)
+        out = {"version": int(w.table.version), "rows": int(stats["num_rows"]),
+               "fragments": int(stats["fragment_stats"]["num_fragments"]),
+               "small_fragments": int(stats["fragment_stats"]["num_small_fragments"]),
+               "indexed_rows": int(index.num_indexed_rows) if index is not None else None,
+               "unindexed_rows": int(index.num_unindexed_rows) if index is not None else None,
+               "index_segments": int(index.num_segments) if index is not None else None,
+               "index_uuid": str(index.index_uuid) if index is not None else None}
+
+        if self.pylance:
+            out["deleted_rows"] = int(sum(f.num_deletions for f in w.table.to_lance().get_fragments()))
+
+        return out
+
+    def maintain(self, w: Writer, action: str, threads: int, params: dict) -> dict:
+        """Table.optimize(), and for `retrain` pylance's optimize_indices(retrain=True) after it, since lancedb 0.40
+        takes retrain=True without doing anything with it. Each step's seconds go in the report."""
+        if action not in self.maintenance_actions:
+            raise Unsupported(f"{self.system} has no maintenance action {action} in this environment")
+
+        before = self.counts(w)
+        t0 = time.perf_counter()
+        w.table.optimize()
+        t1 = time.perf_counter()
+        out: dict[str, Any] = {"optimize_seconds": t1 - t0, "calls": ["Table.optimize()"]}
+
+        if action == "retrain":
+            w.table.to_lance().optimize.optimize_indices(retrain=True)
+            w.table.checkout_latest()
+            out.update(retrain_seconds=time.perf_counter() - t1,
+                       calls=["Table.optimize()", "LanceDataset.optimize.optimize_indices(retrain=True)"])
+
+        after = self.counts(w)
+        return out | {"rows_live": after["rows"], "durability": "process", "before": before, "after": after}
+
+    def pending(self, w: Writer) -> dict:
+        return self.counts(w) | {"inserts": w.inserts, "deletes": w.deletes, "harness_sync": dict(w.synced)}
+
+    def writer_close(self, w: Writer) -> None:
+        w.table = w.db = None
 
 
 if __name__ == "__main__":
