@@ -11,7 +11,7 @@ use crate::index::{Inner, Opening, Shared};
 use crate::search::candidates::{Candidate, order};
 use crate::search::rerank::rerank_live;
 use crate::search::route::{reach_of, route_chunked};
-use crate::search::{PENDING_LISTS, Scratch, depth, invalid, prepare_query, scan_lists, scan_next};
+use crate::search::{Scratch, depth, invalid, prepare_query, scan_lists, scan_next};
 use crate::trace::{Clock, Trace};
 use crate::update::{Delta, Seen, real_path};
 use crate::{Hit, Index, LeafId, Limits, Metric, SearchCtx, SearchParams};
@@ -19,8 +19,8 @@ use crate::{Hit, Index, LeafId, Limits, Metric, SearchCtx, SearchParams};
 /// One collection's part of a search over several, kept in the search context.
 pub(crate) struct Part {
     s: Scratch,
-    /// The collection's clusters among the nearest overall, and among those ranked next, up to the `PENDING_LISTS`
-    /// nearest overall, whose pending inserts alone the search scans.
+    /// The collection's clusters among the nearest overall, and among those ranked next, up to the `depth` nearest
+    /// overall, whose pending inserts alone the search scans.
     leaves: Vec<LeafId>,
     next: Vec<LeafId>,
     /// The collection's candidates among the best overall.
@@ -43,7 +43,7 @@ impl Part {
         Part {
             s: Scratch::new(dim, 0, limits),
             leaves: Vec::with_capacity(limits.max_nprobe),
-            next: Vec::with_capacity(limits.max_nprobe.max(PENDING_LISTS)),
+            next: Vec::with_capacity(depth(limits.max_nprobe, true)),
             chosen: Vec::with_capacity(limits.max_rerank.max(limits.max_k)),
             hits: Vec::with_capacity(limits.max_k),
             taken: 0,
@@ -132,7 +132,7 @@ fn search_loaded(
     let keep = params.rerank.max(params.k);
     let limits = ctx.limits;
     ctx.picks.clear();
-    let routes = limits.max_nprobe.max(PENDING_LISTS);
+    let routes = depth(limits.max_nprobe, true);
     ctx.picks
         .reserve(indexes.len() * routes.max(limits.max_rerank).max(limits.max_k));
 

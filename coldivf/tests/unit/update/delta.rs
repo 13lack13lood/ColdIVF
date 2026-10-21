@@ -91,8 +91,8 @@ fn a_snapshot_keeps_what_it_saw_whatever_comes_later() {
         assert!(s.insert_visible(1, seen) && s.row_visible(r8, seen), "{version:?}");
         assert!(!later.insert_visible(1, later.seen()) && !later.row_visible(r8, later.seen()));
         assert!(later.row_replaced(r8, later.seen()) && !later.row_replaced(r7, later.seen()));
-        assert_eq!(later.groups(3).map(|g| g.len()).sum::<usize>(), 2);
-        assert_eq!(s.groups(1).count(), 0);
+        assert_eq!(later.groups(3).len(), 2);
+        assert!(s.groups(1).is_empty());
     }
 }
 
@@ -184,6 +184,7 @@ fn a_replay_packs_its_inserts_once_and_shows_what_one_by_one_shows() {
     for list in 0..6 {
         let places = |s: &Delta| {
             s.groups(list)
+                .iter()
                 .flat_map(|g| (0..g.len()).map(move |j| g.place(j)))
                 .collect::<Vec<_>>()
         };

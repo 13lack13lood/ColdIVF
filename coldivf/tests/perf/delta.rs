@@ -102,7 +102,7 @@ fn extra_us(a: &mut Side, b: &mut Side, queries: &[f32], dim: usize, sp: &Search
 }
 
 /// What pending inserts add to a search, against the same vectors folded into the file. The file has 6250 clusters, as
-/// 1M vectors have, and a search reads 160 or 64 of them and scans the pending inserts of the 256 nearest, so it sees
+/// 1M vectors have, and a search reads 160 or 64 of them and scans the pending inserts of 5/4 as many, so it sees
 /// as many pending inserts as one at 1M does. A fold writes the file first, so the file with pending inserts and the
 /// folded one are written alike. Pending inserts may add at most 10 µs to a warm search and 1% to a cold one.
 #[test]

@@ -2,7 +2,7 @@
 //! search of that file in this process reads. A search loads them once, as one snapshot, without a lock, and keeps it
 //! until it returns, so it sees the changes as they were when it began. Inserted vectors wait in memory, grouped by
 //! the cluster they were routed to, and a search scans those of the clusters it probes and of the clusters ranked
-//! next, up to the 256 nearest, until a maintenance run folds them into a new data file. With the cluster anchor each
+//! next, up to 5/4 of `nprobe`, until a maintenance run folds them into a new data file. With the cluster anchor each
 //! one is measured from the center of its cluster.
 //!
 //! Every change gets the next sequence number, and the rows of the data file count as number 0. An insert hides the

@@ -1,5 +1,5 @@
 //! The pending inserts of a data file by cluster, so a search scans only those of the clusters it probes and of the
-//! clusters ranked next, up to the 256 nearest, instead of every one. The sorted view holds them in one array, cluster
+//! clusters ranked next, up to 5/4 of `nprobe`, instead of every one. The sorted view holds them in one array, cluster
 //! after cluster, in blocks of 32 for the scan, with each lane's place among the inserts, and their codes and factors
 //! again unpacked, for a cluster with so few that a block would be mostly empty. The inserts since its last rebuild
 //! sit in small groups by cluster, which an insert copies. Every `REBUILD` inserts they join the sorted view, which
@@ -45,6 +45,31 @@ impl<'a> Group<'a> {
     /// The lanes' codes, back to back, and their factors.
     pub(crate) fn lanes(&self) -> (&'a [u8], &'a [Factors]) {
         (self.codes, self.factors)
+    }
+}
+
+/// One cluster's pending inserts, found with one lookup: its group in the sorted view, then its group of the inserts
+/// since.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ClusterGroups<'a> {
+    sorted: Option<Group<'a>>,
+    recent: Option<Group<'a>>,
+}
+
+impl<'a> ClusterGroups<'a> {
+    /// Whether the cluster holds no pending insert.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sorted.is_none() && self.recent.is_none()
+    }
+
+    /// Its groups, the sorted view's first.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = Group<'a>> {
+        self.sorted.into_iter().chain(self.recent)
+    }
+
+    /// How many inserts they hold.
+    pub(crate) fn len(&self) -> usize {
+        self.iter().map(|g| g.len()).sum()
     }
 }
 
@@ -178,7 +203,7 @@ impl Groups {
     }
 
     /// The groups of cluster `list`: its inserts in the sorted view, then those since.
-    pub(crate) fn of(&self, list: u32) -> impl Iterator<Item = Group<'_>> {
+    pub(crate) fn of(&self, list: u32) -> ClusterGroups<'_> {
         let sorted = self.sorted.spans.get(list as usize).filter(|s| s.count > 0).map(|s| {
             let (first, blocks) = (s.block as usize, (s.count as usize).div_ceil(BLOCK));
             let (size, cb) = (block_bytes(self.d_pad), code_bytes(self.d_pad));
@@ -194,7 +219,10 @@ impl Groups {
             true => None,
             false => self.recent.binary_search_by_key(&list, |(l, _)| *l).ok(),
         };
-        sorted.into_iter().chain(recent.map(|i| self.recent[i].1.group()))
+        ClusterGroups {
+            sorted,
+            recent: recent.map(|i| self.recent[i].1.group()),
+        }
     }
 
     /// The same groups with the insert at place `place` in cluster `list`, with its code and factors. Every

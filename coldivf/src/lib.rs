@@ -250,8 +250,8 @@ impl Index {
     /// Writes the positions of the clusters `query` would read into `out`, nearest first. They are the `nprobe`
     /// nearest, or with a `reach`, those of them within it, as in [`SearchParams`]. The positions belong to the
     /// index's current generation, and `ctx` keeps which one, so a fetch with `ctx` after a commit fails. When the
-    /// index has pending inserts, `ctx` also keeps the clusters ranked after those, up to the 256 nearest, whose
-    /// inserts a search of what is fetched scans too.
+    /// index has pending inserts, `ctx` also keeps the clusters ranked after those, up to 5/4 of `nprobe` of the
+    /// nearest, whose inserts a search of what is fetched scans too.
     pub fn route(
         &self,
         query: &[f32],
@@ -384,8 +384,8 @@ pub struct SearchParams {
     /// How many results to return.
     pub k: usize,
     /// Clusters to read. At 1M vectors, 160 to 192 finds ~95% of each query's true 10 nearest neighbors. A search also
-    /// scans the pending inserts of the clusters ranked next, up to the 256 nearest, whose vectors in the file it
-    /// skips.
+    /// scans the pending inserts of the clusters ranked next, up to 5/4 of `nprobe` of the nearest, whose vectors in
+    /// the file it skips.
     pub nprobe: usize,
     /// Candidates to rescore with the more precise copy of each vector. 29 to 39 gives that same ~95%.
     pub rerank: usize,
@@ -451,7 +451,7 @@ impl SearchCtx {
             reads: Vec::new(),
             leaves: Vec::with_capacity(limits.max_nprobe),
             routed: Vec::new(),
-            next: Vec::with_capacity(limits.max_nprobe.max(search::PENDING_LISTS)),
+            next: Vec::with_capacity(search::depth(limits.max_nprobe, true)),
             next_of: None,
             hits: Vec::with_capacity(limits.max_k),
             parts: Vec::new(),
@@ -662,8 +662,8 @@ impl Writer {
 
     /// Adds `vector` with the id `id`, replacing any earlier vector with that id. It joins its nearest cluster, and
     /// with the cluster anchor its code is measured from that cluster's center, so it scores as it would in the file.
-    /// Until a maintenance run folds it in, a search scans it when its cluster is among the `nprobe` nearest the query,
-    /// or among the 256 nearest when that is more. Every open index of the file in this process sees it from its next
+    /// Until a maintenance run folds it in, a search scans it when its cluster is among 5/4 of `nprobe` of the clusters
+    /// nearest the query. Every open index of the file in this process sees it from its next
     /// search, and indexes opened later read it from the log. It survives the process dying, and [`Writer::sync`] makes
     /// it survive a power loss too.
     pub fn insert(&mut self, id: u64, vector: &[f32]) -> Result<(), Error> {

@@ -1027,19 +1027,20 @@ fn queries_aimed_at_fresh_inserts_find_them_in_clusters_past_the_ones_they_read(
     let mut ids = |index: &Index, q: &[f32], sp: &SearchParams| -> Vec<u64> {
         index.search(q, sp, &mut c).unwrap().iter().map(|h| h.id).collect()
     };
+    let deep = crate::search::depth(4, true);
     let read = recall(4, &mut |q, sp| ids(&fold, q, sp));
-    let all_read = recall(256, &mut |q, sp| ids(&fold, q, sp));
+    let deep_read = recall(deep, &mut |q, sp| ids(&fold, q, sp));
     let aimed = recall(4, &mut |q, sp| ids(&index, q, sp));
 
     // A fold leaves an insert in its cluster, so a search finds it only when it reads that cluster. Scanning the
-    // pending inserts of the 256 nearest clusters finds about what reading all of them would.
+    // pending inserts of the clusters ranked next finds about what reading all of those would.
     assert!(
         read <= 0.85,
         "a fold finds {read:.3} at nprobe 4, so the inserts tell nothing"
     );
     assert!(
-        aimed >= 0.95 && aimed >= all_read - 0.02,
-        "{aimed:.3}, against {all_read:.3} reading 256"
+        aimed > read && aimed >= deep_read - 0.02,
+        "{aimed:.3}, against {read:.3} reading 4 and {deep_read:.3} reading {deep}"
     );
 
     // Every path finds the same.
@@ -1072,7 +1073,7 @@ fn queries_aimed_at_fresh_inserts_find_them_in_clusters_past_the_ones_they_read(
 }
 
 #[test]
-fn a_search_scans_the_pending_inserts_of_the_256_nearest_clusters_once_each() {
+fn a_search_scans_the_pending_inserts_of_the_clusters_ranked_next_once_each() {
     let (path, _, centers) = gapped("next-clusters.coldivf");
     let mut writer = Writer::open(&path).unwrap();
 
@@ -1085,7 +1086,7 @@ fn a_search_scans_the_pending_inserts_of_the_256_nearest_clusters_once_each() {
     }
 
     let index = Index::open(&path).unwrap();
-    let held = |l: u32| index.inner().changes().load().groups(l).map(|g| g.len()).sum::<usize>();
+    let held = |l: u32| index.inner().changes().load().groups(l).len();
     assert!((0..320).all(|l| held(l) == 2), "an insert joined another cluster");
     let q = gaussian(&mut SplitMix64::new(93), 1, GAPPED, |_| 1.0);
     let mut c = SearchCtx::new(ROOM);
@@ -1093,13 +1094,17 @@ fn a_search_scans_the_pending_inserts_of_the_256_nearest_clusters_once_each() {
     index.route(&q, 320, None, &mut c, &mut order).unwrap();
     let count = |l: u32| index.inner().tables().unwrap().lists[l as usize].count;
     let read: usize = order[..8].iter().map(|&l| count(l)).sum();
+    let depth = |nprobe: usize| crate::search::depth(nprobe, true).min(320);
+    // The clusters that a search at nprobe 8 ranks next, and one of them.
+    let next = depth(8) - 8;
+    let pick = order[8 + next / 2];
 
-    // Whatever it reads, a search scans the inserts of the 256 nearest clusters, or of more when it reads more, and
-    // the vectors in the file of only the clusters it reads.
+    // Whatever it reads, a search scans the inserts of the `depth` nearest clusters, and the vectors in the file of
+    // only the clusters it reads.
     for (nprobe, reach, clusters, vectors) in [
-        (8, None, 256, Some(read)),
-        (300, None, 300, None),
-        (8, Some(0.0), 256, None),
+        (8, None, depth(8), Some(read)),
+        (300, None, depth(300), None),
+        (8, Some(0.0), depth(8), None),
     ] {
         let sp = SearchParams {
             k: 10,
@@ -1130,7 +1135,7 @@ fn a_search_scans_the_pending_inserts_of_the_256_nearest_clusters_once_each() {
     let mut leaves = Vec::new();
     index.route(&q, 8, None, &mut c, &mut leaves).unwrap();
     let hits = index
-        .fetch(&[order[3], order[100]], &mut c)
+        .fetch(&[order[3], pick], &mut c)
         .unwrap()
         .search(&q, 10, 60)
         .unwrap();
@@ -1138,11 +1143,11 @@ fn a_search_scans_the_pending_inserts_of_the_256_nearest_clusters_once_each() {
     ids.sort_unstable();
     ids.dedup();
     assert_eq!(ids.len(), 10);
-    // The two fetched clusters and the 247 others of the 248 ranked next.
-    assert_eq!(c.trace.inserts_scanned, 2 * 249);
+    // The two fetched clusters and the others of those ranked next.
+    assert_eq!(c.trace.inserts_scanned, 2 * (2 + next - 1));
 
     // A route of another index, a copy with the same inserts that reads 100 clusters, keeps the clusters that this
-    // index's last route ranked next, and a fetch of the other index's route scans the inserts of the 156 that it
+    // index's last route ranked next, and a fetch of the other index's route scans the inserts of those that it
     // ranked next.
     let twin = temp_file("next-clusters-twin.coldivf");
     crate::quantization::testutil::copy_index(&path, &twin);
@@ -1150,22 +1155,22 @@ fn a_search_scans_the_pending_inserts_of_the_256_nearest_clusters_once_each() {
     let mut other_leaves = Vec::new();
     other.route(&q, 100, None, &mut c, &mut other_leaves).unwrap();
     index
-        .fetch(&[order[3], order[100]], &mut c)
+        .fetch(&[order[3], pick], &mut c)
         .unwrap()
         .search(&q, 10, 60)
         .unwrap();
-    assert_eq!(c.trace.inserts_scanned, 2 * 249);
+    assert_eq!(c.trace.inserts_scanned, 2 * (2 + next - 1));
     other
         .fetch(&other_leaves[..2], &mut c)
         .unwrap()
         .search(&q, 10, 60)
         .unwrap();
-    assert_eq!(c.trace.inserts_scanned, 2 * 158);
+    assert_eq!(c.trace.inserts_scanned, 2 * (2 + depth(100) - 100));
 
     // A fetch with a context that never routed this index scans the inserts of the fetched clusters alone.
     let mut fresh = SearchCtx::new(ROOM);
     index
-        .fetch(&[order[3], order[100]], &mut fresh)
+        .fetch(&[order[3], pick], &mut fresh)
         .unwrap()
         .search(&q, 10, 60)
         .unwrap();
@@ -1186,7 +1191,7 @@ fn a_search_scans_the_pending_inserts_of_the_256_nearest_clusters_once_each() {
         };
         index.inner().search_mapped(&q, &sp, &mut c).unwrap();
         let s = c.scratch.iter().find(|s| s.fits(GAPPED)).unwrap();
-        let first = 6400 + 2 * order[99];
+        let first = 6400 + 2 * pick;
         let score = |id: u32| {
             s.candidates
                 .as_slice()
@@ -1200,7 +1205,7 @@ fn a_search_scans_the_pending_inserts_of_the_256_nearest_clusters_once_each() {
     };
     assert_eq!(estimates(8), estimates(120));
 
-    // Two collections of the same file rank each cluster twice, so the 256 nearest overall are 128 of each.
+    // Two collections of the same file rank each cluster twice, so the `depth` nearest overall are half of each.
     let (set, mut out) = (Collections::open(&[&*path, &*path]).unwrap(), Vec::new());
     let sp = SearchParams {
         k: 10,
@@ -1212,6 +1217,6 @@ fn a_search_scans_the_pending_inserts_of_the_256_nearest_clusters_once_each() {
     for warm in [false, true] {
         set.indexes.iter().for_each(|i| i.set_warm(warm));
         set.search(&q, &sp, &mut c, &mut out).unwrap();
-        assert_eq!(c.trace.inserts_scanned, 2 * 256, "two collections, warm {warm}");
+        assert_eq!(c.trace.inserts_scanned, 2 * depth(8), "two collections, warm {warm}");
     }
 }

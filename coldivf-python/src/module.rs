@@ -327,8 +327,8 @@ impl PyWriter {
     }
 
     /// Adds `vector`, a 1-D float32 array, with the id `id`, replacing any earlier vector with that id. Until a
-    /// maintenance run folds it in, a search scans it when its cluster is among the `nprobe` nearest the query, or
-    /// among the 256 nearest. It survives the process dying, and `sync` makes it survive a power loss too. An array of
+    /// maintenance run folds it in, a search scans it when its cluster is among 5/4 of `nprobe` of the clusters nearest
+    /// the query. It survives the process dying, and `sync` makes it survive a power loss too. An array of
     /// another type, eg. float64, raises BufferError, and an object that isn't an array, eg. a list, TypeError. An
     /// array of another shape or length, a value that isn't finite, or a vector of zeros in a cosine index raises
     /// ValueError. Searches return ids as int64, so an id below 0 or of 2^63 or more raises OverflowError. While the

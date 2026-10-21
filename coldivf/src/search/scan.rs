@@ -12,7 +12,7 @@ use crate::quantization::rabitq::{
 };
 use crate::quantization::sq4::QueryS32;
 use crate::update::delta::Marks;
-use crate::update::view::Group;
+use crate::update::view::{ClusterGroups, Group};
 use crate::update::{Delta, Seen};
 use crate::{Anchor, LeafId};
 
@@ -185,12 +185,21 @@ pub(crate) struct Pending<'a> {
     pub(crate) lanes: &'a Cell<[u64; 3]>,
 }
 
-impl Pending<'_> {
-    /// Asks the CPU to bring every cache line of cluster `leaf`'s inserts into its caches, those that a scan reads, so
-    /// that their memory comes in before the scan needs it, eg. while it scans the cluster before.
+impl<'a> Pending<'a> {
+    /// Cluster `leaf`'s inserts, from one lookup.
     #[inline]
-    pub(crate) fn touch(&self, leaf: LeafId) {
-        for g in self.delta.groups(leaf) {
+    pub(crate) fn of(&self, leaf: LeafId) -> ClusterGroups<'a> {
+        self.delta.groups(leaf)
+    }
+
+    /// Cluster `leaf`'s inserts, once the CPU was asked to bring every cache line of them that a scan reads into its
+    /// caches, so that their memory comes in before the scan needs it, eg. while it scans the cluster before. The scan
+    /// of `leaf` then takes them from here instead of looking them up again.
+    #[inline]
+    pub(crate) fn touch(&self, leaf: LeafId) -> ClusterGroups<'a> {
+        let groups = self.of(leaf);
+
+        for g in groups.iter() {
             match g.len() <= FEW {
                 true => {
                     let (codes, factors) = g.lanes();
@@ -200,12 +209,14 @@ impl Pending<'_> {
                 false => kernels::prefetch(g.blocks()),
             }
         }
+
+        groups
     }
 }
 
-/// The same, then the cluster's inserts in `pending`, which are measured from the same center, so the query's
-/// distance to it serves both. A cluster whose own blocks hold no vector may still hold inserts. Every search path
-/// scans its clusters here.
+/// The same, then the cluster's inserts, which `pending` holds with the pending inserts they belong to, and which are
+/// measured from the same center, so the query's distance to it serves both. A cluster whose own blocks hold no
+/// vector may still hold inserts. Every search path scans its clusters here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_probed(
     view: &View,
@@ -213,12 +224,12 @@ pub(crate) fn scan_probed(
     blocks: &[u8],
     query: &mut QueryLut,
     q32: &QueryS32,
-    pending: Option<Pending>,
+    pending: Option<(Pending, ClusterGroups)>,
     candidates: &mut Candidates,
     survivors: &mut [Candidate; BLOCK],
 ) {
     let list = view.lists[leaf as usize];
-    let inserts = pending.filter(|p| p.delta.groups(leaf).next().is_some());
+    let inserts = pending.filter(|(_, groups)| !groups.is_empty());
 
     if list.count == 0 && inserts.is_none() {
         return;
@@ -241,30 +252,32 @@ pub(crate) fn scan_probed(
         );
     }
 
-    if let Some(p) = pending {
+    if let Some((p, _)) = pending {
         let mut lanes = p.lanes.get();
         lanes[0] += list.count as u64;
         p.lanes.set(lanes);
     }
 
-    if let Some(p) = inserts {
-        scan_groups(view.tier, leaf, query, p, 1, candidates, survivors);
+    if let Some((p, groups)) = inserts {
+        scan_groups(view.tier, groups, query, p, 1, candidates, survivors);
     }
 }
 
-/// Scans only the pending inserts of cluster `leaf`, in `pending`, eg. of a cluster that the route ranks just past the
-/// ones a search reads, whose file vectors it skips. For codes measured from the cluster's center, it first sets the
-/// query's t and t2 from its distance to that center, from `q32`, when the cluster holds an insert.
+/// Scans only the pending inserts of cluster `leaf`, `groups` of `pending`, eg. of a cluster that the route ranks just
+/// past the ones a search reads, whose file vectors it skips. For codes measured from the cluster's center, it first
+/// sets the query's t and t2 from its distance to that center, from `q32`, when the cluster holds an insert.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_inserts(
     view: &View,
     leaf: LeafId,
     query: &mut QueryLut,
     q32: &QueryS32,
     pending: Pending,
+    groups: ClusterGroups,
     candidates: &mut Candidates,
     survivors: &mut [Candidate; BLOCK],
 ) {
-    if pending.delta.groups(leaf).next().is_none() {
+    if groups.is_empty() {
         return;
     }
 
@@ -272,27 +285,28 @@ pub(crate) fn scan_inserts(
         query.set_anchor(view.centers.distance2(view.tier, leaf, q32));
     }
 
-    scan_groups(view.tier, leaf, query, pending, 2, candidates, survivors);
+    scan_groups(view.tier, groups, query, pending, 2, candidates, survivors);
 }
 
-/// Scans every group of cluster `leaf`'s pending inserts with the query as it is set, and counts them in lane counter
-/// `counter` of `p`. It first makes the query's bit planes when a group is small enough to score one by one.
+/// Scans every group of one cluster's pending inserts, `groups` of `p`, with the query as it is set, and counts them in
+/// lane counter `counter` of `p`. It first makes the query's bit planes when a group is small enough to score one by
+/// one.
 fn scan_groups(
     tier: Tier,
-    leaf: LeafId,
+    groups: ClusterGroups,
     query: &mut QueryLut,
     p: Pending,
     counter: usize,
     candidates: &mut Candidates,
     survivors: &mut [Candidate; BLOCK],
 ) {
-    if p.delta.groups(leaf).any(|g| g.len() <= FEW) {
+    if groups.iter().any(|g| g.len() <= FEW) {
         query.make_planes();
     }
 
     let mut lanes = p.lanes.get();
 
-    for g in p.delta.groups(leaf) {
+    for g in groups.iter() {
         lanes[counter] += g.len() as u64;
         scan_group(tier, g, p.first, query, p.delta, p.seen, candidates, survivors);
     }

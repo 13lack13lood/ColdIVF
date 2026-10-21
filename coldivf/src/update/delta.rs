@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use super::log::{self, NONE, Record, Version};
-use super::view::{Group, Groups};
+use super::view::{ClusterGroups, Groups};
 use crate::format::{Layout, Part};
 use crate::io::{self, Span};
 use crate::quantization::rabitq::{BLOCK, Factors, code_bytes};
@@ -210,7 +210,7 @@ impl Delta {
     }
 
     /// The groups of cluster `list`'s inserts, for a scan of the cluster.
-    pub(crate) fn groups(&self, list: u32) -> impl Iterator<Item = Group<'_>> {
+    pub(crate) fn groups(&self, list: u32) -> ClusterGroups<'_> {
         self.groups.of(list)
     }
 

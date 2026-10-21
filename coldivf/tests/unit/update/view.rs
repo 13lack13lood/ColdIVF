@@ -31,7 +31,7 @@ fn unpacked(groups: &Groups, list: u32) -> Vec<(u32, Vec<u8>, Factors)> {
     let (size, mut bits) = (block_bytes(d_pad), vec![0u8; code_bytes(d_pad)]);
     let mut out = Vec::new();
 
-    for g in groups.of(list) {
+    for g in groups.of(list).iter() {
         assert_eq!(g.blocks().len(), g.len().div_ceil(BLOCK) * size);
         for j in 0..g.len() {
             let block = &g.blocks()[j / BLOCK * size..(j / BLOCK + 1) * size];

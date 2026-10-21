@@ -591,9 +591,9 @@ impl Inner {
     }
 
     /// Writes the `nprobe` clusters nearest the query into `out`, nearest first, keeping only those within `reach`.
-    /// When the index has pending inserts, `ctx` keeps the clusters ranked after those, up to the `PENDING_LISTS`
-    /// nearest, whose inserts a search of what is fetched scans too. It starts a new trace, which a fetch and the
-    /// search of what it fetched then add to.
+    /// When the index has pending inserts, `ctx` keeps the clusters ranked after those, up to the `depth` nearest,
+    /// whose inserts a search of what is fetched scans too. It starts a new trace, which a fetch and the search of what
+    /// it fetched then add to.
     pub(crate) fn route(
         &self,
         query: &[f32],

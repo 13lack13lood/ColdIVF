@@ -271,7 +271,8 @@ impl Reads {
         let unread = |probed: &[LeafId], s: &mut Scratch| {
             for &leaf in probed.iter().filter(|&&l| view.lists[l as usize].count == 0) {
                 let (lut, q32, candidates, survivors) = (&mut s.lut, &s.q32, &mut s.candidates, &mut s.survivors);
-                scan_probed(view, leaf, &[], lut, q32, pending, candidates, survivors);
+                let here = pending.map(|p| (p, p.of(leaf)));
+                scan_probed(view, leaf, &[], lut, q32, here, candidates, survivors);
             }
         };
 
@@ -506,9 +507,14 @@ impl RowSection {
 fn scan_range(c: &Batch, i: usize, view: &View, s: &mut Scratch, pending: Option<Pending>) {
     let end = c.ranges.get(i + 1).map_or(c.spans.len(), |r| r.tag);
 
+    // The inserts of the cluster that comes next in this range, which the touch before its scan looked up.
+    let mut ahead = None;
+
     for j in c.ranges[i].tag..end {
+        let here = pending.map(|p| (p, ahead.take().unwrap_or_else(|| p.of(c.keys[j]))));
         if let (Some(p), Some(&next)) = (pending, c.keys.get(j + 1)) {
-            p.touch(next);
+            let groups = p.touch(next);
+            ahead = (j + 1 < end).then_some(groups);
         }
         let blocks = c.arena.part(c.at[j], c.spans[j].len);
         scan_probed(
@@ -517,7 +523,7 @@ fn scan_range(c: &Batch, i: usize, view: &View, s: &mut Scratch, pending: Option
             blocks,
             &mut s.lut,
             &s.q32,
-            pending,
+            here,
             &mut s.candidates,
             &mut s.survivors,
         );

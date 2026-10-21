@@ -4,7 +4,7 @@
 //!    reach.
 //! 2. Scan: estimate the distance to every vector in those clusters, 32 at a time, and keep the best candidates. Codes
 //!    measured from the clusters' centers first take the query's distance to each center. The pending inserts of the
-//!    clusters ranked next, up to the 256 nearest, are scanned too.
+//!    clusters ranked next, up to `PENDING_DEPTH` of `nprobe`, are scanned too.
 //! 3. Rerank: rescore the candidates with their 8-bit rows and return the top `k`.
 //!
 //! Candidates and results are ordered by score and then internal id, so they never depend on the order of the scan.
@@ -24,6 +24,7 @@ use crate::quantization::padded_dim;
 use crate::quantization::rabitq::{BLOCK, QueryLut, block_bytes};
 use crate::quantization::rotation::Rotation;
 use crate::quantization::sq4::{QueryS8, QueryS32};
+use crate::update::view::ClusterGroups;
 use crate::{Anchor, Hit, LeafId, Limits, Metric, SearchCtx, SearchParams};
 use candidates::{Candidate, Candidates};
 use rerank::rerank;
@@ -35,17 +36,21 @@ use scan::{Hides, scan_inserts, scan_probed};
 /// adding two of them can't overflow.
 pub(crate) const LIMIT: f64 = f32::MAX as f64 / 4.0;
 
-/// The clusters nearest the query whose pending inserts a search scans, though it reads the file's vectors of only
-/// `nprobe` of them when that is fewer. An insert joins its nearest cluster, which a query near the insert may rank
-/// just past the clusters it reads. Scanning the inserts of the next clusters finds most of those, for far less than a
-/// scan of every insert.
-pub(crate) const PENDING_LISTS: usize = 256;
+/// The share of `nprobe`, as a fraction, of the clusters nearest the query that a search scans the pending inserts
+/// of, though it reads the file's vectors of only `nprobe` of them. An insert joins its nearest cluster, which a query
+/// near the insert may rank just past the clusters it reads. Scanning the inserts of the next clusters finds most of
+/// those, for far less than a scan of every insert. A few more clusters' inserts cost less than the higher `nprobe`
+/// that the same recall would need otherwise, but many more cost more than it: on Cohere 1M with 100K pending inserts,
+/// uniform or drifting, 5/4 of `nprobe` reached recall@10 0.90 and 0.95 within 3% of the fastest share tried, from 1 to
+/// 4 times `nprobe`.
+pub(crate) const PENDING_DEPTH: (usize, usize) = (5, 4);
 
-/// The number of clusters a search routes to. It is `nprobe`, or `PENDING_LISTS` when that is more and the index has
+/// The number of clusters a search routes to: `nprobe`, or `PENDING_DEPTH` of it, rounded up, when the index has
 /// pending inserts.
 pub(crate) fn depth(nprobe: usize, pending: bool) -> usize {
+    let (num, den) = PENDING_DEPTH;
     match pending {
-        true => nprobe.max(PENDING_LISTS),
+        true => nprobe.saturating_mul(num).div_ceil(den),
         false => nprobe,
     }
 }
@@ -131,7 +136,7 @@ pub(crate) fn run<'a>(
 
 /// Routes the query that `s` holds and scans the `params.nprobe` nearest clusters, or those of them within
 /// `params.reach`, reading their blocks in place from `blocks`. With `pending`, it then scans the inserts of the
-/// clusters ranked after those, up to the `PENDING_LISTS` nearest. It leaves the best `max(params.rerank, params.k)`
+/// clusters ranked after those, up to the `depth` nearest. It leaves the best `max(params.rerank, params.k)`
 /// candidates in `s`, and the clusters whose blocks it read in `s.routes`.
 pub(crate) fn scan_in_place(
     view: &View,
@@ -187,14 +192,17 @@ pub(crate) fn scan_lists(
 ) {
     let size = block_bytes(padded_dim(view.dim));
     let mut leaves = leaves.peekable();
+    // The inserts of the cluster that comes next, which the touch before its scan looked up.
+    let mut ahead: Option<ClusterGroups> = None;
 
     while let Some(leaf) = leaves.next() {
+        let here = pending.map(|p| (p, ahead.take().unwrap_or_else(|| p.of(leaf))));
         if let (Some(p), Some(&next)) = (pending, leaves.peek()) {
-            p.touch(next);
+            ahead = Some(p.touch(next));
         }
         let list = view.lists[leaf as usize];
         let blocks = &blocks[list.offset..list.offset + list.count.div_ceil(BLOCK) * size];
-        scan_probed(view, leaf, blocks, lut, q32, pending, candidates, survivors);
+        scan_probed(view, leaf, blocks, lut, q32, here, candidates, survivors);
     }
 }
 
@@ -211,12 +219,14 @@ pub(crate) fn scan_next(
     survivors: &mut [Candidate; BLOCK],
 ) {
     let mut leaves = leaves.peekable();
+    let mut ahead: Option<ClusterGroups> = None;
 
     while let Some(leaf) = leaves.next() {
+        let here = ahead.take().unwrap_or_else(|| pending.of(leaf));
         if let Some(&next) = leaves.peek() {
-            pending.touch(next);
+            ahead = Some(pending.touch(next));
         }
-        scan_inserts(view, leaf, lut, q32, pending, candidates, survivors);
+        scan_inserts(view, leaf, lut, q32, pending, here, candidates, survivors);
     }
 }
 
@@ -362,8 +372,8 @@ impl Scratch {
             q32: QueryS32::new(dim),
             dots: vec![0; nlist],
             chunk: vec![0; CHUNK],
-            best: Candidates::new(limits.max_nprobe.max(PENDING_LISTS)),
-            routes: Vec::with_capacity(nlist.max(limits.max_nprobe).max(PENDING_LISTS)),
+            best: Candidates::new(depth(limits.max_nprobe, true)),
+            routes: Vec::with_capacity(nlist.max(depth(limits.max_nprobe, true))),
             candidates: Candidates::new(keep),
             survivors: [Candidate::NONE; BLOCK],
             rescored: Vec::with_capacity(keep),
