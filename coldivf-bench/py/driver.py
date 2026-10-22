@@ -25,7 +25,7 @@ import json
 import os
 import random
 import re
-import select
+import selectors
 import shutil
 import signal
 import subprocess
@@ -1018,7 +1018,11 @@ class Child:
             if left <= 0:
                 return None
 
-            ready, _, _ = select.select([fd], [], [], left)
+            # select() takes no descriptor past FD_SETSIZE, 1,024 on macOS, and a cold trial passes that once it holds
+            # every file of an index with thousands of them open, eg. LanceDB's after its writes. A selector has no limit.
+            with selectors.DefaultSelector() as sel:
+                sel.register(fd, selectors.EVENT_READ)
+                ready = sel.select(left)
 
             if not ready:
                 return None

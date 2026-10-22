@@ -2,6 +2,7 @@ import io
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -1176,6 +1177,21 @@ class WriteBatchTest(unittest.TestCase):
         self.assertIn("warm fake flat state=s10-compact", text)
         self.assertIn("state=s10 group=main", text)
 
+
+
+class ChildTest(unittest.TestCase):
+    def test_a_child_whose_pipe_is_past_descriptor_1024_still_sends_its_events(self):
+        # A cold trial holds every file of the index open, thousands of them for LanceDB after its writes, so the
+        # child's pipe gets a descriptor past select()'s limit.
+        held = [os.open(os.devnull, os.O_RDONLY) for _ in range(1100)]
+        self.addCleanup(lambda: [os.close(fd) for fd in held])
+        log = Path(tempfile.mkdtemp()) / "child.log"
+        self.addCleanup(shutil.rmtree, log.parent)
+        code = "import json, time; time.sleep(0.1); print(json.dumps({'event': 'ready'}), flush=True)"
+        child = driver.Child([sys.executable, "-c", code], dict(os.environ), log)
+        self.addCleanup(child.proc.wait)
+        self.assertGreater(child.proc.stdout.fileno(), 1024)
+        self.assertEqual(child.event(10.0), {"event": "ready"})
 
 if __name__ == "__main__":
     unittest.main()
