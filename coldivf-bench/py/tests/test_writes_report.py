@@ -74,6 +74,13 @@ class WritesReportTest(unittest.TestCase):
         self.assertEqual(c["dead_returned_max"], 0.0)
         self.assertEqual(c["findability"]["s10"], {"inserted": 1.0, "base": 0.99, "recall10_inserted": 0.95})
 
+    def test_a_system_with_two_builds_picks_the_cheaper_build_for_each_target(self):
+        lines = wr.Lines([warm("s0", {"nprobe": 48}, 0.960, 28000.0, config="b8"),
+                          warm("s0", {"nprobe": 48}, 0.917, 13000.0, config="b4")])
+        picks = lines.system_picks(("coldivf", "python"))
+        self.assertEqual((picks[0.95][0][2], picks[0.90][0][2]), ("b8", "b4"))
+        self.assertEqual([r["build"][2] for r in wr.search_rows(lines, 0.90)], ["b4"])
+
     def test_the_drift_ladder_takes_the_place_of_the_uniform_one(self):
         lines = wr.Lines([warm("s0", HIGH, 0.961, 350.0), *[cold(s, HIGH, 9000.0) for s in ("s0", "d1", "d10")],
                           cold("fresh", HIGH, 7000.0, config="tl320-fresh"), cold("d10-fold", HIGH, 12000.0),

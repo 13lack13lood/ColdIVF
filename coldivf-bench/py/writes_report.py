@@ -102,17 +102,23 @@ class Lines:
 
     def picks(self, build: tuple) -> dict[float, dict | None]:
         """The build's setting for each target: its S0 setting of least recall at or above the target."""
+        return {t: p[1] if p is not None and p[0] == build else None for t, p in self.system_picks(build[:2]).items()}
+
+    def system_picks(self, system: tuple) -> dict[float, tuple | None]:
+        """A system's build and setting for each target, over every build of the system: the S0 setting of least recall
+        at or above the target, eg. Paimon's 4-bit build at 0.90 and its 8-bit build at 0.95."""
         settings = {}
 
-        for x in self.of(build, "warm", state="s0", split="test", threads=1):
-            if x.get("recall10") is not None:
-                settings[h2h.key(x.get("search_params"))] = (x["recall10"], x.get("search_params") or {})
+        for b in (b for b in self.builds() if b[:2] == tuple(system)):
+            for x in self.of(b, "warm", state="s0", split="test", threads=1):
+                if x.get("recall10") is not None:
+                    settings[(b, h2h.key(x.get("search_params")))] = (x["recall10"], b, x.get("search_params") or {})
 
         out = {}
 
         for t in TARGETS:
             reach = [v for v in settings.values() if v[0] >= t]
-            out[t] = min(reach, key=lambda v: v[0])[1] if reach else None
+            out[t] = min(reach, key=lambda v: v[0])[1:] if reach else None
 
         return out
 
