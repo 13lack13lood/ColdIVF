@@ -22,8 +22,8 @@ use crate::quantization::{padded_dim, sq8};
 /// A stamp that hides nothing.
 const NEVER: u64 = u64::MAX;
 
-/// Up to 32 pending inserts in place order. Snapshots share pieces, and a piece that gains an insert is copied, but
-/// every copy shares the stamps that hide its inserts.
+/// Up to 32 pending inserts in place order. Snapshots share pieces, and a piece that gains an insert while a snapshot
+/// holds it is copied, but every copy shares the stamps that hide its inserts.
 struct Piece {
     codes: Vec<u8>,
     factors: Vec<Factors>,
@@ -63,6 +63,15 @@ impl Piece {
         p.seqs.push(seq);
         p.lists.push(list);
         p
+    }
+
+    /// Adds one more insert in place.
+    fn push(&mut self, code: &[u8], factors: Factors, row: &[u8], seq: u64, list: u32) {
+        self.codes.extend_from_slice(code);
+        self.factors.push(factors);
+        self.rows.extend_from_slice(row);
+        self.seqs.push(seq);
+        self.lists.push(list);
     }
 }
 
@@ -558,7 +567,8 @@ impl Applier {
         Ok(())
     }
 
-    /// Adds an insert at the next place.
+    /// Adds an insert at the next place. The last piece takes it in place when no snapshot holds that piece, eg. in a
+    /// replay, which takes none until it ends, and otherwise a copy of it does, so each snapshot keeps the piece it saw.
     fn push(&mut self, id: u64, list: u32, code: &[u8], factors: Factors, row: &[u8], hold: bool) {
         let place = self.len as u32;
         let seq = self.next;
@@ -566,8 +576,12 @@ impl Applier {
             Some(p) if p.len() < BLOCK => self.recent.pop(),
             _ => None,
         };
-        let piece = last.unwrap_or_else(|| Arc::new(Piece::new()));
-        self.recent.push(Arc::new(piece.with(code, factors, row, seq, list)));
+        let mut piece = last.unwrap_or_else(|| Arc::new(Piece::new()));
+        match Arc::get_mut(&mut piece) {
+            Some(p) => p.push(code, factors, row, seq, list),
+            None => piece = Arc::new(piece.with(code, factors, row, seq, list)),
+        }
+        self.recent.push(piece);
         self.len += 1;
         self.latest.insert(id, place);
 

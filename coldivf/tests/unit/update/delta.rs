@@ -97,6 +97,36 @@ fn a_snapshot_keeps_what_it_saw_whatever_comes_later() {
 }
 
 #[test]
+fn a_snapshot_keeps_the_pieces_it_saw_while_later_inserts_fill_them() {
+    let (mut a, _memory, _path) = applier("pieces.coldivf", two());
+    let add = |a: &mut Applier, id: u64| {
+        let hint = a.locate(id).unwrap();
+        let record = insert(a, id, (id % 6) as u32, hint);
+        a.apply(&record, false).unwrap();
+    };
+    let saw = |s: &Delta| {
+        (0..s.len())
+            .map(|i| (s.row(i).to_vec(), s.lane(i).0.to_vec()))
+            .collect::<Vec<_>>()
+    };
+
+    // The snapshot holds a piece of 5 inserts. The next 27 fill a copy of it in place, and the 8 after them a new one.
+    for id in 1000..1005 {
+        add(&mut a, id);
+    }
+    let s = a.snapshot();
+    let before = saw(&s);
+    for id in 1005..1040 {
+        add(&mut a, id);
+    }
+    let later = a.snapshot();
+    assert_eq!((s.len(), later.len()), (5, 40));
+    assert_eq!(saw(&s), before);
+    assert_eq!(saw(&later)[..5], before[..]);
+    assert!((0..40).all(|i| later.lane(i).0[0] == (1000 + i) as u8));
+}
+
+#[test]
 fn an_upsert_hides_the_old_version_exactly_when_the_new_one_shows() {
     let (mut a, memory, _path) = applier("upsert.coldivf", two());
     let r5 = row_of(&memory, 5);
