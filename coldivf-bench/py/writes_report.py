@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import statistics
 import sys
 from collections import defaultdict
@@ -23,9 +24,13 @@ import headtohead as h2h
 SUITE = Path(__file__).resolve().parent.parent / "suites" / "bench-1m-writes.toml"
 TARGETS = (0.95, 0.90)
 REFERENCE = ("coldivf", "python")
-# The states of the search tables, in their order, and those the maintenance table sets beside each action.
-STATES = ("s0", "s1", "s5", "s10", "s10i", "fresh")
 FRESH = ("fresh", "fresh-i")
+# A state of the joint ladder, eg. s5 or d5 of the drift stream, the inserts-only ladder, eg. s5i, the policy pass, eg.
+# s10p, and the state that a maintenance action left, eg. s10-fold.
+JOINT = re.compile(r"[sd](\d+)")
+INSERTS = re.compile(r"[sd](\d+)i")
+POLICY = re.compile(r"[sd](\d+)p")
+AFTER = re.compile(r"[sd](\d+)-(.+)")
 # Names that the head-to-head's tables don't have, by system, variant and build.
 NAMES = {("turbovec", "idmap", "b4-cal"): "turbovec 4-bit, calibrated"}
 
@@ -153,13 +158,24 @@ def search_rows(lines: Lines, target: float) -> list[dict]:
 
 
 def state_order(state: str) -> tuple:
-    """S0, the joint ladder, the inserts-only ladder, S10p, the states after maintenance, then the fresh builds."""
-    ladder = ["s0", "s1", "s5", "s10", "s1i", "s5i", "s10i", "s10p"]
+    """S0 and the joint ladder, the inserts-only ladder, the policy pass, the states after maintenance, then the fresh
+    builds."""
+    for rank, pattern in enumerate((JOINT, INSERTS, POLICY)):
+        if found := pattern.fullmatch(state):
+            return (rank, int(found[1]), "")
 
-    if state in ladder:
-        return (0, ladder.index(state), "")
+    if found := AFTER.fullmatch(state):
+        return (3, int(found[1]), found[2])
 
-    return (2, 0, state) if state in FRESH else (1, 0, state)
+    return (5, 0, state) if state in FRESH else (4, 0, state)
+
+
+def columns(rows: list[dict]) -> list[str]:
+    """The search tables' states: S0 and the joint ladder, the inserts-only ladder's last state and the fresh build."""
+    states = {s for r in rows for s in (*r["cold"], *r["warm"])}
+    joint = sorted((s for s in states if JOINT.fullmatch(s)), key=state_order)
+    inserts = sorted((s for s in states if INSERTS.fullmatch(s)), key=state_order)
+    return joint + inserts[-1:] + [s for s in ("fresh",) if s in states]
 
 
 def write_rows(lines: Lines) -> list[dict]:
@@ -179,7 +195,10 @@ def write_rows(lines: Lines) -> list[dict]:
                                                       "logical_bytes_written", "disk_bytes_written")}
                          for op, x in ops.items() if x is not None}
 
-        stream = {op: lines.write(b, "stream", op, state_from="s0", state_to="s1") for op in ("insert", "delete")}
+        firsts = sorted({x.get("state_to") for x in lines.of(b, "write", mode="stream", state_from="s0")
+                         if JOINT.fullmatch(x.get("state_to") or "")}, key=state_order)
+        stream = {op: lines.write(b, "stream", op, state_from="s0", state_to=firsts[0]) if firsts else None
+                  for op in ("insert", "delete")}
         rows.append({"build": b, "label": name_of(*b), "latency": at,
                      "stream": {op: {k: x.get(k) for k in ("p50_us", "p99_us", "rows_per_s", "durability", "batch")}
                                 for op, x in stream.items() if x is not None}})
@@ -197,20 +216,22 @@ def maintenance_rows(lines: Lines) -> list[dict]:
         target = next((t for t in TARGETS if picks[t] is not None), None)
 
         for x in lines.maintains(b):
-            if x.get("state_from") != "s10":
+            start, after = x.get("state_from") or "", x.get("state_to") or ""
+
+            if not JOINT.fullmatch(start) or after != f"{start}-{x.get('action')}":
                 continue
 
-            after = x.get("state_to")
             params = picks[target] if target is not None else None
             cells = {s: {"cold": cold_cell(lines.cold(b, s, params)) if params is not None and lines.cold(b, s, params)
                          else None, "warm": warm_cell(lines.warm(b, s, params)) if params is not None else {}}
-                     for s in ("s10", after, "fresh")}
+                     for s in (start, after, "fresh")}
             rows.append({"build": b, "label": name_of(*b), "action": x.get("action"), "target": target,
                          "setting_text": h2h.setting_text(params) if params is not None else None,
                          "seconds": x.get("seconds"), "cpu_seconds": x.get("cpu_seconds"),
                          "threads": x.get("threads"), "peak_footprint": x.get("peak_footprint"),
                          "bytes_read": x.get("bytes_read"), "bytes_written": x.get("bytes_written"),
-                         "report": (x.get("extra") or {}).get("report"), "state": after, "cells": cells})
+                         "report": (x.get("extra") or {}).get("report"), "start": start, "state": after,
+                         "cells": cells})
 
     return rows
 
@@ -220,9 +241,10 @@ def policy_rows(lines: Lines) -> list[dict]:
     rows = []
 
     for b in lines.builds():
-        runs = [x for x in lines.maintains(b) if x.get("state_from") == "s10p"]
-        stream = [x for x in lines.of(b, "write", mode="stream", status="ok", state_to="s10p")
-                  if x.get("op") in ("insert", "delete") and x.get("rows_per_s")]
+        runs = [x for x in lines.maintains(b) if POLICY.fullmatch(x.get("state_from") or "")]
+        policy = {x.get("state_from") for x in runs}
+        stream = [x for x in lines.of(b, "write", mode="stream", status="ok")
+                  if x.get("state_to") in policy and x.get("op") in ("insert", "delete") and x.get("rows_per_s")]
 
         if not runs or not stream:
             continue
@@ -308,22 +330,24 @@ def us(value: float | None) -> str:
 
 
 def search_tables(rows: list[dict], target: str) -> list[str]:
-    head = " | ".join(s.upper() if s != "fresh" else "Fresh Build" for s in STATES)
+    states = columns(rows)
+    last = next((s for s in reversed(states) if JOINT.fullmatch(s)), "s0")
+    head = " | ".join(s.upper() if s != "fresh" else "Fresh Build" for s in states)
     out = [f"**Recall@10 {target}, cold p50 in ms, then recall@10**", "",
-           f"| System | Setting | {head} | S10 Against S0 |", "|---|---|" + "---|" * len(STATES) + "---|"]
+           f"| System | Setting | {head} | {last.upper()} Against S0 |", "|---|---|" + "---|" * len(states) + "---|"]
 
     for r in rows:
-        cells = [r["cold"].get(s) for s in STATES]
-        text = [f"{ms(c['p50_us'])} ({h2h.fmt(warm_recall(r, s), 3)})" if c else "-" for c, s in zip(cells, STATES)]
-        s0, s10 = r["cold"].get("s0"), r["cold"].get("s10")
+        cells = [r["cold"].get(s) for s in states]
+        text = [f"{ms(c['p50_us'])} ({h2h.fmt(warm_recall(r, s), 3)})" if c else "-" for c, s in zip(cells, states)]
+        s0, end = r["cold"].get("s0"), r["cold"].get(last)
         out.append(f"| {r['label']} | {r['setting_text']} | {' | '.join(text)} "
-                   f"| {ratio((s10 or {}).get('p50_us'), (s0 or {}).get('p50_us'))} |")
+                   f"| {ratio((end or {}).get('p50_us'), (s0 or {}).get('p50_us'))} |")
 
     out += ["", f"**Recall@10 {target}, warm p50 in ms, then recall@10**", "",
-            f"| System | Setting | {head} |", "|---|---|" + "---|" * len(STATES)]
+            f"| System | Setting | {head} |", "|---|---|" + "---|" * len(states)]
 
     for r in rows:
-        cells = [r["warm"].get(s) for s in STATES]
+        cells = [r["warm"].get(s) for s in states]
         text = [f"{ms(c['p50_us'])} ({h2h.fmt(c.get('recall10'), 3)}){' invalid' if c.get('invalid') else ''}"
                 if c else "-" for c in cells]
         out.append(f"| {r['label']} | {r['setting_text']} | {' | '.join(text)} |")
@@ -338,12 +362,12 @@ def warm_recall(row: dict, state: str) -> float | None:
 
 
 def maintenance_table(rows: list[dict]) -> list[str]:
-    out = ["| System | Action | Threads | Time | Processor Time | Peak Memory | Bytes Written | Cold p50 at S10, After "
-           "and Fresh | Warm p50 at S10, After and Fresh | Recall@10 at S10, After and Fresh |",
+    out = ["| System | Action | Threads | Time | Processor Time | Peak Memory | Bytes Written | Cold p50 Before, After "
+           "and Fresh | Warm p50 Before, After and Fresh | Recall@10 Before, After and Fresh |",
            "|---|---|---|---|---|---|---|---|---|---|"]
 
     for r in rows:
-        trio = [r["cells"][s] for s in ("s10", r["state"], "fresh")]
+        trio = [r["cells"][s] for s in (r["start"], r["state"], "fresh")]
         cold = " / ".join(ms((c["cold"] or {}).get("p50_us")) for c in trio)
         warm = " / ".join(ms((c["warm"] or {}).get("p50_us")) for c in trio)
         recall = " / ".join(h2h.fmt((c["warm"] or {}).get("recall10"), 3) for c in trio)

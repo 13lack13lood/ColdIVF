@@ -74,6 +74,17 @@ class WritesReportTest(unittest.TestCase):
         self.assertEqual(c["dead_returned_max"], 0.0)
         self.assertEqual(c["findability"]["s10"], {"inserted": 1.0, "base": 0.99, "recall10_inserted": 0.95})
 
+    def test_the_drift_ladder_takes_the_place_of_the_uniform_one(self):
+        lines = wr.Lines([warm("s0", HIGH, 0.961, 350.0), *[cold(s, HIGH, 9000.0) for s in ("s0", "d1", "d10")],
+                          cold("fresh", HIGH, 7000.0, config="tl320-fresh"), cold("d10-fold", HIGH, 12000.0),
+                          line("maintain", action="fold", state_from="d10", state_to="d10-fold", seconds=1.0),
+                          line("write", mode="stream", op="insert", state_from="s0", state_to="d1", rows_per_s=9.0)])
+        rows = wr.search_rows(lines, 0.95)
+        self.assertEqual(wr.columns(rows), ["s0", "d1", "d10", "fresh"])
+        self.assertIn("D10 Against S0", "\n".join(wr.search_tables(rows, "0.95")))
+        self.assertEqual(wr.maintenance_rows(lines)[0]["cells"]["d10-fold"]["cold"]["p50_us"], 12000.0)
+        self.assertEqual(wr.write_rows(lines)[0]["stream"]["insert"]["rows_per_s"], 9.0)
+
     def test_the_markdown_has_a_row_for_each_build(self):
         text = wr.markdown(wr.tables(wr.Lines(self.lines())))
         self.assertIn("| ColdIVF | process | 64 µs | 80 µs |", text)
