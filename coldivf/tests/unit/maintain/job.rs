@@ -572,6 +572,22 @@ fn a_search_notes_when_it_ran_in_the_word_that_every_process_maps() {
 }
 
 #[test]
+fn a_word_stored_before_the_machine_started_is_cleared_when_mapped_and_an_earlier_time_kept() {
+    // The clock starts again from zero when the machine starts, so a word that a search stored before then reads as a
+    // time to come, which would hold every job back until the clock passed it.
+    for (offset, kept) in [(3_600_000_000_000i64, false), (-5_000_000_000, true)] {
+        let dir = Folder::new("job-activity-boot");
+        let at = io::now_ns().saturating_add_signed(offset);
+        fs::write(dir.0.join("activity"), at.to_le_bytes()).unwrap();
+        let activity = Activity::open(&dir.0);
+        let word = fs::read(dir.0.join("activity")).unwrap();
+        let stored = u64::from_le_bytes(word[..8].try_into().unwrap());
+        let want = if kept { at } else { 0 };
+        assert_eq!((activity.last(), stored), (want, want), "offset {offset}");
+    }
+}
+
+#[test]
 fn a_warm_index_is_warm_after_a_commit_with_its_new_codes_in_memory_and_a_cold_one_stays_cold() {
     for warm in [true, false] {
         let dir = Folder::new(&format!("job-warm-{warm}"));

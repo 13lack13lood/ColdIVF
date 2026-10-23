@@ -665,9 +665,24 @@ impl Activity {
             && map.len() >= 8
         {
             let _ = self.map.set(map);
+            self.forget_earlier_boot();
         }
 
         self.map.get().is_some()
+    }
+
+    /// Clears the shared word if a search stored it before the machine last started. `now_ns` starts again from zero
+    /// then, so the word reads as a time to come, which would hold every job back until the clock passed it, and
+    /// `note` would never store a later time. A time that a process stored since is never later than one read after
+    /// it, and the 1 s of slack covers clocks that cores read a little apart.
+    fn forget_earlier_boot(&self) {
+        if let Some(word) = self.mapped() {
+            let stored = word.load(Ordering::Relaxed);
+
+            if stored > now_ns().saturating_add(1_000_000_000) {
+                let _ = word.compare_exchange(stored, 0, Ordering::Relaxed, Ordering::Relaxed);
+            }
+        }
     }
 
     /// The shared word, once it is mapped.
