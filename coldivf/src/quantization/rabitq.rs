@@ -393,11 +393,6 @@ pub(crate) fn code_sum(bits: &[u8], qu: &[u8]) -> u32 {
         .sum()
 }
 
-/// The 4-bit group g of a code.
-fn group(bits: &[u8], g: usize) -> u8 {
-    (bits[g / 2] >> (4 * (g % 2))) & 0x0f
-}
-
 /// Packs up to 32 codes and their factors into one block. `codes` holds the codes back to back. Lanes past the last
 /// code are unused. Their bits are 0 and their factors are `Factors::EMPTY`.
 pub(crate) fn pack_block(codes: &[u8], factors: &[Factors], d_pad: usize, out: &mut [u8]) {
@@ -406,10 +401,12 @@ pub(crate) fn pack_block(codes: &[u8], factors: &[Factors], d_pad: usize, out: &
 
     out.fill(0);
 
+    // Byte i of a code holds its groups 2i and 2i + 1, whose 16 lanes take bytes 32i to 32i + 31 of the block.
     for (lane, code) in codes.chunks_exact(cb).enumerate() {
-        let shift = if lane < 16 { 0 } else { 4 };
-        for g in 0..d_pad / 4 {
-            out[16 * g + lane % 16] |= group(code, g) << shift;
+        let (shift, at) = (if lane < 16 { 0 } else { 4 }, lane % 16);
+        for (pair, &byte) in out[..4 * d_pad].as_chunks_mut::<32>().0.iter_mut().zip(code) {
+            pair[at] |= (byte & 0x0f) << shift;
+            pair[16 + at] |= (byte >> 4) << shift;
         }
     }
 

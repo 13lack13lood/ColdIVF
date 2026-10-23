@@ -173,63 +173,64 @@ fn a_wrong_hint_costs_a_lookup_and_never_visibility() {
 
 #[test]
 fn a_replay_packs_its_inserts_once_and_shows_what_one_by_one_shows() {
-    let (mut one, memory, _path) = applier("replay.coldivf", two());
-    let mut records = Vec::new();
+    // A version 1 replay finds the rows its records look up in one pass, and so does a version 2 one past
+    // `FEW_CHECKS` records, which checks every hint against the ids it read.
+    for (version, n) in [(Version::One, 300), (two(), 300), (two(), FEW_CHECKS as u64 + 200)] {
+        let (mut one, memory, _path) = applier(&format!("replay-{}-{n}.coldivf", version.base()), version);
+        let mut records = Vec::new();
 
-    for i in 0..300u64 {
-        let id = if i % 7 == 0 { i % 600 } else { 1000 + i };
-        let hint = one.locate(id).unwrap();
-        let record = match i % 11 {
-            5 => delete(&one, id, hint),
-            _ => insert(&one, id, (i % 6) as u32, hint),
-        };
-        one.apply(&record, false).unwrap();
-        records.push(record);
+        for i in 0..n {
+            let id = if i % 7 == 0 { i % 600 } else { 1000 + i };
+            let hint = one.locate(id).unwrap();
+            let record = match i % 11 {
+                5 => delete(&one, id, hint),
+                _ => insert(&one, id, (i % 6) as u32, hint),
+            };
+            one.apply(&record, false).unwrap();
+            records.push(record);
+        }
+
+        let mut bytes: Vec<u8> = records.iter().flat_map(|r| log::frame(r)).collect();
+        let layout = crate::index::Inner::open(&_path).unwrap().layout().clone();
+        let mut replayed = Applier::new(&layout, version, &_path);
+        replayed.replay(&bytes, 50).unwrap();
+        let (a, b) = (one.snapshot(), replayed.snapshot());
+        assert_eq!((a.len(), a.next()), (b.len(), b.next()));
+        assert_eq!(b.log_len(), 50 + bytes.len());
+        // The open keeps none of the ids it read for the replay.
+        assert!(replayed.ids.is_none() && replayed.found.is_none());
+
+        for r in 0..600 {
+            assert_eq!(a.row_visible(r, a.seen()), b.row_visible(r, b.seen()), "row {r}");
+        }
+
+        for i in 0..a.len() {
+            assert_eq!(
+                a.insert_visible(i, a.seen()),
+                b.insert_visible(i, b.seen()),
+                "insert {i}"
+            );
+            assert!(a.row(i) == b.row(i) && a.lane(i) == b.lane(i));
+        }
+
+        for list in 0..6 {
+            let places = |s: &Delta| {
+                s.groups(list)
+                    .iter()
+                    .flat_map(|g| (0..g.len()).map(move |j| g.place(j)))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(places(&a), places(&b), "cluster {list}");
+        }
+
+        // A damaged middle record fails a version 2 replay, which keeps the records before it.
+        if version != Version::One {
+            bytes[8 + records[0].len() + 8 + 3] ^= 1;
+            let mut damaged = Applier::new(&layout, version, &_path);
+            assert!(damaged.replay(&bytes, 0).is_err());
+        }
+        let _ = memory;
     }
-
-    let mut bytes: Vec<u8> = records.iter().flat_map(|r| log::frame(r)).collect();
-    let mut replayed = Applier::new(
-        &crate::index::Inner::open(&_path).unwrap().layout().clone(),
-        two(),
-        &_path,
-    );
-    replayed.replay(&bytes, 50).unwrap();
-    let (a, b) = (one.snapshot(), replayed.snapshot());
-    assert_eq!((a.len(), a.next()), (b.len(), b.next()));
-    assert_eq!(b.log_len(), 50 + bytes.len());
-
-    for r in 0..600 {
-        assert_eq!(a.row_visible(r, a.seen()), b.row_visible(r, b.seen()), "row {r}");
-    }
-
-    for i in 0..a.len() {
-        assert_eq!(
-            a.insert_visible(i, a.seen()),
-            b.insert_visible(i, b.seen()),
-            "insert {i}"
-        );
-        assert!(a.row(i) == b.row(i) && a.lane(i) == b.lane(i));
-    }
-
-    for list in 0..6 {
-        let places = |s: &Delta| {
-            s.groups(list)
-                .iter()
-                .flat_map(|g| (0..g.len()).map(move |j| g.place(j)))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(places(&a), places(&b), "cluster {list}");
-    }
-
-    // A damaged middle record fails a version 2 replay, which keeps the records before it.
-    bytes[8 + records[0].len() + 8 + 3] ^= 1;
-    let mut damaged = Applier::new(
-        &crate::index::Inner::open(&_path).unwrap().layout().clone(),
-        two(),
-        &_path,
-    );
-    assert!(damaged.replay(&bytes, 0).is_err());
-    let _ = memory;
 }
 
 #[test]

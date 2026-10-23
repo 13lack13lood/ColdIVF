@@ -299,6 +299,15 @@ pub(crate) fn seq_of(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.get(1..9)?.try_into().ok()?))
 }
 
+/// The id whose vector `bytes`, a record of a log of `version`, changes, or `None` for a record too short to hold one.
+pub(crate) fn id_of(bytes: &[u8], version: Version) -> Option<u64> {
+    let at = match version {
+        Version::One => 1,
+        Version::Two { .. } => 9,
+    };
+    Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+}
+
 pub(crate) fn damaged() -> Error {
     Error::new(ErrorKind::InvalidData, "a log record is damaged")
 }

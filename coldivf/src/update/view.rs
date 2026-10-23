@@ -86,6 +86,14 @@ impl Lanes {
         self.places.len()
     }
 
+    fn with_capacity(lanes: usize, cb: usize) -> Lanes {
+        Lanes {
+            codes: Vec::with_capacity(lanes * cb),
+            factors: Vec::with_capacity(lanes),
+            places: Vec::with_capacity(lanes),
+        }
+    }
+
     fn push(&mut self, code: &[u8], factors: Factors, place: u32) {
         self.codes.extend_from_slice(code);
         self.factors.push(factors);
@@ -258,13 +266,17 @@ impl Groups {
     /// The same groups with every insert of `lanes`, as (cluster, code, factors, place) in place order, and the recent
     /// ones joined to the sorted view, eg. for a replay of many records. Each new lane is packed once.
     pub(crate) fn with_many<'a>(&self, lanes: impl Iterator<Item = (u32, &'a [u8], Factors, u32)>) -> Groups {
-        let mut more: BTreeMap<u32, Lanes> = BTreeMap::new();
+        let (lanes, cb) = (lanes.collect::<Vec<_>>(), code_bytes(self.d_pad));
+        let mut counts = vec![0usize; self.sorted.spans.len()];
+        lanes.iter().for_each(|l| counts[l.0 as usize] += 1);
+        let mut by_list: Vec<Lanes> = counts.iter().map(|&n| Lanes::with_capacity(n, cb)).collect();
 
         for (list, code, factors, place) in lanes {
-            more.entry(list).or_default().push(code, factors, place);
+            by_list[list as usize].push(code, factors, place);
         }
 
-        self.rebuilt_with(more)
+        let more = by_list.into_iter().enumerate().filter(|(_, l)| l.len() > 0);
+        self.rebuilt_with(more.map(|(list, l)| (list as u32, l)).collect())
     }
 
     /// The same groups with the recent ones, then the lanes of `more`, after each cluster's inserts in the sorted
@@ -332,9 +344,16 @@ impl Groups {
                 tail.push(&bits, f, old.places[from * BLOCK + j]);
             }
 
-            tail.append(&gains);
-            tail.pack_onto(0, d_pad, &mut new.blocks);
-            new.places.extend_from_slice(&tail.places);
+            // A cluster whose blocks are all full packs its new lanes as they are.
+            let packed = match tail.len() {
+                0 => &gains,
+                _ => {
+                    tail.append(&gains);
+                    &tail
+                }
+            };
+            packed.pack_onto(0, d_pad, &mut new.blocks);
+            new.places.extend_from_slice(&packed.places);
             new.places.resize(new.places.len().next_multiple_of(BLOCK), NO_PLACE);
             new.codes.extend_from_slice(&gains.codes);
             new.factors.extend_from_slice(&gains.factors);

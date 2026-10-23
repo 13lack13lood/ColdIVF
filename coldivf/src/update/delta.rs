@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::Error;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +22,10 @@ use crate::quantization::{padded_dim, sq8};
 
 /// A stamp that hides nothing.
 const NEVER: u64 = u64::MAX;
+
+/// The most records of a replay whose hints of rows of the data file it checks one read of an id at a time. A longer
+/// replay reads the file's ids whole first, which costs about as much as that many reads.
+const FEW_CHECKS: usize = 4096;
 
 /// Up to 32 pending inserts in place order. Snapshots share pieces, and a piece that gains an insert while a snapshot
 /// holds it is copied, but every copy shares the stamps that hide its inserts.
@@ -284,11 +289,32 @@ fn piece_of<'a>(sealed: &'a [Arc<Piece>], recent: &'a [Arc<Piece>], i: usize) ->
     (piece, i % BLOCK)
 }
 
-/// The ids of a data file's rows, by row, and its rows in the order of their ids, which a change that names a row by
-/// its id looks up.
+/// The ids of a data file's rows, by row, and, once a change must find a row by its id outside a replay's rows, its rows
+/// in the order of their ids.
 struct Ids {
     by_row: Vec<u64>,
-    sorted: Vec<u32>,
+    sorted: Option<Vec<u32>>,
+}
+
+/// Hashes an id with the finalizer of SplitMix64, which spreads every bit of it over the hash at a few cycles. It
+/// defends against no chosen ids, so only a replay's own lookups use it.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        bytes.iter().for_each(|&b| self.write_u64(self.0 ^ u64::from(b)));
+    }
+
+    fn write_u64(&mut self, x: u64) {
+        let x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        let x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        self.0 = x ^ (x >> 31);
+    }
 }
 
 /// What builds a data file's snapshots: the writer, as it logs each change, or an open that reads the records another
@@ -299,11 +325,14 @@ pub(crate) struct Applier {
     nlist: usize,
     count: usize,
     /// The data file, opened the first time a change checks one of its ids, and where its ids are, which it reads
-    /// whole the first time a change must find a row by its id.
+    /// whole the first time a change must find a row by its id, or when a replay of many records starts.
     data: PathBuf,
     file: Option<File>,
     ids_at: Span,
     ids: Option<Ids>,
+    /// During a replay, the row of each id that its records look up, or `NONE` for one the file lacks, found in one
+    /// pass over the file's ids, so the replay sorts no ids.
+    found: Option<HashMap<u64, u32, BuildHasherDefault<IdHasher>>>,
     /// The latest insert of each id that has one, by place.
     latest: HashMap<u64, u32>,
     /// The next snapshot as it builds: everything but the groups, which `lanes` holds back during a replay.
@@ -332,6 +361,7 @@ impl Applier {
             file: None,
             ids_at: layout.span(Part::Ids),
             ids: None,
+            found: None,
             latest: HashMap::new(),
             next: version.base(),
             len: 0,
@@ -408,7 +438,7 @@ impl Applier {
     }
 
     /// Where the visible version of `id` is, as an internal id: an insert's, or a row's of the data file, or `NONE`.
-    /// It reads the data file's ids the first time it looks for a row.
+    /// It reads the data file's ids the first time it looks for a row, and sorts them unless a replay found the row.
     pub(crate) fn locate(&mut self, id: u64) -> Result<u32, Error> {
         if let Some(&i) = self.latest.get(&id) {
             let (piece, j) = self.piece(i as usize);
@@ -418,9 +448,14 @@ impl Applier {
             return Ok(NONE);
         }
 
-        let ids = self.ids()?;
-        let at = ids.sorted.partition_point(|&r| ids.by_row[r as usize] < id);
-        let row = ids.sorted.get(at).copied().filter(|&r| ids.by_row[r as usize] == id);
+        let row = match self.found.as_ref().and_then(|f| f.get(&id)) {
+            Some(&r) => Some(r).filter(|&r| r != NONE),
+            None => {
+                let (by_row, sorted) = self.sorted()?;
+                let at = sorted.partition_point(|&r| by_row[r as usize] < id);
+                sorted.get(at).copied().filter(|&r| by_row[r as usize] == id)
+            }
+        };
         let hidden = |r: u32| self.marks.get().is_some_and(|m| m.stamp(r) != NEVER);
 
         Ok(row.filter(|&r| !hidden(r)).unwrap_or(NONE))
@@ -447,23 +482,62 @@ impl Applier {
         Ok(u64::from_le_bytes(id))
     }
 
-    /// The data file's ids, read the first time.
-    fn ids(&mut self) -> Result<&Ids, Error> {
+    /// The data file's ids by row, read the first time.
+    fn by_row(&mut self) -> Result<&mut Ids, Error> {
         if self.ids.is_none() {
             let (mut bytes, at) = (vec![0u8; 8 * self.count], self.ids_at.offset);
             io::read_at(self.file()?, &mut bytes, at)?;
-            let by_row: Vec<u64> = bytes
+            let by_row = bytes
                 .as_chunks::<8>()
                 .0
                 .iter()
                 .map(|b| u64::from_le_bytes(*b))
                 .collect();
-            let mut sorted: Vec<u32> = (0..self.count as u32).collect();
-            sorted.sort_unstable_by_key(|&r| by_row[r as usize]);
-            self.ids = Some(Ids { by_row, sorted });
+            self.ids = Some(Ids { by_row, sorted: None });
         }
 
-        Ok(self.ids.as_ref().expect("the ids were just read"))
+        Ok(self.ids.as_mut().expect("the ids were just read"))
+    }
+
+    /// The data file's ids by row, and its rows in the order of their ids, sorted the first time.
+    fn sorted(&mut self) -> Result<(&[u64], &[u32]), Error> {
+        let ids = self.by_row()?;
+
+        if ids.sorted.is_none() {
+            let mut sorted: Vec<u32> = (0..ids.by_row.len() as u32).collect();
+            sorted.sort_unstable_by_key(|&r| ids.by_row[r as usize]);
+            ids.sorted = Some(sorted);
+        }
+
+        let ids = self.ids.as_ref().expect("the ids were just read");
+        Ok((&ids.by_row, ids.sorted.as_deref().expect("the rows were just sorted")))
+    }
+
+    /// Finds, in one pass over the data file's ids, the row of each id that the replay of `records` looks up, i.e. of
+    /// each record without the writer's lookup of what it hides, unless the ids are sorted already. The ids are read
+    /// whole, which the hints that the other records check then take too.
+    fn find_rows(&mut self, records: &[&[u8]]) -> Result<(), Error> {
+        let version = self.version;
+        let mut found: HashMap<u64, u32, BuildHasherDefault<IdHasher>> = records
+            .iter()
+            .filter(|r| !log::looked_up(r, version))
+            .filter_map(|r| log::id_of(r, version))
+            .map(|id| (id, NONE))
+            .collect();
+        let sorted = self.ids.as_ref().is_some_and(|ids| ids.sorted.is_some());
+
+        if sorted || (found.is_empty() && records.len() <= FEW_CHECKS) {
+            return Ok(());
+        }
+
+        for (row, id) in self.by_row()?.by_row.iter().enumerate() {
+            if let Some(r) = found.get_mut(id).filter(|r| **r == NONE) {
+                *r = row as u32;
+            }
+        }
+
+        self.found = Some(found).filter(|f| !f.is_empty());
+        Ok(())
     }
 
     /// Whether `hint`, a record's guess at where the visible version of `id` is, names it now. A guess of an insert
@@ -545,26 +619,35 @@ impl Applier {
     }
 
     /// Applies the records in `bytes`, which start at byte `at` of the log, holding their inserts for `snapshot`, so a
-    /// replay packs each block once. A version 1 log ends at its first record that is cut short, damaged or doesn't
-    /// fit this file, as a crash in the middle of a write leaves it. A version 2 log ends only at a damaged last frame,
-    /// and any other damage fails with `InvalidData`. Either way it keeps the records before the end or the damage.
+    /// replay packs each block once. It first finds the rows that the records look up in one pass over the data file's
+    /// ids (`find_rows`). A version 1 log ends at its first record that is cut short, damaged or doesn't fit this file,
+    /// as a crash in the middle of a write leaves it. A version 2 log ends only at a damaged last frame, and any other
+    /// damage fails with `InvalidData`. Either way it keeps the records before the end or the damage.
     pub(crate) fn replay(&mut self, bytes: &[u8], at: usize) -> Result<(), Error> {
         let (records, _) = log::records(bytes, self.version, self.dim)?;
-        let mut used = 0;
+        let reads = self.ids.is_none();
+        self.find_rows(&records)?;
+        let (mut used, mut failed) = (0, None);
 
         for record in records {
             if let Err(e) = self.apply(record, true) {
-                self.log_len = at + used;
-                return match self.version {
-                    Version::One => Ok(()),
-                    Version::Two { .. } => Err(e),
-                };
+                failed = Some(e);
+                break;
             }
             used += 8 + record.len();
         }
 
+        // An open keeps no ids that it read for the replay, and a writer reads them again at its first lookup.
+        self.found = None;
+        if reads {
+            self.ids = None;
+        }
         self.log_len = at + used;
-        Ok(())
+
+        match (failed, self.version) {
+            (Some(e), Version::Two { .. }) => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// Adds an insert at the next place. The last piece takes it in place when no snapshot holds that piece, eg. in a
