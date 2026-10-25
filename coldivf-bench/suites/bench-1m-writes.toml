@@ -762,6 +762,10 @@ adapter = "usearch_hnsw"
 [[system]]
 name = "rabitq-ivf"
 adapter = "rabitq_ivf"
+# Each add copies the whole index, and macOS malloc's cache of freed blocks kept the old copies in the footprint, which
+# grew past the 16 GB cap at 100,000 inserts in one session with memory compressing through every timed call. With the
+# cache off the process holds only its index and the copy an add makes.
+env = { MallocLargeCache = "0" }
 
   [[system.build]]
   config_id = "cp320-b5"
