@@ -25,6 +25,8 @@ SUITE = Path(__file__).resolve().parent.parent / "suites" / "bench-1m-writes.tom
 TARGETS = (0.95, 0.90)
 REFERENCE = ("coldivf", "python")
 FRESH = ("fresh", "fresh-i")
+# The states whose recall picks a build's setting for each target, the first that the build has.
+PICKED_AT = ("s0", "fresh")
 # A state of the joint ladder, eg. s5 or d5 of the drift stream, the inserts-only ladder, eg. s5i, the policy pass, eg.
 # s10p, and the state that a maintenance action left, eg. s10-fold.
 JOINT = re.compile(r"[sd](\d+)")
@@ -51,8 +53,9 @@ class Lines:
     """A write suite's ok and invalid lines, by build. A build is a system, its variant and a config id that isn't a
     fresh build's, and a fresh build's lines join the build it was named after."""
 
-    def __init__(self, lines: list[dict]) -> None:
+    def __init__(self, lines: list[dict], picks_from: Lines | None = None) -> None:
         self.by_build: dict[tuple, list[dict]] = defaultdict(list)
+        self.picks_from = picks_from
 
         for x in lines:
             if x.get("status") not in ("ok", "invalid"):
@@ -70,7 +73,7 @@ class Lines:
     def builds(self) -> list[tuple]:
         """Every build with a warm line at S0, ColdIVF's first."""
         found = [b for b, xs in self.by_build.items()
-                 if any(x["kind"] == "warm" and x.get("state") == "s0" for x in xs)]
+                 if any(x["kind"] == "warm" and x.get("state") in PICKED_AT for x in xs)]
         return sorted(found, key=lambda b: (b[:2] != REFERENCE, name_of(*b)))
 
     def of(self, build: tuple, kind: str, **match) -> list[dict]:
@@ -106,11 +109,20 @@ class Lines:
 
     def system_picks(self, system: tuple) -> dict[float, tuple | None]:
         """A system's build and setting for each target, over every build of the system: the S0 setting of least recall
-        at or above the target, eg. Paimon's 4-bit build at 0.90 and its 8-bit build at 0.95."""
+        at or above the target, eg. Paimon's 4-bit build at 0.90 and its 8-bit build at 0.95, or the picks of the
+        suite that `picks_from` holds, eg. the main suite's for the drift suite, whose states start from the same
+        builds."""
+        if self.picks_from is not None:
+            return self.picks_from.system_picks(system)
+
         settings = {}
 
         for b in (b for b in self.builds() if b[:2] == tuple(system)):
-            for x in self.of(b, "warm", state="s0", split="test", threads=1):
+            warm = self.of(b, "warm", split="test", threads=1)
+            # A suite without S0 and no `picks_from` picks on its fresh build.
+            at = next((s for s in PICKED_AT if any(x.get("state") == s for x in warm)), None)
+
+            for x in (x for x in warm if x.get("state") == at):
                 if x.get("recall10") is not None:
                     settings[(b, h2h.key(x.get("search_params")))] = (x["recall10"], b, x.get("search_params") or {})
 
@@ -338,14 +350,18 @@ def us(value: float | None) -> str:
 def search_tables(rows: list[dict], target: str) -> list[str]:
     states = columns(rows)
     last = next((s for s in reversed(states) if JOINT.fullmatch(s)), "s0")
+    # A suite without S0, eg. the drift suite, sets its last state against the fresh build.
+    base = "s0" if "s0" in states else "fresh"
     head = " | ".join(s.upper() if s != "fresh" else "Fresh Build" for s in states)
+    against = "S0" if base == "s0" else "the Fresh Build"
     out = [f"**Recall@10 {target}, cold p50 in ms, then recall@10**", "",
-           f"| System | Setting | {head} | {last.upper()} Against S0 |", "|---|---|" + "---|" * len(states) + "---|"]
+           f"| System | Setting | {head} | {last.upper()} Against {against} |",
+           "|---|---|" + "---|" * len(states) + "---|"]
 
     for r in rows:
         cells = [r["cold"].get(s) for s in states]
         text = [f"{ms(c['p50_us'])} ({h2h.fmt(warm_recall(r, s), 3)})" if c else "-" for c, s in zip(cells, states)]
-        s0, end = r["cold"].get("s0"), r["cold"].get(last)
+        s0, end = r["cold"].get(base), r["cold"].get(last)
         out.append(f"| {r['label']} | {r['setting_text']} | {' | '.join(text)} "
                    f"| {ratio((end or {}).get('p50_us'), (s0 or {}).get('p50_us'))} |")
 
@@ -429,11 +445,19 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--suite", type=Path, default=SUITE)
     p.add_argument("--results", type=Path, help="the suite's results folder, by default its results root and phase")
+    p.add_argument("--picks-from", type=Path, help="a suite whose S0 picks each system's settings, eg. the main write "
+                   "suite for the drift suite")
     p.add_argument("--json", type=Path)
     p.add_argument("--md", type=Path)
     args = p.parse_args(argv)
     suite = driver.load_suite(args.suite)
-    data = tables(Lines(h2h.Results(args.results or suite.results_root / suite.phase).lines))
+    main_lines = None
+
+    if args.picks_from:
+        other = driver.load_suite(args.picks_from)
+        main_lines = Lines(h2h.Results(other.results_root / other.phase).lines)
+
+    data = tables(Lines(h2h.Results(args.results or suite.results_root / suite.phase).lines, main_lines))
     text = markdown(data)
     print(text)
 
