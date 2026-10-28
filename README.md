@@ -25,6 +25,13 @@ A read-optimized vector index in Rust, built for cold reads.
     - [Warm Query](#warm-query-1)
     - [Memory and Build](#memory-and-build-1)
     - [Not Run at 10M](#not-run-at-10m)
+  - [Writes](#writes)
+    - [Write Latency](#write-latency)
+    - [Cold First Query After Writes](#cold-first-query-after-writes)
+    - [Warm Query After Writes](#warm-query-after-writes)
+    - [Maintenance](#maintenance)
+    - [Writes That Drift](#writes-that-drift)
+    - [Checks](#checks)
 - [Caveats / Observations](#caveats--observations)
 - [Disclosure](#disclosure)
 - [License](#license)
@@ -940,6 +947,192 @@ ColdIVF's build peaks at 0.84 GB, the lowest here. Its index takes 943 bytes per
 ### Not Run at 10M
 
 The other systems took too much memory to run at 10M on this Mac's 36 GB. They are qdrant-edge, SymphonyQG, AsterVec, RaBitQ-Library HNSW, sqlite-vec and the flat scan, plus faiss HNSW, RaBitQ-Library IVF and usearch over full-precision rows.
+
+## Writes
+
+Every system takes the same stream of writes on its index of the [1M benchmark](#1m-vectors): 100,000 inserts of new vectors, rows 1,000,000 to 1,099,999 of Cohere 10M, and 100,000 deletes, in batches of 1,000. Its three rounds leave the states S1, S5 and S10, with 1%, 5% and 10% of the vectors inserted and as many deleted. S10i holds the inserts alone. Each system keeps its build and its settings from the 1M benchmark, and each state's recall is scored against the exact top 10 of the vectors it holds. [coldivf-bench/suites/bench-1m-writes.toml](coldivf-bench/suites/bench-1m-writes.toml) describes the protocol.
+
+### Write Latency
+
+ColdIVF has **the fastest durable insert**, 3.14 ms with the sync that makes it survive a power loss. turbovec takes 1.21 times as long, sqlite-vec 3.4 times, LanceDB 5.1 times and qdrant-edge 10.7 times. The systems that save their whole index take 257 ms to 1.4 s per save.
+
+![Each system's p50 for one insert that survives a power loss, on a log scale, with ColdIVF in blue](docs/charts/writes-durable-dark.svg)
+
+<details>
+<summary>Write latency at S0, by system</summary>
+
+| System | Insert p50 | Insert p99 | Delete p50 | Durable Insert p50 | How It Becomes Durable | Inserts per Second in Batches of 1,000 |
+|---|---|---|---|---|---|---|
+| **ColdIVF** | **64 µs** | **79 µs** | **5.0 µs** | **3.14 ms** | **a sync of its log** | **15,940** |
+| turbovec 4-bit, calibrated | 7.0 µs | 11 µs | 5.8 µs | 3.81 ms | a sync | 415,101 |
+| sqlite-vec | 54 µs | 9.15 ms | 3.78 ms | 10.7 ms | a commit with `synchronous=FULL` | 9,716 |
+| LanceDB IVF_RQ | 6.62 ms | 13.1 ms | 35.1 ms | 16.0 ms | a sync of the commit's files, which LanceDB never makes | 137,266 |
+| qdrant-edge | 26 µs | 163 µs | 3.6 µs | 33.6 ms | a flush | 54,563 |
+| faiss IVF, batched reads, 2,560 per list | 46 µs | 92 µs | 1.32 ms | 257 ms | a save of the whole index | 83,660 |
+| faiss IVF as shipped, 320 per list | 218 µs | 803 µs | 1.35 ms | 260 ms | a save of the whole index | 56,638 |
+| faiss FastScan + SQ8 | 286 µs | 860 µs | 1.48 ms | 269 ms | a save of the whole index | 53,312 |
+| faiss HNSW32-SQ8 | 1.12 ms | 2.00 ms | none | 319 ms | a save of the whole index | inserts only |
+| RaBitQ-Library HNSW 4-bit | 2.59 ms | 5.88 ms | 1.6 µs | 487 ms | a save of the whole index | 371 |
+| RaBitQ-Library IVF 5-bit, malloc cache off | 34.1 ms | 40.4 ms | 445 µs | 513 ms | a save of the whole index | 3,669 |
+| AsterVec | 8.67 ms | 21.9 ms | 3.7 µs | 675 ms, process crash only | a close, which syncs none of its vectors | 268 |
+| usearch HNSW f16 | 988 µs | 1.84 ms | 1.9 µs | 1,376 ms | a save of the whole index | 1,055 |
+
+A durable insert is one insert, then the call that makes it survive a power loss, timed together. Where that call saves the whole index, the column gives the save alone. Every sync and save ends with `F_FULLFSYNC`. AsterVec has no call that survives a power loss, thus its row gives a close, after which its writes survive a process crash. RaBitQ-Library's IVF copies its whole index at each add. With macOS malloc's default cache of freed blocks, the old copies stayed in its footprint, which passed this benchmark's 16 GB cap at 100,000 inserts in one session, thus it runs with that cache off.
+
+</details>
+
+### Cold First Query After Writes
+
+ColdIVF's cold first query grows with the changes that maintenance hasn't folded in yet, since an open replays its log: from 7.93 ms at S0 to 23.9 ms at S1 and 85.8 ms at S10, at recall@10 0.95. That is faster than LanceDB at every state. One fold, which takes 2.4 s, brings it back to 14.6 ms. faiss IVF with batched reads stays at 8.5 to 9.4 ms in every state, since it saves its whole index at every durable point.
+
+Each line is a system's cold first-query p50 at each state, on a log scale.
+
+![Each system's cold first-query p50 at S0, S1, S5 and S10 at recall@10 0.95, one line per system, with ColdIVF in blue](docs/charts/writes-cold-95-dark.svg)
+
+![Each system's cold first-query p50 at S0, S1, S5 and S10 at recall@10 0.90, one line per system, with ColdIVF in blue](docs/charts/writes-cold-90-dark.svg)
+
+<details>
+<summary>Cold first query at each state, by system</summary>
+
+Each cell gives the p50 and, in parentheses, recall@10. The fresh build is a new build of S10's vectors.
+
+**Recall@10 0.95**
+
+| System | Setting | S0 | S1 | S5 | S10 | S10i | Fresh Build |
+|---|---|---|---|---|---|---|---|
+| **ColdIVF** | **nprobe 128, rerank 64** | **7.93 ms (0.961)** | **23.9 ms (0.959)** | **52.9 ms (0.959)** | **85.8 ms (0.961)** | **73.2 ms (0.961)** | **6.99 ms (0.959)** |
+| faiss IVF, batched reads, 2,560 per list | nprobe 24, k_factor 8 | 9.12 ms (0.958) | 8.51 ms (0.958) | 8.90 ms (0.958) | 9.12 ms (0.959) | 9.39 ms (0.960) | 8.84 ms (0.963) |
+| faiss IVF as shipped, 320 per list | nprobe 96, k_factor 8 | 53.6 ms (0.956) | 54.1 ms (0.956) | 53.1 ms (0.956) | 53.2 ms (0.957) | 56.2 ms (0.959) | 56.9 ms (0.961) |
+| LanceDB IVF_RQ | nprobes 16, refine 8 | 21.7 ms (0.965) | 29.1 ms (0.966) | 58.8 ms (0.967) | 93.7 ms (0.970) | 91.6 ms (0.970) | 22.0 ms (0.963) |
+| RaBitQ-Library IVF 5-bit | nprobe 192 | 133 ms (0.960) | 130 ms (0.960) | 135 ms (0.963) | 140 ms (0.963) | 140 ms (0.961) | 133 ms (0.967) |
+| faiss FastScan + SQ8 | nprobe 96, k_factor 8 | 215 ms (0.956) | 187 ms (0.955) | 179 ms (0.932) | 183 ms (0.904) | 184 ms (0.958) | 200 ms (0.961) |
+| faiss HNSW32-SQ8 | ef 96 | 708 ms (0.958) | - | - | - | 800 ms (0.958) | 745 ms (0.956) |
+| AsterVec | ef 384 | 801 ms (0.959) | 799 ms (0.957) | 803 ms (0.958) | 808 ms (0.953) | 801 ms (0.957) | 798 ms (0.959) |
+| usearch HNSW f16 | expansion 384 | 1,025 ms (0.954) | 1,042 ms (0.954) | 1,053 ms (0.953) | 1,413 ms (0.951) | 1,335 ms (0.955) | 981 ms (0.973) |
+| qdrant-edge | hnsw_ef 256, oversampling 2 | 1,026 ms (0.953) | 1,105 ms (0.954) | 1,428 ms (0.953) | 1,828 ms (0.951) | 1,753 ms (0.959) | 1,032 ms (0.959) |
+| sqlite-vec | none | 1,899 ms (1.000) | 2,330 ms (1.000) | 2,785 ms (1.000) | 2,767 ms (1.000) | 2,024 ms (1.000) | 1,895 ms (1.000) |
+
+**Recall@10 0.90**
+
+| System | Setting | S0 | S1 | S5 | S10 | S10i | Fresh Build |
+|---|---|---|---|---|---|---|---|
+| **ColdIVF** | **nprobe 64, rerank 39** | **5.85 ms (0.921)** | **23.2 ms (0.921)** | **50.3 ms (0.921)** | **83.9 ms (0.925)** | **70.5 ms (0.924)** | **5.61 ms (0.925)** |
+| faiss IVF, batched reads, 2,560 per list | nprobe 12, k_factor 4 | 6.90 ms (0.905) | 6.54 ms (0.904) | 6.86 ms (0.904) | 6.75 ms (0.908) | 6.65 ms (0.907) | 6.97 ms (0.908) |
+| faiss IVF as shipped, 320 per list | nprobe 48, k_factor 4 | 37.6 ms (0.911) | 38.9 ms (0.912) | 38.1 ms (0.912) | 37.9 ms (0.916) | 39.8 ms (0.918) | 41.6 ms (0.915) |
+| LanceDB IVF_RQ | nprobes 12, refine 4 | 19.6 ms (0.938) | 27.4 ms (0.938) | 56.1 ms (0.944) | 90.8 ms (0.949) | 87.2 ms (0.948) | 19.2 ms (0.933) |
+| RaBitQ-Library IVF 5-bit | nprobe 64 | 132 ms (0.917) | 130 ms (0.917) | 134 ms (0.921) | 140 ms (0.922) | 141 ms (0.919) | 131 ms (0.918) |
+| faiss FastScan + SQ8 | nprobe 48, k_factor 4 | 215 ms (0.911) | 186 ms (0.910) | 176 ms (0.886) | 185 ms (0.857) | 186 ms (0.918) | 200 ms (0.916) |
+| RaBitQ-Library HNSW 4-bit | ef 128 | 209 ms (0.911) | 215 ms (0.910) | 221 ms (0.912) | 232 ms (0.913) | 231 ms (0.910) | 209 ms (0.921) |
+| AsterVec | ef 96 | 485 ms (0.924) | 489 ms (0.918) | 499 ms (0.914) | 503 ms (0.906) | 502 ms (0.909) | 479 ms (0.915) |
+| usearch HNSW f16 | expansion 96 | 509 ms (0.916) | 492 ms (0.914) | 524 ms (0.910) | 673 ms (0.905) | 606 ms (0.914) | 436 ms (0.927) |
+| faiss HNSW32-SQ8 | ef 48 | 598 ms (0.923) | - | - | - | 684 ms (0.924) | 631 ms (0.926) |
+| qdrant-edge | hnsw_ef 96, oversampling 2 | 1,023 ms (0.918) | 1,105 ms (0.919) | 1,429 ms (0.918) | 1,828 ms (0.918) | 1,749 ms (0.928) | 1,029 ms (0.927) |
+| sqlite-vec | none | 1,899 ms (1.000) | 2,330 ms (1.000) | 2,785 ms (1.000) | 2,767 ms (1.000) | 2,024 ms (1.000) | 1,895 ms (1.000) |
+
+</details>
+
+### Warm Query After Writes
+
+ColdIVF's warm p50 rises by 15% from S0 to S10 at recall@10 0.95, from 0.354 to 0.408 ms, since each search also scans the pending inserts of its clusters. It stays the fastest of the systems that take writes at 0.95. LanceDB's rises 7 times and qdrant-edge's 8.8 times.
+
+<details>
+<summary>Warm query at each state, by system</summary>
+
+**Recall@10 0.95**
+
+| System | Setting | S0 | S1 | S5 | S10 | S10i | Fresh Build |
+|---|---|---|---|---|---|---|---|
+| **ColdIVF** | **nprobe 128, rerank 64** | **0.354 ms (0.961)** | **0.378 ms (0.959)** | **0.391 ms (0.959)** | **0.408 ms (0.961)** | **0.404 ms (0.961)** | **0.355 ms (0.959)** |
+| faiss HNSW32-SQ8 | ef 96 | 0.503 ms (0.958) | - | - | - | 0.508 ms (0.958) | 0.509 ms (0.956) |
+| faiss FastScan + SQ8 | nprobe 96, k_factor 8 | 0.965 ms (0.956) | 0.962 ms (0.955) | 0.972 ms (0.932) | 0.961 ms (0.904) | 0.984 ms (0.958) | 0.951 ms (0.961) |
+| RaBitQ-Library IVF 5-bit | nprobe 192 | 1.10 ms (0.960) | 1.12 ms (0.960) | 1.19 ms (0.963) | 1.29 ms (0.963) | 1.28 ms (0.961) | 1.12 ms (0.967) |
+| faiss IVF as shipped, 320 per list | nprobe 96, k_factor 8 | 1.31 ms (0.956) | 1.31 ms (0.956) | 1.31 ms (0.956) | 1.31 ms (0.957) | 1.39 ms (0.959) | 1.32 ms (0.961) |
+| usearch HNSW f16 | expansion 384 | 2.03 ms (0.954) | 1.98 ms (0.954) | 2.03 ms (0.953) | 1.98 ms (0.951) | 2.03 ms (0.955) | 1.98 ms (0.973) |
+| faiss IVF, batched reads, 2,560 per list | nprobe 24, k_factor 8 | 2.15 ms (0.958) | 2.15 ms (0.958) | 2.17 ms (0.958) | 2.19 ms (0.959) | 2.35 ms (0.960) | 2.21 ms (0.963) |
+| qdrant-edge | hnsw_ef 256, oversampling 2 | 0.734 ms (0.953) | 1.38 ms (0.954) | 3.63 ms (0.953) | 6.47 ms (0.951) | 6.39 ms (0.959) | 0.723 ms (0.959) |
+| AsterVec | ef 384 | 14.8 ms (0.959) | 13.9 ms (0.957) | 13.8 ms (0.958) | 13.7 ms (0.953) | 13.7 ms (0.957) | 14.3 ms (0.959) |
+| LanceDB IVF_RQ | nprobes 16, refine 8 | 3.77 ms (0.965) | 8.17 ms (0.966) | 13.4 ms (0.967) | 26.3 ms (0.970) | 22.4 ms (0.970) | 2.83 ms (0.963) |
+| flat scan | none | 37.9 ms (1.000) | 37.6 ms (1.000) | 41.0 ms (1.000) | 44.1 ms (1.000) | 41.9 ms (1.000) | - |
+| sqlite-vec | none | 452 ms (1.000) | 462 ms (1.000) | 473 ms (1.000) | 501 ms (1.000) | 499 ms (1.000) | 444 ms (1.000) |
+
+**Recall@10 0.90**
+
+| System | Setting | S0 | S1 | S5 | S10 | S10i | Fresh Build |
+|---|---|---|---|---|---|---|---|
+| **ColdIVF** | **nprobe 64, rerank 39** | **0.210 ms (0.921)** | **0.225 ms (0.921)** | **0.230 ms (0.921)** | **0.288 ms (0.925)** | **0.285 ms (0.924)** | **0.216 ms (0.925)** |
+| RaBitQ-Library HNSW 4-bit | ef 128 | 0.154 ms (0.911) | 0.154 ms (0.910) | 0.158 ms (0.912) | 0.160 ms (0.913) | 0.156 ms (0.910) | 0.153 ms (0.921) |
+| faiss HNSW32-SQ8 | ef 48 | 0.288 ms (0.923) | - | - | - | 0.345 ms (0.924) | 0.287 ms (0.926) |
+| RaBitQ-Library IVF 5-bit | nprobe 64 | 0.482 ms (0.917) | 0.490 ms (0.917) | 0.517 ms (0.921) | 0.653 ms (0.922) | 0.681 ms (0.919) | 0.485 ms (0.918) |
+| faiss FastScan + SQ8 | nprobe 48, k_factor 4 | 0.568 ms (0.911) | 0.562 ms (0.910) | 0.572 ms (0.886) | 0.694 ms (0.857) | 0.711 ms (0.918) | 0.566 ms (0.916) |
+| usearch HNSW f16 | expansion 96 | 0.581 ms (0.916) | 0.611 ms (0.914) | 0.581 ms (0.910) | 0.727 ms (0.905) | 0.733 ms (0.914) | 0.589 ms (0.927) |
+| faiss IVF as shipped, 320 per list | nprobe 48, k_factor 4 | 0.741 ms (0.911) | 0.743 ms (0.912) | 0.738 ms (0.912) | 0.917 ms (0.916) | 0.973 ms (0.918) | 0.757 ms (0.915) |
+| faiss IVF, batched reads, 2,560 per list | nprobe 12, k_factor 4 | 1.11 ms (0.905) | 1.12 ms (0.904) | 1.18 ms (0.904) | 1.31 ms (0.908) | 1.47 ms (0.907) | 1.14 ms (0.908) |
+| AsterVec | ef 96 | 4.35 ms (0.924) | 4.22 ms (0.918) | 4.09 ms (0.914) | 3.97 ms (0.906) | 3.98 ms (0.909) | 4.24 ms (0.915) |
+| qdrant-edge | hnsw_ef 96, oversampling 2 | 0.341 ms (0.918) | 0.989 ms (0.919) | 3.22 ms (0.918) | 6.05 ms (0.918) | 5.98 ms (0.928) | 0.327 ms (0.927) |
+| LanceDB IVF_RQ | nprobes 12, refine 4 | 6.74 ms (0.938) | 6.49 ms (0.938) | 13.4 ms (0.944) | 26.2 ms (0.949) | 22.4 ms (0.948) | 6.06 ms (0.933) |
+| flat scan | none | 37.9 ms (1.000) | 37.6 ms (1.000) | 41.0 ms (1.000) | 44.1 ms (1.000) | 41.9 ms (1.000) | - |
+| sqlite-vec | none | 452 ms (1.000) | 462 ms (1.000) | 473 ms (1.000) | 501 ms (1.000) | 499 ms (1.000) | 444 ms (1.000) |
+
+</details>
+
+### Maintenance
+
+A ColdIVF fold of S10 takes 2.4 s and a major run, which clusters every vector again, 187 s, at 10 threads. Either one brings its cold first query back to 14.6 to 14.9 ms and keeps its recall. As a background job at 2 threads, a run of kind auto takes 66 s.
+
+<details>
+<summary>Maintenance at S10, by system</summary>
+
+| System | Action | Threads | Time | Peak Memory | Bytes Written | Cold p50 Before, After and Fresh | Warm p50 Before, After and Fresh | Recall@10 Before, After and Fresh |
+|---|---|---|---|---|---|---|---|---|
+| **ColdIVF** | **fold** | **10** | **2.4 s** | **369 MB** | **948 MB** | **85.8 / 14.6 / 6.99 ms** | **0.408 / 0.356 / 0.355 ms** | **0.961 / 0.961 / 0.959** |
+| **ColdIVF** | **auto** | **10** | **25.1 s** | **608 MB** | **948 MB** | **85.8 / 14.9 / 6.99 ms** | **0.408 / 0.354 / 0.355 ms** | **0.961 / 0.961 / 0.959** |
+| **ColdIVF** | **major** | **10** | **187 s** | **426 MB** | **948 MB** | **85.8 / 14.8 / 6.99 ms** | **0.408 / 0.361 / 0.355 ms** | **0.961 / 0.963 / 0.959** |
+| **ColdIVF** | **auto, as a background job** | **2** | **66.1 s** | **558 MB** | **1.88 GB** | **the same file as auto** | **the same file as auto** | **the same file as auto** |
+| LanceDB IVF_RQ | optimize | 10 | 1.1 s | 1.4 GB | 432 MB | 93.7 / 21.0 / 22.0 ms | 26.3 / 10.3 / 2.83 ms | 0.970 / 0.966 / 0.963 |
+| LanceDB IVF_RQ | retrain | 10 | 13.0 s | 2.51 GB | 658 MB | 93.7 / 25.0 / 22.0 ms | 26.3 / 9.77 / 2.83 ms | 0.970 / 0.964 / 0.963 |
+| qdrant-edge | optimize | 10 | 26.2 s | 2.28 GB | 4.28 GB | 1,828 / 1,298 / 1,032 ms | 6.47 / 0.759 / 0.723 ms | 0.951 / 0.956 / 0.959 |
+| sqlite-vec | vacuum | 10 | 15.2 s | 29.2 MB | 7.39 GB | 2,767 / 1,492 / 1,895 ms | 501 / 503 / 444 ms | 1.000 / 1.000 / 1.000 |
+
+The other systems have no maintenance call. With its own policy, ColdIVF ran 4 runs during S10's writes, 2 folds and 2 minor runs, in 32.1 s, which takes its writes from 30,012 to 5,163 rows per second.
+
+</details>
+
+### Writes That Drift
+
+A second stream inserts the 100,000 rows nearest 10 of 200 topics of the data, so that new vectors pile up in a few clusters, with as many deletes spread evenly. D10 is its last state. ColdIVF keeps its recall@10 at D10, 0.957 against 0.957 for a fresh build, and a fold brings its cold first query back to 13.3 ms. Clustering the vectors again, in a minor or a major run, gains no recall over the fold.
+
+<details>
+<summary>Cold first query at D10, by system</summary>
+
+**Recall@10 0.95**
+
+| System | Setting | D10 | After Maintenance | Fresh Build |
+|---|---|---|---|---|
+| **ColdIVF** | **nprobe 128, rerank 64** | **85.7 ms (0.957)** | **fold: 13.3 ms (0.956)<br>auto: 13.7 ms (0.953)<br>major: 14.6 ms (0.954)** | **7.56 ms (0.957)** |
+| faiss IVF, batched reads, 2,560 per list | nprobe 24, k_factor 8 | 9.02 ms (0.954) | none | 9.41 ms (0.957) |
+| faiss IVF as shipped, 320 per list | nprobe 96, k_factor 8 | 57.2 ms (0.953) | none | 58.3 ms (0.955) |
+| LanceDB IVF_RQ | nprobes 16, refine 8 | 93.5 ms (0.975) | optimize: 20.1 ms (0.959)<br>retrain: 24.6 ms (0.962) | 21.0 ms (0.951) |
+| RaBitQ-Library IVF 5-bit | nprobe 192 | 153 ms (0.965) | none | 138 ms (0.944) |
+| faiss FastScan + SQ8 | nprobe 96, k_factor 8 | 186 ms (0.906) | none | 174 ms (0.956) |
+| qdrant-edge | hnsw_ef 256, oversampling 2 | 1,738 ms (0.957) | optimize: 1,442 ms (0.957) | 1,034 ms (0.958) |
+
+**Recall@10 0.90**
+
+| System | Setting | D10 | After Maintenance | Fresh Build |
+|---|---|---|---|---|
+| **ColdIVF** | **nprobe 64, rerank 39** | **84.2 ms (0.918)** | **fold: 12.1 ms (0.914)<br>auto: 11.8 ms (0.916)<br>major: 13.3 ms (0.917)** | **6.12 ms (0.915)** |
+| faiss IVF, batched reads, 2,560 per list | nprobe 12, k_factor 4 | 6.69 ms (0.899) | none | 6.97 ms (0.904) |
+| faiss IVF as shipped, 320 per list | nprobe 48, k_factor 4 | 40.5 ms (0.906) | none | 41.9 ms (0.908) |
+| LanceDB IVF_RQ | nprobes 12, refine 4 | 89.6 ms (0.955) | optimize: 18.8 ms (0.924)<br>retrain: 22.2 ms (0.930) | 19.1 ms (0.919) |
+| RaBitQ-Library IVF 5-bit | nprobe 64 | 152 ms (0.928) | none | 138 ms (0.877) |
+| faiss FastScan + SQ8 | nprobe 48, k_factor 4 | 184 ms (0.849) | none | 174 ms (0.908) |
+| qdrant-edge | hnsw_ef 96, oversampling 2 | 1,733 ms (0.928) | optimize: 1,436 ms (0.922) | 1,034 ms (0.915) |
+
+</details>
+
+### Checks
+
+No system returned a deleted vector at any state. ColdIVF found every inserted and every base vector that the checks searched for, at S10, at S10i and after each maintenance run. faiss FastScan found 70.7% of the inserted vectors at S10, since its deletes leave codes in place that later inserts write over.
 
 ## Caveats / Observations
 
