@@ -39,13 +39,14 @@ struct Piece {
 }
 
 impl Piece {
-    fn new() -> Piece {
+    /// No insert yet, with room for `lanes` of them, whose codes and rows take `cb` and `rb` bytes each.
+    fn with_capacity(lanes: usize, cb: usize, rb: usize) -> Piece {
         Piece {
-            codes: Vec::new(),
-            factors: Vec::new(),
-            rows: Vec::new(),
-            seqs: Vec::new(),
-            lists: Vec::new(),
+            codes: Vec::with_capacity(lanes * cb),
+            factors: Vec::with_capacity(lanes),
+            rows: Vec::with_capacity(lanes * rb),
+            seqs: Vec::with_capacity(lanes),
+            lists: Vec::with_capacity(lanes),
             hidden: Arc::new(std::array::from_fn(|_| AtomicU64::new(NEVER))),
         }
     }
@@ -530,7 +531,20 @@ impl Applier {
             return Ok(());
         }
 
+        // A bit per hash of the wanted ids, ~8 per id, so that most rows of the file skip the table.
+        let bits = (found.len() * 8).next_power_of_two().max(64);
+        let mut filter = vec![0u64; bits / 64];
+        let bit = |id: &u64| {
+            let mut h = IdHasher::default();
+            h.write_u64(*id);
+            h.finish() as usize & (bits - 1)
+        };
+        found.keys().for_each(|id| filter[bit(id) / 64] |= 1 << (bit(id) % 64));
+
         for (row, id) in self.by_row()?.by_row.iter().enumerate() {
+            if filter[bit(id) / 64] & (1 << (bit(id) % 64)) == 0 {
+                continue;
+            }
             if let Some(r) = found.get_mut(id).filter(|r| **r == NONE) {
                 *r = row as u32;
             }
@@ -627,6 +641,8 @@ impl Applier {
         let (records, _) = log::records(bytes, self.version, self.dim)?;
         let reads = self.ids.is_none();
         self.find_rows(&records)?;
+        // Every insert of the replay may take a place in the id map, so it grows once.
+        self.latest.reserve(records.len());
         let (mut used, mut failed) = (0, None);
 
         for record in records {
@@ -659,7 +675,9 @@ impl Applier {
             Some(p) if p.len() < BLOCK => self.recent.pop(),
             _ => None,
         };
-        let mut piece = last.unwrap_or_else(|| Arc::new(Piece::new()));
+        // A replay fills each piece in place, so it makes them whole at once.
+        let room = if hold { BLOCK } else { 0 };
+        let mut piece = last.unwrap_or_else(|| Arc::new(Piece::with_capacity(room, code.len(), row.len())));
         match Arc::get_mut(&mut piece) {
             Some(p) => p.push(code, factors, row, seq, list),
             None => piece = Arc::new(piece.with(code, factors, row, seq, list)),
