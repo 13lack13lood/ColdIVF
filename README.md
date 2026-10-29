@@ -1042,7 +1042,7 @@ ColdIVF's warm p50 rises by 15% from S0 to S10 at recall@10 0.95, from 0.354 to 
 
 | System | Setting | S0 | S1 | S5 | S10 | S10i | Fresh Build |
 |---|---|---|---|---|---|---|---|
-| **ColdIVF** | **nprobe 128, rerank 64** | **0.354 ms (0.961)** | **0.378 ms (0.959)** | **0.391 ms (0.959)** | **0.408 ms (0.961)** | **0.404 ms (0.961)** | **0.355 ms (0.959)** |
+| **ColdIVF** | **nprobe 128, rerank 64** | **0.354 ms (0.961)** | **0.378 ms (0.959)** | **0.391 ms (0.959)** | **0.408 ms (0.961)** | **0.404 ms (0.961)** | **0.343 ms (0.959)** |
 | faiss HNSW32-SQ8 | ef 96 | 0.503 ms (0.958) | - | - | - | 0.508 ms (0.958) | 0.509 ms (0.956) |
 | faiss FastScan + SQ8 | nprobe 96, k_factor 8 | 0.965 ms (0.956) | 0.962 ms (0.955) | 0.972 ms (0.932) | 0.961 ms (0.904) | 0.984 ms (0.958) | 0.951 ms (0.961) |
 | RaBitQ-Library IVF 5-bit | nprobe 192 | 1.10 ms (0.960) | 1.12 ms (0.960) | 1.19 ms (0.963) | 1.29 ms (0.963) | 1.28 ms (0.961) | 1.12 ms (0.967) |
@@ -1059,7 +1059,7 @@ ColdIVF's warm p50 rises by 15% from S0 to S10 at recall@10 0.95, from 0.354 to 
 
 | System | Setting | S0 | S1 | S5 | S10 | S10i | Fresh Build |
 |---|---|---|---|---|---|---|---|
-| **ColdIVF** | **nprobe 64, rerank 39** | **0.210 ms (0.921)** | **0.225 ms (0.921)** | **0.230 ms (0.921)** | **0.288 ms (0.925)** | **0.285 ms (0.924)** | **0.216 ms (0.925)** |
+| **ColdIVF** | **nprobe 64, rerank 39** | **0.210 ms (0.921)** | **0.225 ms (0.921)** | **0.230 ms (0.921)** | **0.288 ms (0.925)** | **0.285 ms (0.924)** | **0.213 ms (0.925)** |
 | RaBitQ-Library HNSW 4-bit | ef 128 | 0.154 ms (0.911) | 0.154 ms (0.910) | 0.158 ms (0.912) | 0.160 ms (0.913) | 0.156 ms (0.910) | 0.153 ms (0.921) |
 | faiss HNSW32-SQ8 | ef 48 | 0.288 ms (0.923) | - | - | - | 0.345 ms (0.924) | 0.287 ms (0.926) |
 | RaBitQ-Library IVF 5-bit | nprobe 64 | 0.482 ms (0.917) | 0.490 ms (0.917) | 0.517 ms (0.921) | 0.653 ms (0.922) | 0.681 ms (0.919) | 0.485 ms (0.918) |
@@ -1084,9 +1084,9 @@ A ColdIVF fold of S10 takes 2.4 s and a major run, which clusters every vector a
 
 | System | Action | Threads | Time | Peak Memory | Bytes Written | Cold p50 Before, After and Fresh | Warm p50 Before, After and Fresh | Recall@10 Before, After and Fresh |
 |---|---|---|---|---|---|---|---|---|
-| **ColdIVF** | **fold** | **10** | **2.4 s** | **369 MB** | **948 MB** | **85.8 / 14.6 / 6.99 ms** | **0.408 / 0.356 / 0.355 ms** | **0.961 / 0.961 / 0.959** |
-| **ColdIVF** | **auto** | **10** | **25.1 s** | **608 MB** | **948 MB** | **85.8 / 14.9 / 6.99 ms** | **0.408 / 0.354 / 0.355 ms** | **0.961 / 0.961 / 0.959** |
-| **ColdIVF** | **major** | **10** | **187 s** | **426 MB** | **948 MB** | **85.8 / 14.8 / 6.99 ms** | **0.408 / 0.361 / 0.355 ms** | **0.961 / 0.963 / 0.959** |
+| **ColdIVF** | **fold** | **10** | **2.4 s** | **369 MB** | **948 MB** | **85.8 / 14.6 / 6.99 ms** | **0.408 / 0.356 / 0.343 ms** | **0.961 / 0.961 / 0.959** |
+| **ColdIVF** | **auto** | **10** | **25.1 s** | **608 MB** | **948 MB** | **85.8 / 14.9 / 6.99 ms** | **0.408 / 0.340 / 0.343 ms** | **0.961 / 0.961 / 0.959** |
+| **ColdIVF** | **major** | **10** | **187 s** | **426 MB** | **948 MB** | **85.8 / 14.8 / 6.99 ms** | **0.408 / 0.361 / 0.343 ms** | **0.961 / 0.963 / 0.959** |
 | **ColdIVF** | **auto, as a background job** | **2** | **66.1 s** | **558 MB** | **1.88 GB** | **the same file as auto** | **the same file as auto** | **the same file as auto** |
 | LanceDB IVF_RQ | optimize | 10 | 1.1 s | 1.4 GB | 432 MB | 93.7 / 21.0 / 22.0 ms | 26.3 / 10.3 / 2.83 ms | 0.970 / 0.966 / 0.963 |
 | LanceDB IVF_RQ | retrain | 10 | 13.0 s | 2.51 GB | 658 MB | 93.7 / 25.0 / 22.0 ms | 26.3 / 9.77 / 2.83 ms | 0.970 / 0.964 / 0.963 |
