@@ -117,6 +117,11 @@ fn a_code_s_sum_from_the_query_s_bit_planes_is_its_sum() {
 
         for code in codes.chunks_exact(cb).chain([&random[..], &vec![0xff; cb][..]]) {
             assert_eq!(plane_sum(code, &query.planes), code_sum(code, &query.qu), "dim {dim}");
+            assert_eq!(
+                plane_sum(code, &query.planes),
+                plane_sum_portable(code, &query.planes),
+                "dim {dim}"
+            );
         }
     }
 }

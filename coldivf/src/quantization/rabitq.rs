@@ -339,11 +339,14 @@ impl QueryLut {
         }
 
         let cb = self.planes.len() / 4;
-        self.planes.fill(0);
 
-        for (i, &q) in self.qu.iter().enumerate() {
+        // Bit b of each of 8 query values at once: masked to the low bit of each byte, one multiply moves byte j's
+        // bit to bit 56 + j, with no carry, since every product bit lands on a place of its own.
+        for (g, q) in self.qu.as_chunks::<8>().0.iter().enumerate() {
+            let x = u64::from_le_bytes(*q);
             for b in 0..4 {
-                self.planes[b * cb + i / 8] |= ((q >> b) & 1) << (i % 8);
+                let low = (x >> b) & 0x0101_0101_0101_0101;
+                self.planes[b * cb + g] = (low.wrapping_mul(0x0102_0408_1020_4080) >> 56) as u8;
             }
         }
 
@@ -354,6 +357,42 @@ impl QueryLut {
 /// The sum s of one code, as `code_sum` gives it, from the query's bit planes `planes`, which `make_planes` made. It is
 /// the sum over b of 2^b times the number of bits that the code and plane b both set.
 pub(crate) fn plane_sum(code: &[u8], planes: &[u8]) -> u32 {
+    // Each byte lane of the NEON sum adds at most 8 per 16 bytes, so 31 of them fit a byte.
+    #[cfg(target_arch = "aarch64")]
+    if code.len().is_multiple_of(16) && code.len() <= 16 * 31 && planes.len() >= 4 * code.len() {
+        // SAFETY: every aarch64 target has NEON, and the loads stay within `code` and the first four planes.
+        return unsafe { plane_sum_neon(code, planes) };
+    }
+
+    plane_sum_portable(code, planes)
+}
+
+/// `plane_sum` with NEON: each plane's bytes that the code shares, counted 16 at a time in byte lanes.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn plane_sum_neon(code: &[u8], planes: &[u8]) -> u32 {
+    use std::arch::aarch64::{vaddlvq_u8, vaddq_u8, vandq_u8, vcntq_u8, vdupq_n_u8, vld1q_u8};
+    let cb = code.len();
+    let mut total = 0u32;
+
+    for b in 0..4 {
+        let plane = &planes[b * cb..(b + 1) * cb];
+        let mut ones = vdupq_n_u8(0);
+
+        for (c, p) in code.as_chunks::<16>().0.iter().zip(plane.as_chunks::<16>().0) {
+            // SAFETY: each chunk holds 16 bytes.
+            let both = unsafe { vandq_u8(vld1q_u8(c.as_ptr()), vld1q_u8(p.as_ptr())) };
+            ones = vaddq_u8(ones, vcntq_u8(both));
+        }
+
+        total += u32::from(vaddlvq_u8(ones)) << b;
+    }
+
+    total
+}
+
+/// `plane_sum` with 64-bit words, for every target.
+pub(crate) fn plane_sum_portable(code: &[u8], planes: &[u8]) -> u32 {
     let cb = code.len();
     let code = code.as_chunks::<8>().0;
 
