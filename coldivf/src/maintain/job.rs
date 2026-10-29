@@ -642,6 +642,8 @@ struct Bursts<'a> {
     burst: Mutex<Burst>,
     /// Every byte written so far.
     written: AtomicU64,
+    /// On macOS, the length that `set_len` set aside space for and that `order` gives the file, or 0 for none.
+    len: AtomicU64,
 }
 
 /// The burst under way, if any.
@@ -674,6 +676,7 @@ impl<'a> Bursts<'a> {
             cancel,
             burst: Mutex::new(Burst::default()),
             written: AtomicU64::new(0),
+            len: AtomicU64::new(0),
         }
     }
 
@@ -799,11 +802,24 @@ impl Out for Bursts<'_> {
 
         match has == len {
             true => Ok(()),
+            // On APFS, a sync of a file with space set aside past what was written writes zeros over the gaps that the
+            // rewrite's sections leave, and so does one of a file made longer first. A job, which syncs at each burst
+            // and mark, then wrote its file about twice. So on macOS the file grows only by its writes, and gets its
+            // length before the header, once its other sections are written. The check above stands in for the space.
+            false if cfg!(target_os = "macos") => {
+                self.len.store(len, Ordering::Relaxed);
+                Ok(())
+            }
             false => io::preallocate(self.file, len),
         }
     }
 
     fn order(&self) -> Result<(), Error> {
+        match self.len.swap(0, Ordering::Relaxed) {
+            0 => {}
+            len => self.file.set_len(len)?,
+        }
+
         let Some(params) = self.params else {
             return self.file.sync_data();
         };
