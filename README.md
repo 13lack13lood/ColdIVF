@@ -1,6 +1,6 @@
 # ColdIVF
 
-A read-optimized vector index in Rust, built for cold reads.
+The fastest vector index in Rust built for cold reads.
 
 ## Contents
 
