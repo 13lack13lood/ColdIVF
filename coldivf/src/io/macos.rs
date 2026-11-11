@@ -61,6 +61,10 @@ impl Wave for RdAdviseWave {
         self.0.read(lane, file, ranges, arena)
     }
 
+    fn in_order(&mut self) -> Option<&mut InOrder> {
+        Some(&mut self.0)
+    }
+
     fn read_path(&self) -> ReadPath {
         ReadPath {
             backend: "rdadvise",

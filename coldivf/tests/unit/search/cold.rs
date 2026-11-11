@@ -22,6 +22,10 @@ fn buffers(ctx: &SearchCtx) -> Vec<(usize, usize)> {
             ]
         })
         .collect();
+    for r in &ctx.reads {
+        all.push((r.early_in.as_ptr() as usize, r.early_in.len()));
+        all.push((r.early_needed.as_ptr() as usize, r.early_needed.capacity()));
+    }
     all.push((ctx.leaves.as_ptr() as usize, ctx.leaves.capacity()));
     all.push((ctx.hits.as_ptr() as usize, ctx.hits.capacity()));
     all
@@ -187,6 +191,100 @@ fn the_late_wave_skips_the_rows_the_early_wave_read() {
     fetched.search(q, 10, 40).unwrap();
     let reads = &ctx.reads[0];
     assert!(!reads.early.keys.is_empty() && reads.late.ranges.is_empty());
+}
+
+#[test]
+fn a_backend_that_reads_in_order_reads_only_the_early_pages_a_search_needs() {
+    // 11,200 vectors at 128 dimensions fill 400 row pages of 28 rows.
+    let (memory, file, path) = written("needed.coldivf", &params(Metric::L2), 11_200, 128, 64);
+    let (bytes, layout) = file.parts();
+    let section = RowSection::new(layout);
+    let limits = Limits {
+        max_k: 10,
+        max_nprobe: 4,
+        max_rerank: 60,
+    };
+    // One row on each of `pages`, and the bytes of a row in the file.
+    let on = |pages: &[usize]| -> Vec<Candidate> {
+        let id = |p: usize| (p * section.per_page + p % section.per_page) as u32;
+        pages.iter().map(|&p| Candidate { score: 0.0, id: id(p) }).collect()
+    };
+    let row_bytes = |id: u32| {
+        let (page, slot) = (id as usize / section.per_page, id as usize % section.per_page);
+        let at = section.offset + page * section.page_size + slot * section.row_bytes;
+        &bytes[at..at + section.row_bytes]
+    };
+    // The guess reads 24 pages early, some side by side. Each search needs some of them and a page of its own, and the
+    // second search of the same fetch needs some that the first didn't.
+    let early = [
+        0, 1, 2, 3, 10, 11, 20, 40, 41, 42, 60, 80, 100, 101, 150, 200, 201, 202, 203, 204, 300, 350, 398, 399,
+    ];
+    let searches = [
+        [1, 2, 5, 11, 41, 42, 100, 203, 204, 250, 399],
+        [0, 1, 3, 5, 10, 20, 60, 201, 202, 251, 350],
+    ];
+    let handle = File::open(&path).unwrap();
+    let owner = Arc::new(Inner::open(&path).unwrap());
+    let all: Vec<Box<dyn Wave>> = vec![
+        Box::<crate::io::portable::PortableWave>::default(),
+        Box::<PoolWave>::default(),
+        Box::<Shuffled>::default(),
+        #[cfg(target_os = "macos")]
+        Box::<crate::io::macos::RdAdviseWave>::default(),
+        #[cfg(target_os = "linux")]
+        Box::<crate::io::linux::UringWave>::default(),
+        #[cfg(target_os = "linux")]
+        Box::<crate::io::linux::FadviseWave>::default(),
+    ];
+    let pages_in = |reads: &Reads| -> Vec<usize> {
+        let keys = reads.early.keys.iter().enumerate();
+        keys.filter(|&(j, _)| has(&reads.early_in, j))
+            .map(|(_, &p)| p as usize)
+            .collect()
+    };
+
+    for wave in all {
+        let mut reads = Reads::new(&owner, wave, layout, bytes.len(), owner.tables().unwrap(), &limits);
+        reads.fetch(&handle, &memory.lists, &[]).unwrap();
+        reads.prefetch(&handle, &on(&early)).unwrap();
+        let backend = reads.read_path().backend;
+        let in_order = matches!(backend, "portable" | "rdadvise" | "fadvise");
+        let mut needed = Vec::new();
+
+        for (i, pages) in searches.iter().enumerate() {
+            reads.read_rows(&handle, &on(pages), false).unwrap();
+            for c in on(pages) {
+                assert_eq!(reads.row(c.id), row_bytes(c.id), "{backend} search {i} row {}", c.id);
+            }
+            needed.extend(pages.iter().filter(|p| early.contains(p)));
+            needed.sort_unstable();
+            needed.dedup();
+            // A backend that reads in order has read just the early pages needed so far, and never copied the rest
+            // into the arena. Any other backend waits for the whole early wave.
+            let want = if in_order { needed.clone() } else { early.to_vec() };
+            assert_eq!(pages_in(&reads), want, "{backend} search {i}");
+            for (j, &p) in reads.early.keys.iter().enumerate() {
+                let copied = reads.early.arena.part(reads.early.at[j], section.page_size);
+                assert!(
+                    has(&reads.early_in, j) || copied.iter().all(|&b| b == 0),
+                    "{backend} page {p}"
+                );
+            }
+        }
+
+        // A handle that can't read fails the reads of the early pages and leaves them out, so the next search of the
+        // fetch reads them again.
+        if in_order {
+            let rest = on(&[40, 80, 150, 300]);
+            let unreadable = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            assert!(reads.read_rows(&unreadable, &rest, false).is_err(), "{backend}");
+            assert_eq!(pages_in(&reads), needed, "{backend}");
+            reads.read_rows(&handle, &rest, false).unwrap();
+            for c in &rest {
+                assert_eq!(reads.row(c.id), row_bytes(c.id), "{backend} row {}", c.id);
+            }
+        }
+    }
 }
 
 #[test]

@@ -245,6 +245,62 @@ fn the_two_lanes_keep_their_waves_apart() {
 }
 
 #[test]
+fn a_backend_that_reads_in_order_reads_parts_of_a_wave_alone() {
+    let len = 1 << 18;
+    let (bytes, cold, _path) = random_file("parts.bin", len);
+    let span = |offset, len| Span { offset, len };
+    let spans = [
+        span(0, 100),
+        span(50_000, 9000),
+        span(120_000, 40_000),
+        span(250_000, 1),
+    ];
+    let (mut ranges, mut at) = (Vec::new(), Vec::new());
+
+    for mut wave in backends(&cold) {
+        coalesce(&spans, wave.page(), len, &mut ranges, &mut at);
+        let mut arena = vec![0xA5u8; arena_bound(spans.iter().map(|s| s.len), wave.page())];
+        wave.submit(1, &cold.file, &ranges, Memory::of(&mut arena)).unwrap();
+        let backend = wave.read_path().backend;
+        let in_order = matches!(backend, "portable" | "rdadvise" | "fadvise");
+        assert_eq!(wave.in_order().is_some(), in_order, "{backend}");
+
+        // The whole second span and a piece of the third, each where its range lands. Nothing else comes in.
+        let parts = [
+            Range {
+                offset: spans[1].offset,
+                len: spans[1].len,
+                tag: 1,
+                at: at[1],
+            },
+            Range {
+                offset: 130_000,
+                len: 5000,
+                tag: 2,
+                at: at[2] + 10_000,
+            },
+        ];
+        if let Some(reader) = wave.in_order() {
+            for p in parts {
+                reader.read_part(&cold.file, p, Memory::of(&mut arena)).unwrap();
+            }
+            for (i, &b) in arena.iter().enumerate() {
+                match parts.iter().find(|p| (p.at..p.at + p.len).contains(&i)) {
+                    Some(p) => assert_eq!(b, bytes[p.offset + i - p.at], "{backend} byte {i}"),
+                    None => assert_eq!(b, 0xA5, "{backend} byte {i}"),
+                }
+            }
+        }
+
+        // The lane still hands over every range, and reads it.
+        drain_all(&mut *wave, 1, &cold.file, &ranges, Memory::of(&mut arena));
+        for (s, &a) in spans.iter().zip(&at) {
+            assert_eq!(&arena[a..a + s.len], &bytes[s.range()], "{backend}");
+        }
+    }
+}
+
+#[test]
 fn an_empty_span_on_a_page_boundary_reads_nothing() {
     let len = 1 << 18;
     let (bytes, cold, _path) = random_file("empty.bin", len);

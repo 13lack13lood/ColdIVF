@@ -260,6 +260,13 @@ pub(crate) trait Wave: Send {
     /// range has been returned. It returns each range once, in any order. `ranges` and `arena` must be that submit's.
     fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: Memory) -> Result<Option<usize>, Error>;
 
+    /// The reader of a backend that reads each range only when `next` asks for it, or `None` for one whose reads land
+    /// by themselves. Nothing else lands in its arenas, so through it a caller may read just the parts of a wave that
+    /// it needs, and never ask `next` for the rest.
+    fn in_order(&mut self) -> Option<&mut InOrder> {
+        None
+    }
+
     /// What the backend is and how it is set up, for benchmarks.
     fn read_path(&self) -> ReadPath {
         ReadPath::default()
@@ -1027,6 +1034,14 @@ impl InOrder {
         // range's bytes alone until this hands it over.
         read_at(file, unsafe { arena.slice_mut(r.at, r.len) }, r.offset)?;
         Ok(self.lanes[lane].take())
+    }
+
+    /// Reads `part` into its place in `arena` now, eg. the pages of a lane's wave that the caller needs. It hands over
+    /// no range, so `read` still reads each of them when asked.
+    pub(crate) fn read_part(&mut self, file: &File, part: Range, arena: Memory) -> Result<(), Error> {
+        // SAFETY: a backend that reads in order reads into its arenas only here and in `read`, one read at a time, and
+        // the caller leaves the part's bytes alone until this returns.
+        read_at(file, unsafe { arena.slice_mut(part.at, part.len) }, part.offset)
     }
 }
 

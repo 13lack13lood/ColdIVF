@@ -11,7 +11,7 @@ use super::scan::{Pending, scan_probed};
 use super::{List, Scratch, View};
 use crate::format::{Layout, Part, Tables};
 use crate::index::{Inner, Shared};
-use crate::io::{Arena, Range, Span, Wave, arena_bound, coalesce};
+use crate::io::{Arena, InOrder, Range, Span, Wave, arena_bound, coalesce};
 use crate::quantization::rabitq::{BLOCK, block_bytes};
 use crate::quantization::{padded_dim, sq8};
 use crate::trace::{Clock, ReadPath};
@@ -56,11 +56,14 @@ pub(crate) struct Reads {
     clusters_in: bool,
     /// Whether a read of `clusters` failed, which leaves them incomplete.
     failed: bool,
-    /// The row pages read early for a guess at the query, and whether that wave may still be arriving.
+    /// The row pages read early for a guess at the query, and whether that wave may still bring pages in.
     early: Batch,
     early_pending: bool,
-    /// Whether the last `start_rows` needs some of the early rows.
-    early_used: bool,
+    /// Which pages of `early` are in its arena, one bit per place in its keys. A backend that reads in order reads
+    /// only the pages that a search needs, so another search of the same fetch may need some that aren't in yet.
+    early_in: Vec<u64>,
+    /// The places in `early.keys` of the pages that the last `start_rows` takes from the early wave.
+    early_needed: Vec<usize>,
     /// The row pages that the final query needs and the early wave didn't read.
     late: Batch,
     /// How long the last scan waited for its clusters to arrive, measured only with the `bench` feature.
@@ -116,7 +119,8 @@ impl Reads {
             failed: false,
             early: Batch::new(keep, row_arena),
             early_pending: false,
-            early_used: false,
+            early_in: vec![0; keep.div_ceil(64)],
+            early_needed: Vec::with_capacity(keep),
             late: Batch::new(keep, row_arena),
             waited: Duration::ZERO,
             searches: 0,
@@ -306,6 +310,7 @@ impl Reads {
     /// Starts reading the rows of `candidates`, eg. the best candidates for a guess at the query.
     pub(crate) fn prefetch(&mut self, file: &File, candidates: &[Candidate]) -> Result<(), Error> {
         self.early_pending = false;
+        self.early_in.fill(0);
         let e = &mut self.early;
         e.keys.clear();
         e.keys.extend(self.rows.pages(candidates));
@@ -330,17 +335,24 @@ impl Reads {
         self.finish_rows(file)
     }
 
-    /// Starts reading the rows of `candidates` that the early wave didn't, so other reads can start before the wait.
+    /// Starts reading the rows of `candidates` that the early wave didn't, so other reads can start before the wait. A
+    /// page of the early wave needs no read once it is in, nor while that wave may still bring it in.
     pub(crate) fn start_rows(&mut self, file: &File, candidates: &[Candidate], warm: bool) -> Result<(), Error> {
-        let (e, l) = (&mut self.early, &mut self.late);
+        let (e, l, needed) = (&self.early, &mut self.late, &mut self.early_needed);
+        let held = |j| self.early_pending || has(&self.early_in, j);
         l.keys.clear();
         l.keys.extend(self.rows.pages(candidates));
         l.keys.sort_unstable();
         l.keys.dedup();
-        let needed = l.keys.len();
-        l.keys.retain(|p| e.keys.binary_search(p).is_err());
+        needed.clear();
+        l.keys.retain(|p| match e.keys.binary_search(p) {
+            Ok(j) if held(j) => {
+                needed.push(j);
+                false
+            }
+            _ => true,
+        });
         self.rows.plan(l, self.page, self.file_len);
-        self.early_used = l.keys.len() < needed;
 
         match warm {
             true => self.wave.submit_cached(MAIN, file, &l.ranges, l.arena.memory()),
@@ -348,13 +360,21 @@ impl Reads {
         }
     }
 
-    /// Waits for the rows that `start_rows` started, and for the early rows when some of them are needed.
+    /// Waits for the rows that `start_rows` started, and brings in the early pages that it takes from the early wave.
+    /// A guess reads more rows early than the query ends up needing, and a backend that reads in order copies a page
+    /// into the arena only when asked, so it reads just the pages needed and leaves the rest unread. Any other
+    /// backend's reads land by themselves, so it waits for the whole wave.
     pub(crate) fn finish_rows(&mut self, file: &File) -> Result<(), Error> {
-        if self.early_used && self.early_pending {
-            drain(&mut *self.wave, EARLY, file, &mut self.early)?;
+        if !self.early_needed.is_empty() {
+            if let Some(reader) = self.wave.in_order() {
+                read_pages(reader, file, &mut self.early, &self.early_needed, &mut self.early_in)?;
+            } else if self.early_pending {
+                drain(&mut *self.wave, EARLY, file, &mut self.early)?;
+                self.early_in.fill(u64::MAX);
+                self.early_pending = false;
+            }
         }
 
-        self.early_pending = false;
         drain(&mut *self.wave, MAIN, file, &mut self.late)?;
         self.searches += 1;
         Ok(())
@@ -379,8 +399,8 @@ impl Reads {
     pub(crate) fn row(&self, id: u32) -> &[u8] {
         let page = self.rows.page_of(id);
         let (b, j) = match self.early.keys.binary_search(&page) {
-            Ok(j) => (&self.early, j),
-            Err(_) => {
+            Ok(j) if has(&self.early_in, j) => (&self.early, j),
+            _ => {
                 let j = self.late.keys.binary_search(&page);
                 (
                     &self.late,
@@ -543,6 +563,50 @@ fn drain(wave: &mut dyn Wave, lane: usize, file: &File, b: &mut Batch) -> Result
     }
 
     Ok(())
+}
+
+/// Reads the pages of `b` at the places in `needed` that aren't in `ins` yet through `reader`, each into the place that
+/// the wave gave it in the arena. Pages that follow one another in the file go in one read. Only once every read is in
+/// does it mark them all in `ins`, so a read that fails leaves its pages to be read again.
+fn read_pages(
+    reader: &mut InOrder,
+    file: &File,
+    b: &mut Batch,
+    needed: &[usize],
+    ins: &mut [u64],
+) -> Result<(), Error> {
+    let mut part: Option<Range> = None;
+
+    for &j in needed.iter().filter(|&&j| !has(ins, j)) {
+        let (s, at) = (b.spans[j], b.at[j]);
+
+        if let Some(p) = part.as_mut().filter(|p| p.end() == s.offset && p.at + p.len == at) {
+            p.len += s.len;
+            continue;
+        }
+
+        let page = Range {
+            offset: s.offset,
+            len: s.len,
+            tag: j,
+            at,
+        };
+        if let Some(p) = part.replace(page) {
+            reader.read_part(file, p, b.arena.memory())?;
+        }
+    }
+
+    if let Some(p) = part {
+        reader.read_part(file, p, b.arena.memory())?;
+    }
+
+    needed.iter().for_each(|&j| ins[j / 64] |= 1 << (j % 64));
+    Ok(())
+}
+
+/// Whether bit `j` of `bits` is set.
+fn has(bits: &[u64], j: usize) -> bool {
+    bits[j / 64] >> (j % 64) & 1 == 1
 }
 
 fn lost() -> Error {

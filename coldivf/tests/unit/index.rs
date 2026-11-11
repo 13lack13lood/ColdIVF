@@ -263,36 +263,86 @@ fn a_fetch_of_the_routed_clusters_searches_like_search() {
 
 #[test]
 fn rows_prefetched_for_a_guess_never_change_the_hits() {
-    let (_, index, _path, queries) = sample("guessed.coldivf");
+    let (_, _, path, queries) = sample("guessed.coldivf");
     let sp = SearchParams {
         k: 10,
         nprobe: 16,
         rerank: 40,
         reach: None,
     };
-    let (mut a, mut b) = (ctx(), ctx());
-    let mut rng = SplitMix64::new(6);
     let mut leaves = Vec::new();
 
-    for q in &queries {
-        let want = bits(index.search(q, &sp, &mut a).unwrap());
-        let noise = gaussian(&mut rng, 1, 128, |_| 0.3);
-        let near: Vec<f32> = q.iter().zip(&noise).map(|(x, e)| x + e).collect();
-        let far = gaussian(&mut rng, 1, 128, |_| 1.0);
-        let guesses: [&[(&[f32], usize)]; 5] = [
-            &[],
-            &[(&near, sp.rerank)],
-            &[(&near, 0)],
-            &[(&far, 200)],
-            &[(&far, 30), (q, sp.rerank), (&near, 100)],
-        ];
-        index.route(q, sp.nprobe, None, &mut b, &mut leaves).unwrap();
-        for (g, guess) in guesses.iter().enumerate() {
-            let mut fetched = index.fetch(&leaves, &mut b).unwrap();
-            for &(e, n) in guess.iter() {
-                fetched.prefetch_rows(e, n).unwrap();
+    // A backend that reads in order reads only the prefetched rows that the search needs, and any other waits for all
+    // of them, so every backend must give the same hits.
+    for (name, wave) in waves() {
+        let index = public(Inner::open(&path).unwrap().with_wave(wave));
+        let (mut a, mut b) = (ctx(), ctx());
+        let mut rng = SplitMix64::new(6);
+
+        for q in &queries {
+            let want = bits(index.search(q, &sp, &mut a).unwrap());
+            let noise = gaussian(&mut rng, 1, 128, |_| 0.3);
+            let near: Vec<f32> = q.iter().zip(&noise).map(|(x, e)| x + e).collect();
+            let far = gaussian(&mut rng, 1, 128, |_| 1.0);
+            let guesses: [&[(&[f32], usize)]; 6] = [
+                &[],
+                &[(&near, sp.rerank)],
+                &[(&near, 0)],
+                &[(&far, 200)],
+                &[(q, 200)],
+                &[(&far, 30), (q, sp.rerank), (&near, 100)],
+            ];
+            index.route(q, sp.nprobe, None, &mut b, &mut leaves).unwrap();
+            for (g, guess) in guesses.iter().enumerate() {
+                let mut fetched = index.fetch(&leaves, &mut b).unwrap();
+                for &(e, n) in guess.iter() {
+                    fetched.prefetch_rows(e, n).unwrap();
+                }
+                assert_eq!(
+                    bits(fetched.search(q, sp.k, sp.rerank).unwrap()),
+                    want,
+                    "{name}, guess {g}"
+                );
             }
-            assert_eq!(bits(fetched.search(q, sp.k, sp.rerank).unwrap()), want, "guess {g}");
+        }
+    }
+}
+
+#[test]
+fn a_second_search_of_one_fetch_finds_what_a_fresh_fetch_does() {
+    let (_, _, path, queries) = sample("twice.coldivf");
+    let mut leaves = Vec::new();
+
+    for (name, wave) in waves() {
+        let index = public(Inner::open(&path).unwrap().with_wave(wave));
+        let (mut a, mut b) = (ctx(), ctx());
+        let mut rng = SplitMix64::new(26);
+
+        for q in queries.iter().take(10) {
+            let noise = gaussian(&mut rng, 1, 128, |_| 0.3);
+            let near: Vec<f32> = q.iter().zip(&noise).map(|(x, e)| x + e).collect();
+            index.route(q, 16, None, &mut b, &mut leaves).unwrap();
+            let mut fresh =
+                |q: &[f32], k, rerank| bits(index.fetch(&leaves, &mut a).unwrap().search(q, k, rerank).unwrap());
+            let later = SearchParams {
+                k: 10,
+                nprobe: 0,
+                rerank: 100,
+                reach: None,
+            };
+
+            // The guess reads 200 rows early. The first search needs none of them or a few, and the second, of a near
+            // query, many that the first left unread.
+            for (k, rerank) in [(0, 0), (10, 10), (10, 40)] {
+                let want = (fresh(q, k, rerank), fresh(&near, later.k, later.rerank));
+                let mut fetched = index.fetch(&leaves, &mut b).unwrap();
+                fetched.prefetch_rows(q, 200).unwrap();
+                let (inner, slot) = (Arc::clone(&fetched.inner), fetched.slot);
+                let first = bits(fetched.search(q, k, rerank).unwrap());
+                // `Fetched::search` takes the fetch, so the second search goes through the call underneath it.
+                let second = bits(inner.search_fetched(&near, &later, &mut b, slot).unwrap());
+                assert_eq!((first, second), want, "{name}, first ({k}, {rerank})");
+            }
         }
     }
 }

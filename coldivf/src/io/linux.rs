@@ -256,6 +256,13 @@ impl Wave for UringWave {
         }
     }
 
+    fn in_order(&mut self) -> Option<&mut InOrder> {
+        match &mut self.mode {
+            Mode::Fadvise(fadvise) => fadvise.in_order(),
+            _ => None,
+        }
+    }
+
     fn read_path(&self) -> ReadPath {
         match &self.mode {
             Mode::Unset => ReadPath::default(),
@@ -677,6 +684,10 @@ impl Wave for FadviseWave {
 
     fn next(&mut self, lane: usize, file: &File, ranges: &[Range], arena: Memory) -> Result<Option<usize>, Error> {
         self.0.read(lane, file, ranges, arena)
+    }
+
+    fn in_order(&mut self) -> Option<&mut InOrder> {
+        Some(&mut self.0)
     }
 
     fn read_path(&self) -> ReadPath {
