@@ -493,8 +493,8 @@ fn every_build_check_rejects_with_invalid_input() {
 
 #[test]
 fn rows_of_more_than_4080_dimensions_need_pages_of_8_kib() {
-    // A row takes the dimension plus 16 bytes, rounded up to 8, so 4080 dimensions fill a 4 KiB page, and 4081 to 4352
-    // take 4104 to 4368 bytes.
+    // A row takes the dimension plus 16 bytes, rounded up to 8, so 4080 dimensions fill a 4 KiB page exactly, and 4081
+    // to 4352 take 4104 to 4368 bytes.
     let mut rng = SplitMix64::new(18);
 
     for dim in [4080, 4081, 4096, MAX_DIM] {
@@ -506,16 +506,18 @@ fn rows_of_more_than_4080_dimensions_need_pages_of_8_kib() {
             };
             InMemory::build(&p, &rows, &clusters)
         };
-        match build(4096) {
-            Ok(index) => assert_eq!((dim, index.in_place().rows.per_page), (4080, 1)),
-            Err(e) => {
-                assert_eq!(e.kind(), ErrorKind::InvalidInput, "dim {dim}");
-                assert_eq!(
-                    e.to_string(),
-                    "above 4080 dimensions a row takes more than 4 KiB, so the page size must be at least 8192",
-                    "dim {dim}"
-                );
-            }
+        if dim == 4080 {
+            assert_eq!(build(4096).unwrap().in_place().rows.per_page, 1);
+        } else {
+            let Err(e) = build(4096) else {
+                panic!("dim {dim}: a 4 KiB page took a row of more than 4 KiB");
+            };
+            assert_eq!(e.kind(), ErrorKind::InvalidInput, "dim {dim}");
+            assert_eq!(
+                e.to_string(),
+                "above 4080 dimensions a row takes more than 4 KiB, so the page size must be at least 8192",
+                "dim {dim}"
+            );
         }
         let index = build(8192).unwrap();
         assert_eq!(
