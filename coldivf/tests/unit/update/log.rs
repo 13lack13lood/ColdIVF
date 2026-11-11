@@ -1,10 +1,15 @@
-//! Unit tests for the log formats: their records, and which damage each version takes as a torn write.
+//! Unit tests for the log: the records of its formats, which damage each version takes as a torn write, and which
+//! syncs it skips.
 
 use std::io::ErrorKind;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::*;
+use crate::Writer;
+use crate::io::watch::{self, Op};
+use crate::quantization::SplitMix64;
 use crate::quantization::rabitq::Factors;
-use crate::quantization::testutil::{params, written};
+use crate::quantization::testutil::{gaussian, params, written};
 use crate::update::Applier;
 
 const DIM: usize = 128;
@@ -241,4 +246,76 @@ fn a_whole_record_that_does_not_fit_fails_a_version_2_log_and_ends_a_version_1_l
             }
         }
     }
+}
+
+/// Counts the syncs of the log of `writer` until the returned guard drops, and fails its writes as a full disk would
+/// while `full` is set. The watch takes the log alone for its folder, since the test files share theirs with other
+/// tests' files.
+fn watch_log(writer: &Writer, full: &Arc<AtomicBool>) -> (Arc<AtomicUsize>, watch::Guard) {
+    let (syncs, full) = (Arc::new(AtomicUsize::new(0)), Arc::clone(full));
+    let counted = Arc::clone(&syncs);
+    let guard = watch::set(writer.log.path(), move |op, _| match op {
+        Op::Sync => {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        Op::Write if full.load(Ordering::SeqCst) => Err(Error::new(ErrorKind::StorageFull, "a test fault")),
+        _ => Ok(()),
+    });
+    (syncs, guard)
+}
+
+#[test]
+fn a_sync_issues_none_when_nothing_was_appended_since_the_last_one() {
+    let (_, inner, path) = written("log-sync.coldivf", &params(crate::Metric::L2), 600, DIM, 6);
+    drop(inner);
+    let v = gaussian(&mut SplitMix64::new(71), 1, DIM, |_| 1.0);
+    let mut writer = Writer::open(&path).unwrap();
+    let full = Arc::new(AtomicBool::new(false));
+    let (syncs, _watch) = watch_log(&writer, &full);
+    let count = || syncs.load(Ordering::SeqCst);
+
+    // The sync after an insert issues one, and a second sync right after it issues none. The same goes for a delete.
+    writer.insert(9000, &v).unwrap();
+    writer.sync().unwrap();
+    writer.sync().unwrap();
+    assert_eq!(count(), 1);
+    writer.delete(9000).unwrap();
+    writer.sync().unwrap();
+    writer.sync().unwrap();
+    assert_eq!(count(), 2);
+
+    // A write that fails may land part of its record, which the writer cuts off again. Both change the file after the
+    // last sync, so the next sync issues one, though no record was appended.
+    full.store(true, Ordering::SeqCst);
+    assert_eq!(writer.insert(9001, &v).unwrap_err().kind(), ErrorKind::StorageFull);
+    full.store(false, Ordering::SeqCst);
+    writer.sync().unwrap();
+    writer.sync().unwrap();
+    assert_eq!(count(), 3);
+
+    // A maintenance run right after a sync begins its job without syncing the log again. The run's new log is another
+    // file, which the watch doesn't see.
+    writer.compact().unwrap();
+    assert_eq!(count(), 3);
+}
+
+#[test]
+fn a_writer_whose_open_cuts_nothing_still_syncs_what_an_earlier_writer_appended() {
+    let (_, inner, path) = written("log-sync-open.coldivf", &params(crate::Metric::L2), 600, DIM, 6);
+    drop(inner);
+    let v = gaussian(&mut SplitMix64::new(72), 1, DIM, |_| 1.0);
+
+    // A writer that drops without a sync leaves its record in the log, maybe only in the system's cache.
+    let mut writer = Writer::open(&path).unwrap();
+    writer.insert(9000, &v).unwrap();
+    drop(writer);
+
+    // The next writer's open finds the log whole and cuts nothing, so its first sync issues one, though it appended
+    // nothing, and only its second issues none.
+    let mut writer = Writer::open(&path).unwrap();
+    let (syncs, _watch) = watch_log(&writer, &Arc::default());
+    writer.sync().unwrap();
+    writer.sync().unwrap();
+    assert_eq!(syncs.load(Ordering::SeqCst), 1);
 }

@@ -412,6 +412,10 @@ pub(crate) struct Log {
     _lock: Arc<File>,
     /// How many bytes its whole records take, which is where the next one goes.
     len: usize,
+    /// How many bytes its whole records took at its last sync, so a sync with nothing appended since returns at once.
+    /// It is 0 when the file may hold what no sync covered: an earlier writer's records that the open didn't sync, or
+    /// a failed write and its cut.
+    synced: usize,
     /// Set when a failed write left bytes that couldn't be cut off, so no record may follow them.
     broken: bool,
     /// Set when a commit failed in a way that leaves unknown which generation is current, so no record may go to this
@@ -469,16 +473,21 @@ impl Log {
             ));
         }
 
-        if !ours {
+        let synced = if !ours {
             file.set_len(0)?;
             file.write_all(&version.header(layout))?;
             io::sync_file(&file, path)?;
             a.set_log_len(version.header_len());
             changes.publish(&mut a);
+            a.log_len()
         } else if len > a.log_len() as u64 {
             file.set_len(a.log_len() as u64)?;
             io::sync_file(&file, path)?;
-        }
+            a.log_len()
+        } else {
+            // The records may come from a writer that never synced them, so none counts as synced.
+            0
+        };
 
         file.seek(SeekFrom::Start(a.log_len() as u64))?;
         Ok(Log {
@@ -488,6 +497,7 @@ impl Log {
             dim: layout.dim,
             _lock: lock,
             len: a.log_len(),
+            synced,
             broken: false,
             poisoned: false,
         })
@@ -516,6 +526,7 @@ impl Log {
             dim: layout.dim,
             _lock: lock,
             len: bytes.len(),
+            synced: bytes.len(),
             broken: false,
             poisoned: false,
         })
@@ -546,6 +557,8 @@ impl Log {
                 .set_len(back)
                 .and_then(|()| self.file.seek(SeekFrom::Start(back)).map(|_| ()));
             self.broken = cut.is_err();
+            // What landed of the record, and the cut, changed the file since the last sync.
+            self.synced = 0;
             return Err(e);
         }
 
@@ -570,9 +583,16 @@ impl Log {
         Ok(())
     }
 
-    /// Makes every record so far survive a power loss.
+    /// Makes every record so far survive a power loss. With nothing appended since the last sync it returns at once,
+    /// since a sync takes milliseconds even then, eg. on macOS, where it has the drive write its whole cache out.
     pub(crate) fn sync(&mut self) -> Result<(), Error> {
-        io::sync_file(&self.file, &self.path)
+        if self.synced == self.len {
+            return Ok(());
+        }
+
+        io::sync_file(&self.file, &self.path)?;
+        self.synced = self.len;
+        Ok(())
     }
 
     /// Refuses every record from now on, after a commit whose outcome is unknown.
