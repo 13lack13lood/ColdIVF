@@ -819,6 +819,54 @@ fn a_warm_up_stops_at_a_clear_or_once_the_index_closes() {
 }
 
 #[test]
+fn a_warm_up_touches_each_page_of_the_codes_once_before_the_bit_and_warm_searches_keep_their_hits() {
+    let dim = 128;
+    let (memory, file, _path) = written("warm-touch.coldivf", &params(Metric::L2), 3000, dim, 64);
+    let index = public(file);
+    let inner = index.inner();
+    let (codes, page) = (inner.in_place().blocks, io::page_size());
+    let lead = codes.as_ptr() as usize % page;
+    assert!(codes.len() > page, "{} bytes of codes", codes.len());
+
+    // Nothing starts the pressure watch here, so no clear comes between the warm-up and the searches.
+    TOUCHED.with(|t| t.borrow_mut().clear());
+    let (weak, mark) = (Arc::downgrade(&inner), inner.warmth.mark());
+    assert_eq!(warm_once(&weak, mark).unwrap(), codes.len());
+    assert!(index.is_warm());
+
+    // Before it set the bit, it touched one byte of the codes on each of the system's pages that hold them, unless its
+    // reads faulted the pages in themselves, as they do from Linux 5.14.
+    let want: Vec<usize> = (0..(lead + codes.len()).div_ceil(page)).collect();
+    #[cfg(target_os = "linux")]
+    let want = match crate::io::linux::populate(&codes[..1]).unwrap() {
+        true => Vec::new(),
+        false => want,
+    };
+    let touched = TOUCHED.with(|t| t.take());
+    assert!(touched.iter().all(|&(at, warm)| !warm && at < codes.len()));
+    let pages: Vec<usize> = touched.iter().map(|&(at, _)| (lead + at) / page).collect();
+    assert_eq!(pages, want, "pages of {page} bytes");
+
+    // Warm searches give exactly the in-memory hits.
+    let (mut a, mut b) = (ctx(), ctx());
+
+    for q in gaussian(&mut SplitMix64::new(25), 4, dim, |_| 1.0).chunks_exact(dim) {
+        for nprobe in [6, 24] {
+            let sp = SearchParams {
+                k: 10,
+                nprobe,
+                rerank: 40,
+                reach: None,
+            };
+            let want = bits(memory.search(q, &sp, &mut a).unwrap());
+            assert_eq!(bits(index.search(q, &sp, &mut b).unwrap()), want, "nprobe {nprobe}");
+        }
+    }
+
+    assert!(index.is_warm());
+}
+
+#[test]
 fn a_warm_up_warms_the_open_file_after_a_rebuild_renames_another_over_it() {
     let (memory, file, path) = written("warm-replaced.coldivf", &params(Metric::L2), 400, 128, 12);
     let index = public(file);

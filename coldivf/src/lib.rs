@@ -325,11 +325,12 @@ impl Index {
     }
 
     /// Reads every cluster's blocks into the operating system's cache on a background thread, in file order, and
-    /// returns at once. The thread runs at low priority on macOS and Linux. When it is done, the index is warm, and
-    /// searches score the clusters in place. A clear while it runs stops it, and so does a failed read, which nothing
-    /// reports. Either way the index stays cold. A call while a warm-up runs makes it run again if the index isn't warm
-    /// when it ends, and a call once the index is warm does nothing. On Mac drives that refuse read hints, eg. FAT32,
-    /// it can't fill the cache, so it stops at once.
+    /// returns at once. The thread runs at low priority on macOS and Linux. It also touches each page of the blocks in
+    /// the index's memory map, so the first searches after it take no page faults for them. When it is done, the index
+    /// is warm, and searches score the clusters in place. A clear while it runs stops it, and so does a failed read,
+    /// which nothing reports. Either way the index stays cold. A call while a warm-up runs makes it run again if the
+    /// index isn't warm when it ends, and a call once the index is warm does nothing. On Mac drives that refuse read
+    /// hints, eg. FAT32, it can't fill the cache, so it stops at once.
     pub fn warm_up(&self) -> Result<(), Error> {
         self.shared.load().warm_up()
     }

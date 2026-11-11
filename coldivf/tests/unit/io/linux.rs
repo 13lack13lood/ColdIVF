@@ -526,13 +526,13 @@ fn warming_brings_the_mapped_pages_into_memory() {
 
     evict(&cold);
     let mut buf = vec![0u8; 1 << 18];
-    crate::io::warm(&cold.file, map.bytes(), &mut buf, 1 << 18).unwrap();
+    let mapped = crate::io::warm(&cold.file, map.bytes(), &mut buf, 1 << 18).unwrap();
     assert!(resident(&map) >= 1 << 18, "{} bytes resident", resident(&map));
 
-    // From Linux 5.14 the kernel faults the pages in itself, and before it says so.
+    // From Linux 5.14 the kernel faults the pages in itself, and before it says so. The warm-up's answer says which.
     match populate(&map.bytes()[1..]) {
-        Ok(true) => assert_eq!(resident(&map), 1 << 20),
-        Ok(false) => assert!(NO_POPULATE.load(Ordering::Relaxed)),
+        Ok(true) => assert_eq!((mapped, resident(&map)), (true, 1 << 20)),
+        Ok(false) => assert!(!mapped && NO_POPULATE.load(Ordering::Relaxed)),
         Err(e) => panic!("{e}"),
     }
 

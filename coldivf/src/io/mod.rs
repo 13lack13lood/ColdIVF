@@ -371,19 +371,20 @@ pub(crate) fn read_cached(file: &File, buf: &mut [u8], offset: usize) -> Result<
 
 /// Brings `buf.len()` bytes from `offset` of an index file into the operating system's cache, and returns once they are
 /// in, eg. for a warm-up. `map` is the whole file, mapped. On Linux it faults the mapped pages in, so a scan in place
-/// later doesn't stop for them. Before Linux 5.14, and on other systems, it reads them through the cold handle `file`.
-pub(crate) fn warm(file: &File, map: &[u8], buf: &mut [u8], offset: usize) -> Result<(), Error> {
+/// later doesn't stop for them, and returns true. Before Linux 5.14, and on other systems, it reads them through the
+/// cold handle `file`, which maps none of them, and returns false.
+pub(crate) fn warm(file: &File, map: &[u8], buf: &mut [u8], offset: usize) -> Result<bool, Error> {
     #[cfg(target_os = "linux")]
     {
         if linux::populate(&map[offset..offset + buf.len()])? {
-            return Ok(());
+            return Ok(true);
         }
     }
 
     #[cfg(not(target_os = "linux"))]
     let _ = map;
 
-    read_cached(file, buf, offset)
+    read_cached(file, buf, offset).map(|()| false)
 }
 
 /// The next range of a lane's last submit to hand over, and how many it has.

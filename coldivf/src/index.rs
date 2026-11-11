@@ -48,6 +48,13 @@ static NEXT_UID: AtomicU64 = AtomicU64::new(1);
 /// The shared cells of the open indexes of this process.
 static SHARED: Mutex<Vec<Weak<Shared>>> = Mutex::new(Vec::new());
 
+#[cfg(test)]
+thread_local! {
+    /// The bytes of the codes section, by their place in it, that `prefault_codes` touched on this thread, each with
+    /// whether the index was warm then.
+    static TOUCHED: std::cell::RefCell<Vec<(usize, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// One index as every open handle of it in this process shares it: the generation that it holds now, and the ones it
 /// held before that a search or a fetch may still hold.
 pub(crate) struct Shared {
@@ -1071,11 +1078,21 @@ impl Inner {
             .collect()
     }
 
-    /// Touches a byte of each page of the codes section's map, so a scan in place of them takes no page fault for a
-    /// page that the system holds in memory.
+    /// Touches a byte of each of the system's pages that hold the codes section's map, so a scan in place of them takes
+    /// no page fault for a page that the system holds in memory.
     pub(crate) fn prefault_codes(&self) {
-        let codes = self.in_place().blocks;
-        codes.iter().step_by(4096).for_each(|b| _ = std::hint::black_box(*b));
+        let (codes, page) = (self.in_place().blocks, io::page_size());
+        // The section starts on a 16 KiB boundary of the file, which may fall inside a page where the system's pages
+        // are larger, eg. 64 KiB. So it touches the section's first byte, then the first byte of each later page.
+        let lead = codes.as_ptr() as usize % page;
+
+        for at in (0..lead + codes.len()).step_by(page).map(|at| at.saturating_sub(lead)) {
+            if let Some(&byte) = codes.get(at) {
+                _ = std::hint::black_box(byte);
+                #[cfg(test)]
+                TOUCHED.with(|t| t.borrow_mut().push((at, self.is_warm())));
+            }
+        }
     }
 
     pub(crate) fn in_place(&self) -> InPlace<'_> {
@@ -1262,24 +1279,29 @@ fn keep_warming(index: &Weak<Inner>) {
 }
 
 /// Brings the codes section of `index` into the operating system's cache in file order, a piece at a time, then sets
-/// the warm bit. It does nothing for a warm index, and stops before a piece once the index has closed or a clear has
-/// come since `mark`. Returns how many bytes it brought in.
+/// the warm bit. Unless the reads faulted the mapped pages in, it first touches each of them, so the first warm
+/// searches take no page faults for them. It does nothing for a warm index, and stops before a piece, or before the
+/// touches, once the index has closed or a clear has come since `mark`. Returns how many bytes it brought in.
 pub(crate) fn warm_once(index: &Weak<Inner>, mark: u64) -> Result<usize, Error> {
     let span = match index.upgrade() {
         Some(inner) if !inner.is_warm() => inner.layout.span(Part::Codes),
         _ => return Ok(0),
     };
-    let mut buf = vec![0u8; PIECE.min(span.len)];
+    let (mut buf, mut mapped) = (vec![0u8; PIECE.min(span.len)], true);
 
     for at in (span.offset..span.end()).step_by(PIECE) {
         let Some(inner) = index.upgrade().filter(|inner| inner.warmth.mark() == mark) else {
             return Ok(at - span.offset);
         };
         let piece = &mut buf[..PIECE.min(span.end() - at)];
-        io::warm(&inner.cold.file, inner.map.bytes(), piece, at)?;
+        mapped &= io::warm(&inner.cold.file, inner.map.bytes(), piece, at)?;
     }
 
-    if let Some(inner) = index.upgrade() {
+    // A clear since `mark` may have let the system drop the pages, which touching them would read back in.
+    if let Some(inner) = index.upgrade().filter(|inner| inner.warmth.mark() == mark) {
+        if !mapped {
+            inner.prefault_codes();
+        }
         inner.warmth.finish(mark);
     }
 
