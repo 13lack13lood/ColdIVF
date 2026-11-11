@@ -357,9 +357,8 @@ impl QueryLut {
 /// The sum s of one code, as `code_sum` gives it, from the query's bit planes `planes`, which `make_planes` made. It is
 /// the sum over b of 2^b times the number of bits that the code and plane b both set.
 pub(crate) fn plane_sum(code: &[u8], planes: &[u8]) -> u32 {
-    // Each byte lane of the NEON sum adds at most 8 per 16 bytes, so 31 of them fit a byte.
     #[cfg(target_arch = "aarch64")]
-    if code.len().is_multiple_of(16) && code.len() <= 16 * 31 && planes.len() >= 4 * code.len() {
+    if code.len().is_multiple_of(16) && planes.len() >= 4 * code.len() {
         // SAFETY: every aarch64 target has NEON, and the loads stay within `code` and the first four planes.
         return unsafe { plane_sum_neon(code, planes) };
     }
@@ -367,25 +366,32 @@ pub(crate) fn plane_sum(code: &[u8], planes: &[u8]) -> u32 {
     plane_sum_portable(code, planes)
 }
 
-/// `plane_sum` with NEON: each plane's bytes that the code shares, counted 16 at a time in byte lanes.
+/// `plane_sum` with NEON: each plane's bytes that the code shares, counted 16 at a time in byte lanes. A lane adds at
+/// most 8 per 16 bytes, so it holds the counts of 31 chunks of 16 bytes, and a longer code is counted 31 chunks at a
+/// time, eg. one of 4096 dimensions, which has 32.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn plane_sum_neon(code: &[u8], planes: &[u8]) -> u32 {
     use std::arch::aarch64::{vaddlvq_u8, vaddq_u8, vandq_u8, vcntq_u8, vdupq_n_u8, vld1q_u8};
     let cb = code.len();
+    let code = code.as_chunks::<16>().0;
     let mut total = 0u32;
 
     for b in 0..4 {
-        let plane = &planes[b * cb..(b + 1) * cb];
-        let mut ones = vdupq_n_u8(0);
+        let plane = planes[b * cb..(b + 1) * cb].as_chunks::<16>().0;
+        let mut ones = 0u32;
 
-        for (c, p) in code.as_chunks::<16>().0.iter().zip(plane.as_chunks::<16>().0) {
-            // SAFETY: each chunk holds 16 bytes.
-            let both = unsafe { vandq_u8(vld1q_u8(c.as_ptr()), vld1q_u8(p.as_ptr())) };
-            ones = vaddq_u8(ones, vcntq_u8(both));
+        for (code_part, plane_part) in code.chunks(31).zip(plane.chunks(31)) {
+            let mut lanes = vdupq_n_u8(0);
+            for (c, p) in code_part.iter().zip(plane_part) {
+                // SAFETY: each chunk holds 16 bytes.
+                let both = unsafe { vandq_u8(vld1q_u8(c.as_ptr()), vld1q_u8(p.as_ptr())) };
+                lanes = vaddq_u8(lanes, vcntq_u8(both));
+            }
+            ones += u32::from(vaddlvq_u8(lanes));
         }
 
-        total += u32::from(vaddlvq_u8(ones)) << b;
+        total += ones << b;
     }
 
     total

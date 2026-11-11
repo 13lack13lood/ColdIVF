@@ -1,12 +1,14 @@
 //! Unit tests for maintenance runs.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use super::*;
 use crate::quantization::SplitMix64;
-use crate::quantization::testutil::{Rows, TempFile, clustered, data_of, dist2, gaussian, params, temp_file};
+use crate::quantization::testutil::{Rows, TempFile, clustered, data_of, dist2, gaussian, group, params, temp_file};
 use crate::update::log_path;
-use crate::{BuildParams, Builder, Index, LeafId, LeafOrder, MajorParams, MinorParams, SearchParams, Throttle, Writer};
+use crate::{
+    BuildParams, Builder, Hit, Index, LeafId, LeafOrder, MajorParams, MinorParams, SearchParams, Throttle, Writer,
+};
 
 pub(crate) const DIM: usize = 128;
 
@@ -166,6 +168,114 @@ fn every_run_keeps_each_visible_vector_once_and_no_hidden_one() {
             );
         }
     }
+}
+
+#[test]
+fn an_index_of_4096_dimensions_builds_searches_and_maintains() {
+    // Its rows take 4112 bytes, more than a 4 KiB page holds, so each 16 KiB page holds 3, and its codes take 32 chunks
+    // of 16 bytes, more than one NEON count of a pending insert's code holds.
+    let (dim, n) = (4096, 400);
+    let mut rng = SplitMix64::new(37);
+    let (rows, mut clusters) = clustered(&mut rng, n, dim, 8, 0.5);
+    group(&mut clusters, 2);
+    let row = |r: usize| &rows.data[r * dim..(r + 1) * dim];
+    let p = BuildParams {
+        page_size: 16384,
+        ..build_params(Metric::Cosine, Anchor::Cluster)
+    };
+    let path = temp_file("dim-4096.coldivf");
+    Builder::new(p.clone())
+        .build_with_clusters(&rows, &clusters, &path)
+        .unwrap();
+    let _ = std::fs::remove_file(log_path(&path));
+
+    // The file searches exactly as the same index in memory does, cold and through its map.
+    let memory = crate::search::inmem::InMemory::build(&p, &rows, &clusters).unwrap();
+    let index = Index::open(&path).unwrap();
+    index.verify().unwrap();
+    let sp = SearchParams {
+        k: 10,
+        nprobe: 4,
+        rerank: 40,
+        reach: None,
+    };
+    let limits = Limits {
+        max_k: 10,
+        max_nprobe: 4,
+        max_rerank: 40,
+    };
+    let (mut a, mut b, mut c) = (SearchCtx::new(limits), SearchCtx::new(limits), SearchCtx::new(limits));
+    let bits = |hits: &[Hit]| -> Vec<(u64, u32)> { hits.iter().map(|h| (h.id, h.score.to_bits())).collect() };
+    for q in gaussian(&mut rng, 5, dim, |_| 1.0).chunks_exact(dim) {
+        let want = bits(memory.search(q, &sp, &mut a).unwrap());
+        assert_eq!(bits(index.search(q, &sp, &mut b).unwrap()), want);
+        assert_eq!(bits(index.inner().search_mapped(q, &sp, &mut c).unwrap()), want);
+    }
+    drop(index);
+
+    // Each round makes changes, then one kind of run. The round's inserts find themselves and its deleted vectors are
+    // gone, for the writer before and after the run, and for an index opened again, which replays the log. After the
+    // last run every round's changes still hold.
+    let mut ids: BTreeSet<u64> = (0..n as u64).collect();
+    let (mut inserted, mut deleted) = (Vec::new(), Vec::new());
+    let check = |index: &Index, inserted: &[(u64, Vec<f32>)], deleted: &[(u64, Vec<f32>)], when: &str| {
+        for (id, v) in inserted {
+            assert_eq!(everything(index, v)[0], *id, "{when}: insert {id} is missing");
+        }
+        for (id, v) in deleted {
+            assert!(!everything(index, v).contains(id), "{when}: {id} is still there");
+        }
+    };
+
+    for (round, kind) in [RunKind::Fold, RunKind::Minor, RunKind::Major].into_iter().enumerate() {
+        let (first_insert, first_delete) = (inserted.len(), deleted.len());
+        let mut writer = Writer::open(&path).unwrap();
+        // 8 inserts near one vector join its cluster, more than a pending group that is scored one by one holds, and
+        // 4 go near others.
+        for i in 0..12 {
+            let r = match i < 8 {
+                true => 100 * round,
+                false => (rng.next_u64() % n as u64) as usize,
+            };
+            let v: Vec<f32> = row(r).iter().map(|&x| x + 0.3 * rng.normal() as f32).collect();
+            let id = 10_000 * (round as u64 + 1) + i;
+            writer.insert(id, &v).unwrap();
+            ids.insert(id);
+            inserted.push((id, v));
+        }
+        for j in 0..5 {
+            let r = 100 * round + 20 * j + 3;
+            writer.delete(r as u64).unwrap();
+            ids.remove(&(r as u64));
+            deleted.push((r as u64, row(r).to_vec()));
+        }
+        let want: Vec<u64> = ids.iter().copied().collect();
+        let (new, gone) = (&inserted[first_insert..], &deleted[first_delete..]);
+        assert!(
+            visible_ids(&writer) == want,
+            "round {round}: the writer holds other ids"
+        );
+        check(&writer.index, new, gone, "before the run");
+        drop(writer);
+        check(&Index::open(&path).unwrap(), new, gone, "reopened");
+
+        let mut writer = Writer::open(&path).unwrap();
+        let report = writer.maintain(&eager(), kind).unwrap();
+        assert_eq!((report.kind, report.count), (kind, want.len()));
+        assert_eq!(report.reencoded > 0, kind != RunKind::Fold, "{report:?}");
+        let mut got = ids_of(&path);
+        got.sort_unstable();
+        assert!(got == want, "{kind:?}: the new file holds other ids");
+        writer.index.verify().unwrap();
+        check(&writer.index, new, gone, "after the run");
+    }
+
+    check(
+        &Index::open(&path).unwrap(),
+        &inserted,
+        &deleted,
+        "reopened after the runs",
+    );
 }
 
 #[test]

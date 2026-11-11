@@ -4,6 +4,7 @@ use super::*;
 use crate::kernels::{Tier, center_distance2, sq4_dots};
 use crate::quantization::SplitMix64;
 use crate::quantization::testutil::{dot, gaussian};
+use crate::search::inmem::MAX_DIM;
 
 /// The codes of `n` random centers back to back, and their factors.
 fn random_centers(rng: &mut SplitMix64, n: usize, dim: usize) -> (Vec<u8>, Vec<CenterFactors>) {
@@ -53,8 +54,8 @@ fn simd_matches_scalar_exactly() {
 #[test]
 fn the_largest_products_add_up_exactly_on_every_tier() {
     // Every code at 15 against every query value at −128 or 127, so each product is as large as it gets, and the
-    // whole dot product is 15·d_pad·q.
-    for d_pad in [768, 1536] {
+    // whole dot product is 15·d_pad·q, up to the largest padded dimension.
+    for d_pad in [768, 1536, padded_dim(MAX_DIM)] {
         let codes = vec![0xffu8; 2 * code_bytes(d_pad)];
         for q in [-128i8, 127] {
             let q8 = vec![q; d_pad];

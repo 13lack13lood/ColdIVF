@@ -14,7 +14,7 @@ use crate::quantization::SplitMix64;
 use crate::quantization::testutil::{
     EndsEarly, Faulty, Rows, Shuffled, TempFile, clustered, gaussian, group, params, shuffle, temp_file, written,
 };
-use crate::search::inmem::InMemory;
+use crate::search::inmem::{InMemory, MAX_DIM};
 use crate::{Anchor, BuildParams, Index, LeafOrder, Limits, Metric};
 
 fn ctx() -> SearchCtx {
@@ -60,6 +60,8 @@ fn cold_and_mapped_searches_give_exactly_the_in_memory_hits() {
         (Metric::Cosine, LeafOrder::Chained, 768, 4096),
         (Metric::L2, LeafOrder::Chained, 768, 16384),
         (Metric::L2, LeafOrder::Chained, 3000, 4096),
+        // At the largest dimension a row takes 4368 bytes, so each 8 KiB page holds one.
+        (Metric::Cosine, LeafOrder::Chained, MAX_DIM, 8192),
     ];
     let settings = [
         SearchParams {

@@ -6,6 +6,7 @@ use crate::quantization::SplitMix64;
 use crate::quantization::sq4::{self, CenterFactors, QueryS32};
 use crate::quantization::sq8;
 use crate::quantization::testutil::{dist2, gaussian, mean};
+use crate::search::inmem::MAX_DIM;
 
 /// The codes of `rows`, back to back, and their factors.
 fn encode_all(rotation: &Rotation, mean: &[f32], rows: &[f32]) -> (Vec<u8>, Vec<Factors>) {
@@ -98,7 +99,8 @@ fn per_vector_and_block_paths_agree_bit_for_bit() {
 fn a_code_s_sum_from_the_query_s_bit_planes_is_its_sum() {
     let mut rng = SplitMix64::new(6);
 
-    for dim in [64, 200, 768] {
+    // Codes of 4096 dimensions and more take more than 31 chunks of 16 bytes, which the NEON sum counts in parts.
+    for dim in [64, 200, 768, 4096, MAX_DIM] {
         let cb = code_bytes(padded_dim(dim));
         let rows = gaussian(&mut rng, 40, dim, |_| 1.0);
         let mu = mean(&rows, dim);
@@ -123,6 +125,28 @@ fn a_code_s_sum_from_the_query_s_bit_planes_is_its_sum() {
                 "dim {dim}"
             );
         }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn the_neon_plane_sum_counts_codes_of_any_length() {
+    // With every bit of a code and its planes set, each byte lane of the NEON count adds 8 per 16 bytes, the most it
+    // can, so past 31 chunks of 16 bytes a lane would wrap unless the count goes in parts. 4096 and 4352 dimensions
+    // take 32 and 34 chunks.
+    let mut rng = SplitMix64::new(18);
+
+    for chunks in [1, 6, 31, 32, 34, 62, 63, 64, 100] {
+        let cb = 16 * chunks;
+        let ones = vec![0xffu8; 4 * cb];
+        let random: Vec<u8> = (0..4 * cb).map(|_| rng.next_u64() as u8).collect();
+        for (code, planes) in [(&ones, &ones), (&random, &ones), (&ones, &random)] {
+            // SAFETY: every aarch64 target has NEON, the code is a whole number of chunks of 16 bytes, and the planes
+            // hold four times its bytes.
+            let neon = unsafe { plane_sum_neon(&code[..cb], planes) };
+            assert_eq!(neon, plane_sum_portable(&code[..cb], planes), "{chunks} chunks");
+        }
+        assert_eq!(plane_sum(&ones[..cb], &ones), 15 * 8 * cb as u32, "{chunks} chunks");
     }
 }
 

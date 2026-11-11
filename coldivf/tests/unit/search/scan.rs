@@ -123,7 +123,7 @@ fn simd_scan_matches_scalar_bit_for_bit() {
 #[test]
 fn the_largest_sums_score_alike_on_every_tier() {
     // At the largest padded dimension, with every query value at 15, each set group adds 60, so a lane with every bit
-    // set sums 1024·60 = 61440, near the top of 16 bits.
+    // set sums 1088·60 = 65280, just below 2^16.
     let mut rng = SplitMix64::new(8);
     let d_pad = padded_dim(MAX_DIM);
     let mut query = random_query(&mut rng, d_pad);
@@ -131,11 +131,14 @@ fn the_largest_sums_score_alike_on_every_tier() {
         *entries = std::array::from_fn(|j| 15 * j.count_ones() as u8);
     }
     let (mut a, mut b) = ([Candidate::NONE; BLOCK], [Candidate::NONE; BLOCK]);
+    let mut sums = [0u32; BLOCK];
 
     // Every lane at the top, then only lanes 0 to 15, then only lanes 16 to 31.
     for code in [0xff, 0x0f, 0xf0] {
         let mut block = random_block(&mut rng, d_pad, BLOCK);
         block[..4 * d_pad].fill(code);
+        block_sums(&block, &query.lut, d_pad, &mut sums);
+        assert_eq!(sums.iter().max(), Some(&65_280), "codes {code:#x}");
         let na = scan_block(Tier::SCALAR, &block, &query, None, 0, BLOCK, Candidate::NONE, &mut a);
         assert_eq!(na, BLOCK);
         for tier in Tier::simd() {

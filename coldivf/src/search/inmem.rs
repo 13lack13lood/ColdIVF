@@ -21,8 +21,10 @@ use crate::{Anchor, BuildParams, Clusters, Hit, LeafId, Metric, SearchCtx, Searc
 /// The smallest dimension an index takes.
 pub(crate) const MIN_DIM: usize = 128;
 
-/// The largest dimension. Up to here a block's lookup sums fit in 16 bits and a row fits in a 4 KiB page.
-pub(crate) const MAX_DIM: usize = 4080;
+/// The largest dimension. Up to here a block's lookup sums fit in 16 bits: each of its d_pad/4 groups adds at most 60,
+/// so a sum is at most 15·4352 = 65280. Above 4080 dimensions a row takes more than 4 KiB, so it needs pages of 8 KiB
+/// or more.
+pub(crate) const MAX_DIM: usize = 4352;
 
 /// Rows read from the source at a time.
 pub(crate) const CHUNK: usize = 4096;
@@ -300,16 +302,21 @@ pub(crate) struct Stored {
 /// Checks the dimension, the vector count and the page size, the settings that need no clustering.
 pub(crate) fn check_settings(n: usize, dim: usize, page_size: usize) -> Result<(), Error> {
     if !(MIN_DIM..=MAX_DIM).contains(&dim) {
-        return Err(invalid("the dimension must be 128 to 4080"));
+        return Err(invalid("the dimension must be 128 to 4352"));
     }
 
     if n > u32::MAX as usize - BLOCK {
         return Err(invalid("an index holds at most 2^32 − 33 vectors"));
     }
 
-    if !page_size.is_multiple_of(4096) || page_size < sq8::row_bytes(dim) || page_size > MAX_PAGE {
+    if page_size == 0 || !page_size.is_multiple_of(4096) || page_size > MAX_PAGE {
+        return Err(invalid("the page size must be a multiple of 4096, 4 KiB to 1 MiB"));
+    }
+
+    // A row never crosses a page. Up to 4080 dimensions it fits in 4 KiB, and up to 4352 in 8 KiB.
+    if page_size < sq8::row_bytes(dim) {
         return Err(invalid(
-            "the page size must be a multiple of 4096, at most 1 MiB, that holds a row",
+            "above 4080 dimensions a row takes more than 4 KiB, so the page size must be at least 8192",
         ));
     }
 
