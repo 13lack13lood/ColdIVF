@@ -440,6 +440,65 @@ fn a_job_that_writes_in_other_windows_than_the_one_it_goes_on_from_starts_over()
 }
 
 #[test]
+fn a_job_cancelled_while_it_plans_keeps_the_file_and_the_mark_that_it_goes_on_from() {
+    let (dir, other) = (Folder::new("job-replan"), Folder::new("job-replan-whole"));
+    let (_, writer) = changed(&dir, Anchor::Cluster, 71);
+    drop(writer);
+    copy_index(&dir.index(), &other.index());
+    let mut writer = Writer::open(&dir.index()).unwrap();
+    let want = visible_ids(&writer);
+    let mut whole = Writer::open(&other.index()).unwrap();
+    let (done, file, writes) = run_job(&other, &mut whole, 64 << 10, None);
+    whole.finish_compact(done.unwrap()).unwrap();
+
+    // The first job stops halfway with a mark.
+    let (stopped, _, _) = run_job(&dir, &mut writer, 64 << 10, Some(writes / 2));
+    assert_eq!(stopped.err().map(|e| e.kind()), Some(ErrorKind::Interrupted));
+    let names = kept(&writer.root);
+    assert_eq!(names.len(), 2, "the job left no file to go on with");
+    let folder = crate::root::folder(&dir.index());
+    let contents = || -> Vec<Vec<u8>> { names.iter().map(|n| fs::read(folder.join(n)).unwrap()).collect() };
+    let left = contents();
+
+    // The next job goes on from the mark, and is cancelled while it plans: a search that the word says runs until an
+    // hour from now holds back its reads of the old file, so it can't finish its plan before the cancel.
+    let mut job = writer.begin(&settings(), RunKind::Fold).unwrap();
+    assert!(job.resumes(), "the next job started over");
+    job.window = 64 << 10;
+    let (cancel, link) = (job.canceller(), Arc::clone(writer.job.as_ref().unwrap()));
+    let activity = writer.index.shared.activity();
+    let throttle = Throttle::new(ThrottleParams {
+        quiet: Duration::from_millis(50),
+        reserve_bytes: 0,
+        ..ThrottleParams::default()
+    });
+    activity.set(io::now_ns() + 3_600_000_000_000);
+    let stopped = std::thread::scope(|s| {
+        let running = s.spawn(|| job.run(&throttle));
+        std::thread::sleep(Duration::from_millis(100));
+        cancel.cancel();
+        running.join().unwrap()
+    });
+    activity.set(0);
+    drop(job);
+    assert_eq!(stopped.err().map(|e| e.kind()), Some(ErrorKind::Interrupted));
+    assert!(link.centers.get().is_none(), "the job planned before the cancel");
+
+    // It leaves the file and the mark as they were, and the job after it goes on from the mark to the same file.
+    assert_eq!(
+        kept(&writer.root),
+        names,
+        "the cancelled job lost the file it went on with"
+    );
+    assert!(contents() == left, "the cancelled job changed the file it went on with");
+    let (done, again, more) = run_job(&dir, &mut writer, 64 << 10, None);
+    assert!(again == file, "the job that went on wrote another file");
+    assert!(more < writes, "the job that went on wrote the whole file again");
+    writer.finish_compact(done.unwrap()).unwrap();
+    assert_eq!(visible_ids(&writer), want);
+}
+
+#[test]
 fn a_job_outlives_its_writer_and_the_next_writer_goes_on_with_it() {
     let dir = Folder::new("job-outlives");
     let (_, mut writer) = changed(&dir, Anchor::Cluster, 64);

@@ -280,8 +280,9 @@ impl Job {
     /// Plans the next generation's data file and writes it, on the calling thread and a pool of the job's own, as
     /// `throttle` lets it. With [`Throttle::none`] it blocks the calling thread for as long as the run takes, and
     /// otherwise it also waits for quiet. The pool runs at utility quality of service (QoS) on macOS and a nice value
-    /// of 10 on Linux, unless `throttle` is none. A cancelled job fails with `Interrupted`. It keeps its file and resume
-    /// file once it recorded where it got, so the next job of the same generation goes on from there. A job runs once.
+    /// of 10 on Linux, unless `throttle` is none. A cancelled job fails with `Interrupted`. It keeps its file and
+    /// resume file once it recorded where it got, or while it plans when they are an earlier job's, so the next job of
+    /// the same generation goes on from there. A job runs once.
     pub fn run(&mut self, throttle: &Throttle) -> Result<Done, Error> {
         let (Some((next, file)), Some(lock)) = (self.next.take(), self.lock.take()) else {
             return Err(Error::new(ErrorKind::InvalidInput, "the job ran already"));
@@ -301,7 +302,9 @@ impl Job {
             start: None,
             plan: 0,
             marked: 0,
-            recorded: false,
+            // A job that goes on from a record writes nothing before its plan shows whether the record holds, so one
+            // cancelled before then leaves the record and its data file to the next job.
+            recorded: self.record.is_some(),
             lanes: Vec::new(),
         };
         let writes = Writes {
@@ -859,7 +862,8 @@ struct Tracker<'a> {
     record: Option<Record>,
     start: Option<Mark>,
     plan: u32,
-    /// The bytes written when the job last recorded a mark, and whether the resume file holds one of this plan.
+    /// The bytes written when the job last recorded a mark, and whether the resume file holds one to go on from: until
+    /// the plan, the one it held when the job began, if any, and then one of this plan.
     marked: u64,
     recorded: bool,
     lanes: Vec<Lane>,
