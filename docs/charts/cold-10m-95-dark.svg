@@ -182,7 +182,7 @@ z
 " style="stroke: #1a1a19; stroke-width: 1.75"/>
     </defs>
     <g clip-path="url(#pb12d3f9545)">
-     <use xlink:href="#m22ac2c8405" x="376.152644" y="97.5" style="fill: #3987e5; stroke: #1a1a19; stroke-width: 1.75"/>
+     <use xlink:href="#m22ac2c8405" x="374.912054" y="97.5" style="fill: #3987e5; stroke: #1a1a19; stroke-width: 1.75"/>
     </g>
    </g>
    <g id="text_7">
@@ -192,10 +192,10 @@ z
     <text style="font-size: 8px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #c3c2b7" x="294.2" y="106.6" transform="rotate(-0 294.2 106.6)">nprobe 192, rerank 39 · recall 0.953 · 300 trials</text>
    </g>
    <g id="text_9">
-    <text style="font-weight: 700; font-size: 9.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #ffffff" x="604" y="100.255371" transform="rotate(-0 604 100.255371)">11.2 ms</text>
+    <text style="font-weight: 700; font-size: 9.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #ffffff" x="604" y="100.255371" transform="rotate(-0 604 100.255371)">10.8 ms</text>
    </g>
    <g id="text_10">
-    <text style="font-size: 8.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="666" y="99.965332" transform="rotate(-0 666 99.965332)">13.1 ms</text>
+    <text style="font-size: 8.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="666" y="99.965332" transform="rotate(-0 666 99.965332)">12.9 ms</text>
    </g>
    <g id="line2d_20">
     <defs>

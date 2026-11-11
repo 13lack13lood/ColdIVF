@@ -223,21 +223,21 @@ z
    </g>
    <g id="patch_5">
     <path d="M 128 120.25 
-L 128.179363 120.25 
-Q 128.179363 120.25 128.179363 120.25 
-L 128.179363 111.25 
-Q 128.179363 111.25 128.179363 111.25 
+L 128.179757 120.25 
+Q 128.179757 120.25 128.179757 120.25 
+L 128.179757 111.25 
+Q 128.179757 111.25 128.179757 111.25 
 L 128 111.25 
 z
 " clip-path="url(#pe36aa35f15)" style="fill: #3987e5"/>
    </g>
    <g id="patch_6">
-    <path d="M 128.376623 120.25 
-L 128.376623 120.25 
-Q 128.376623 120.25 128.376623 120.25 
-L 128.376623 111.25 
-Q 128.376623 111.25 128.376623 111.25 
-L 128.376623 111.25 
+    <path d="M 128.37682 120.25 
+L 128.37682 120.25 
+Q 128.37682 120.25 128.37682 120.25 
+L 128.37682 111.25 
+Q 128.37682 111.25 128.37682 111.25 
+L 128.37682 111.25 
 z
 " clip-path="url(#pe36aa35f15)" style="fill: #184f95"/>
    </g>
@@ -530,7 +530,7 @@ L 324 326
     <text style="font-size: 7.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="132.27083" y="103.425293" transform="rotate(-0 132.27083 103.425293)">590 KB + 10.7 MB</text>
    </g>
    <g id="text_22">
-    <text style="font-size: 7.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #ffffff" x="132.376623" y="117.925293" transform="rotate(-0 132.376623 117.925293)">7.47 MB + 8.22 MB</text>
+    <text style="font-size: 7.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #ffffff" x="132.37682" y="117.925293" transform="rotate(-0 132.37682 117.925293)">7.49 MB + 8.21 MB</text>
    </g>
    <g id="text_23">
     <text style="font-size: 7.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #c3c2b7" x="132.414715" y="132.425293" transform="rotate(-0 132.414715 132.425293)">5.91 MB + 11.4 MB</text>

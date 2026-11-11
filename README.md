@@ -41,7 +41,7 @@ The fastest vector index in Rust built for cold reads.
 
 ### Python
 
-[`coldivf-python`](coldivf-python) builds the `coldivf` module with [maturin](https://www.maturin.rs). Vectors need 128 to 4,080 dimensions.
+[`coldivf-python`](coldivf-python) builds the `coldivf` module with [maturin](https://www.maturin.rs). Vectors need 128 to 4,352 dimensions. Above 4,080, the build needs `page_size=8192`.
 
 ```
 cd coldivf-python
@@ -381,7 +381,7 @@ A cold query runs in seven steps:
    - For the scan, the rotated query is also stored as 4-bit values from 0 to 15. Each set of 4 dimensions gets a table with one entry for each of the 16 patterns of its 4 code bits. An entry is the sum of the query's values over the dimensions whose bit the pattern sets. It is a whole number of at most 60.
    - A block interleaves the codes of 32 vectors. For each set of 4 dimensions, 16 bytes hold those 4 bits of each of the 32 vectors. Byte i holds the bits of vector i in its low half and of vector 16 + i in its high half.
    - One lookup instruction then finds the table entries of 16 vectors. On NEON, `tbl` handles one set of 4 dimensions at a time. On AVX2 and AVX-512, `vpshufb` handles 2 and 4 sets, respectively.
-   - The sums stay exact. Since each entry is at most 60, the kernels add the lookups of 4 sets in single bytes, at most 240. Then they widen these sums to 16 bits. A vector's total stays below $2^{16}$, since the dimension is at most 4,080.
+   - The sums stay exact. Since each entry is at most 60, the kernels add the lookups of 4 sets in single bytes, at most 240. Then they widen these sums to 16 bits. A vector's total stays below $2^{16}$, since the dimension is at most 4,352.
    - Three fused multiply-adds then turn each vector's sum into its distance estimate. They use 3 of the vector's 4 numbers, all but the error bound. They run in the same order on every CPU, thus every kernel returns exactly the same estimates.
    - The scan keeps the best max([`rerank`](coldivf/src/lib.rs#L391), [`k`](coldivf/src/lib.rs#L385)) candidates so far. A vector stays a candidate only if its estimate beats the worst of them.
 
@@ -461,7 +461,7 @@ The 1M results use the first 1M rows of Cohere 10M.
 
 ### Cold First Query
 
-ColdIVF has **the fastest cold first query**, 7.8 ms at recall@10 0.95 and 6.1 ms at 0.90. The next system, faiss with batched reads, comes within 10 to 13%. We added that read path to faiss for these benchmarks. Every other system takes 2.7 to 580 times as long.
+ColdIVF has **the fastest cold first query**, 7.1 ms at recall@10 0.95 and 5.6 ms at 0.90. The next system, faiss with batched reads, takes 22 to 24% longer. We added that read path to faiss for these benchmarks. Every other system takes 3.0 to 640 times as long.
 
 Each dot is a system's median and its line runs to the p99, on a log scale.
 
@@ -476,40 +476,40 @@ Each dot is a system's median and its line runs to the p99, on a log scale.
 
 | System | Setting | Recall@10 | Trials (Queries) | Cold p50 | Cold p99 | p50 Against ColdIVF |
 |---|---|---|---|---|---|---|
-| ColdIVF | nprobe 128, rerank 64 | 0.961 | 300 (50) | 7.83 ms | 10.1 ms | 1.00x |
-| faiss IVF, batched reads, 2,560 per list | nprobe 24, k_factor 8, qb 4 | 0.958 | 300 (50) | 8.64 ms | 11.9 ms | 1.10x |
-| LanceDB IVF_RQ | nprobes 16, refine 8 | 0.963 | 100 (50) | 21.4 ms | 43.5 ms | 2.74x |
-| DiskANN | list 96, beam 8 | 0.963 | 100 (50) | 23.5 ms | 28.3 ms | 3.00x |
-| Paimon 8-bit | nprobe 48 | 0.960 | 100 (50) | 41.9 ms | 46.0 ms | 5.35x |
-| RaBitQ-Library IVF 5-bit | nprobe 192 | 0.961 | 100 (50) | 125 ms | 135 ms | 15.94x |
-| faiss FastScan + SQ8 | nprobe 96, k_factor 8, qb 8 | 0.956 | 100 (50) | 172 ms | 186 ms | 21.92x |
-| faiss HNSW32-SQ8 | ef 96 | 0.958 | 100 (50) | 659 ms | 771 ms | 84.22x |
-| AsterVec | ef 384 | 0.963 | 100 (50) | 813 ms | 962 ms | 103.94x |
-| qdrant-edge | hnsw_ef 256, oversampling 2 | 0.958 | 100 (50) | 1,005 ms | 1,051 ms | 128.36x |
-| usearch HNSW f16 | expansion 384 | 0.961 | 99 (50) | 1,283 ms | 1,674 ms | 163.94x |
-| SymphonyQG | ef 128 | 0.957 | 99 (50) | 1,594 ms | 1,682 ms | 203.67x |
-| sqlite-vec | none | 1.000 | 30 (30) | 1,930 ms | 2,014 ms | 246.66x |
-| flat scan | none | 1.000 | 30 (30) | 3,537 ms | 3,668 ms | 451.98x |
+| ColdIVF | nprobe 128, rerank 64 | 0.961 | 299 (50) | 7.11 ms | 10.9 ms | 1.00x |
+| faiss IVF, batched reads, 2,560 per list | nprobe 24, k_factor 8, qb 4 | 0.958 | 300 (50) | 8.64 ms | 11.9 ms | 1.22x |
+| LanceDB IVF_RQ | nprobes 16, refine 8 | 0.963 | 100 (50) | 21.4 ms | 43.5 ms | 3.01x |
+| DiskANN | list 96, beam 8 | 0.963 | 100 (50) | 23.5 ms | 28.3 ms | 3.30x |
+| Paimon 8-bit | nprobe 48 | 0.960 | 100 (50) | 41.9 ms | 46.0 ms | 5.89x |
+| RaBitQ-Library IVF 5-bit | nprobe 192 | 0.961 | 100 (50) | 125 ms | 135 ms | 17.54x |
+| faiss FastScan + SQ8 | nprobe 96, k_factor 8, qb 8 | 0.956 | 100 (50) | 172 ms | 186 ms | 24.13x |
+| faiss HNSW32-SQ8 | ef 96 | 0.958 | 100 (50) | 659 ms | 771 ms | 92.71x |
+| AsterVec | ef 384 | 0.963 | 100 (50) | 813 ms | 962 ms | 114.41x |
+| qdrant-edge | hnsw_ef 256, oversampling 2 | 0.958 | 100 (50) | 1,005 ms | 1,051 ms | 141.30x |
+| usearch HNSW f16 | expansion 384 | 0.961 | 99 (50) | 1,283 ms | 1,674 ms | 180.46x |
+| SymphonyQG | ef 128 | 0.957 | 99 (50) | 1,594 ms | 1,682 ms | 224.19x |
+| sqlite-vec | none | 1.000 | 30 (30) | 1,930 ms | 2,014 ms | 271.51x |
+| flat scan | none | 1.000 | 30 (30) | 3,537 ms | 3,668 ms | 497.52x |
 
 **Recall@10 0.90**
 
 | System | Setting | Recall@10 | Trials (Queries) | Cold p50 | Cold p99 | p50 Against ColdIVF |
 |---|---|---|---|---|---|---|
-| ColdIVF | nprobe 64, rerank 39 | 0.921 | 100 (50) | 6.12 ms | 7.86 ms | 1.00x |
-| faiss IVF, batched reads, 2,560 per list | nprobe 12, k_factor 4, qb 4 | 0.905 | 30 (30) | 6.89 ms | 9.23 ms | 1.13x |
-| LanceDB IVF_RQ | nprobes 12, refine 4 | 0.931 | 30 (30) | 18.7 ms | 44.6 ms | 3.05x |
-| Paimon 4-bit | nprobe 48 | 0.917 | 30 (30) | 22.0 ms | 24.1 ms | 3.59x |
-| DiskANN | list 48, beam 8 | 0.919 | 30 (30) | 22.5 ms | 25.8 ms | 3.68x |
-| RaBitQ-Library IVF 5-bit | nprobe 64 | 0.918 | 30 (30) | 126 ms | 133 ms | 20.56x |
-| faiss FastScan + SQ8 | nprobe 48, k_factor 4, qb 8 | 0.911 | 30 (30) | 171 ms | 180 ms | 27.96x |
-| RaBitQ-Library HNSW 4-bit | ef 128 | 0.914 | 30 (30) | 221 ms | 237 ms | 36.04x |
-| AsterVec | ef 96 | 0.920 | 30 (30) | 483 ms | 532 ms | 78.90x |
-| faiss HNSW32-SQ8 | ef 48 | 0.923 | 30 (30) | 553 ms | 610 ms | 90.28x |
-| usearch HNSW f16 | expansion 96 | 0.920 | 30 (30) | 584 ms | 849 ms | 95.37x |
-| qdrant-edge | hnsw_ef 96, oversampling 2 | 0.918 | 30 (30) | 1,004 ms | 1,048 ms | 164.11x |
-| SymphonyQG | ef 64 | 0.920 | 30 (30) | 1,607 ms | 1,664 ms | 262.53x |
-| sqlite-vec | none | 1.000 | 30 (30) | 1,930 ms | 2,014 ms | 315.44x |
-| flat scan | none | 1.000 | 30 (30) | 3,537 ms | 3,668 ms | 578.01x |
+| ColdIVF | nprobe 64, rerank 39 | 0.921 | 100 (50) | 5.55 ms | 7.32 ms | 1.00x |
+| faiss IVF, batched reads, 2,560 per list | nprobe 12, k_factor 4, qb 4 | 0.905 | 30 (30) | 6.89 ms | 9.23 ms | 1.24x |
+| LanceDB IVF_RQ | nprobes 12, refine 4 | 0.931 | 30 (30) | 18.7 ms | 44.6 ms | 3.37x |
+| Paimon 4-bit | nprobe 48 | 0.917 | 30 (30) | 22.0 ms | 24.1 ms | 3.96x |
+| DiskANN | list 48, beam 8 | 0.919 | 30 (30) | 22.5 ms | 25.8 ms | 4.06x |
+| RaBitQ-Library IVF 5-bit | nprobe 64 | 0.918 | 30 (30) | 126 ms | 133 ms | 22.67x |
+| faiss FastScan + SQ8 | nprobe 48, k_factor 4, qb 8 | 0.911 | 30 (30) | 171 ms | 180 ms | 30.83x |
+| RaBitQ-Library HNSW 4-bit | ef 128 | 0.914 | 30 (30) | 221 ms | 237 ms | 39.74x |
+| AsterVec | ef 96 | 0.920 | 30 (30) | 483 ms | 532 ms | 86.99x |
+| faiss HNSW32-SQ8 | ef 48 | 0.923 | 30 (30) | 553 ms | 610 ms | 99.54x |
+| usearch HNSW f16 | expansion 96 | 0.920 | 30 (30) | 584 ms | 849 ms | 105.15x |
+| qdrant-edge | hnsw_ef 96, oversampling 2 | 0.918 | 30 (30) | 1,004 ms | 1,048 ms | 180.95x |
+| SymphonyQG | ef 64 | 0.920 | 30 (30) | 1,607 ms | 1,664 ms | 289.45x |
+| sqlite-vec | none | 1.000 | 30 (30) | 1,930 ms | 2,014 ms | 347.80x |
+| flat scan | none | 1.000 | 30 (30) | 3,537 ms | 3,668 ms | 637.30x |
 
 </details>
 
@@ -523,7 +523,7 @@ These tables list every configuration each system ran, from [`coldivf-bench/py/h
 | System | Setting | Test Recall@10 | Warm p50 ms | QPS on 6 Threads | QPS on 12 Threads | QPS Method | Cold p50 ms | Cold p99 ms | Cold Trials (Queries) |
 |---|---|---|---|---|---|---|---|---|---|
 | ColdIVF, binaries | nprobe 64, rerank 39 | 0.9212 | 0.205 | 20,101 | 20,159 | threads | 5.46 | 6.55 | 100 (50) |
-| ColdIVF | nprobe 64, rerank 39 | 0.9214 | 0.208 | 20,287 | 19,247 | threads | 6.12 | 7.86 | 100 (50) |
+| ColdIVF | nprobe 64, rerank 39 | 0.9214 | 0.208 | 20,287 | 19,247 | threads | 5.55 | 7.32 | 100 (50) |
 | faiss IVF, batched reads, 2,560 per list | nprobe 12, k_factor 4 | 0.9048 | 1.10 | 4,606 | 6,027 | processes | 6.89 | 9.23 | 30 (30) |
 | faiss IVF, batched reads, 320 per list | nprobe 48, k_factor 4 | 0.9114 | 0.853 | 5,331 | 6,146 | processes | 8.54 | 11.7 | 30 (30) |
 | faiss IVF, on-disk lists, 2,560 per list | nprobe 12, k_factor 4 | 0.9048 | 1.11 | 5,175 | 5,822 | batch call | 13.7 | 37.5 | 30 (30) |
@@ -553,7 +553,7 @@ These tables list every configuration each system ran, from [`coldivf-bench/py/h
 | System | Setting | Open and First Query: Process + Index Pages | Warm Mode | Warm: Process + Cached Pages | Build Minutes | Build Peak | Build Malloc Cache | Index Size | Bytes per Vector |
 |---|---|---|---|---|---|---|---|---|---|
 | ColdIVF, binaries | nprobe 64, rerank 39 | 4.37 MB + 4.89 MB = 9.26 MB | whole | 9.54 MB + 946 MB = 956 MB | 0.5 | 359 MB | off | 946 MB | 946 |
-| ColdIVF | nprobe 64, rerank 39 | 3.88 MB + 4.89 MB = 8.74 MB | whole | 71.8 MB + 946 MB = 1.02 GB | 0.5 (another setup's file) | 359 MB | off | 946 MB | 946 |
+| ColdIVF | nprobe 64, rerank 39 | 3.88 MB + 4.89 MB = 8.78 MB | whole | 71.8 MB + 946 MB = 1.02 GB | 0.5 (another setup's file) | 359 MB | off | 946 MB | 946 |
 | faiss IVF, batched reads, 2,560 per list | nprobe 12, k_factor 4 | 533 KB + 5.89 MB = 6.43 MB | whole | 70.4 MB + 881 MB = 952 MB | 0.1 (another setup's file) | 4.65 GB | off | 884 MB | 884 |
 | faiss IVF, batched reads, 320 per list | nprobe 48, k_factor 4 | 705 KB + 12.9 MB = 13.7 MB | whole | 71.2 MB + 890 MB = 961 MB | 0.1 (another setup's file) | 4.67 GB | off | 892 MB | 892 |
 | faiss IVF, on-disk lists, 2,560 per list | nprobe 12, k_factor 4 | 812 KB + 4.75 MB = 5.57 MB | whole | 70.9 MB + 880 MB = 951 MB | 0.1 | 4.65 GB | off | 884 MB | 884 |
@@ -581,8 +581,8 @@ These tables list every configuration each system ran, from [`coldivf-bench/py/h
 
 | System | Setting | Test Recall@10 | Warm p50 ms | QPS on 6 Threads | QPS on 12 Threads | QPS Method | Cold p50 ms | Cold p99 ms | Cold Trials (Queries) | Cold p50 at Exactly the Target ms |
 |---|---|---|---|---|---|---|---|---|---|---|
+| ColdIVF | nprobe 128, rerank 64 | 0.9610 | 0.348 | 12,209 | 11,305 | threads | 7.11 | 10.9 | 299 (50) | 6.85 |
 | ColdIVF, binaries | nprobe 128, rerank 64 | 0.9608 | 0.345 | 12,151 | 11,588 | threads | 7.18 | 9.09 | 300 (50) | 6.81 |
-| ColdIVF | nprobe 128, rerank 64 | 0.9610 | 0.348 | 12,209 | 11,305 | threads | 7.83 | 10.1 | 300 (50) | 7.51 |
 | faiss IVF, batched reads, 2,560 per list | nprobe 24, k_factor 8 | 0.9576 | 2.10 | 2,365 | 3,175 | processes | 8.64 | 11.9 | 300 (50) | 8.34 |
 | faiss IVF, batched reads, 320 per list | nprobe 96, k_factor 8 | 0.9556 | 1.52 | 3,159 | 3,528 | processes | 11.4 | 13.6 | 100 (50) | 11.0 |
 | faiss IVF, on-disk lists, 2,560 per list | nprobe 32, k_factor 4 | 0.9558 | 2.88 | 2,060 | 2,434 | batch call | 20.8 | 44.8 | 300 (50) | 19.2 |
@@ -611,8 +611,8 @@ These tables list every configuration each system ran, from [`coldivf-bench/py/h
 
 | System | Setting | Open and First Query: Process + Index Pages | Warm Mode | Warm: Process + Cached Pages | Build Minutes | Build Peak | Build Malloc Cache | Index Size | Bytes per Vector |
 |---|---|---|---|---|---|---|---|---|---|
+| ColdIVF | nprobe 128, rerank 64 | 7.49 MB + 8.21 MB = 15.7 MB | whole | 74.2 MB + 946 MB = 1.02 GB | 0.5 (another setup's file) | 359 MB | off | 946 MB | 946 |
 | ColdIVF, binaries | nprobe 128, rerank 64 | 7.38 MB + 8.22 MB = 15.6 MB | whole | 9.98 MB + 946 MB = 956 MB | 0.5 | 359 MB | off | 946 MB | 946 |
-| ColdIVF | nprobe 128, rerank 64 | 7.47 MB + 8.22 MB = 15.7 MB | whole | 74.2 MB + 946 MB = 1.02 GB | 0.5 (another setup's file) | 359 MB | off | 946 MB | 946 |
 | faiss IVF, batched reads, 2,560 per list | nprobe 24, k_factor 8 | 590 KB + 10.7 MB = 11.3 MB | whole | 70.5 MB + 881 MB = 952 MB | 0.1 (another setup's file) | 4.65 GB | off | 884 MB | 884 |
 | faiss IVF, batched reads, 320 per list | nprobe 96, k_factor 8 | 787 KB + 15.9 MB = 16.7 MB | whole | 71.6 MB + 890 MB = 961 MB | 0.1 (another setup's file) | 4.67 GB | off | 892 MB | 892 |
 | faiss IVF, on-disk lists, 2,560 per list | nprobe 32, k_factor 4 | 1.16 MB + 12.6 MB = 13.8 MB | whole | 71.3 MB + 880 MB = 951 MB | 0.1 | 4.65 GB | off | 884 MB | 884 |
@@ -742,7 +742,7 @@ Every system that fits in this Mac's memory ran on all 10M rows of Cohere 10M.
 
 ### Cold First Query
 
-ColdIVF has **the fastest cold first query**, 7.9 ms at recall@10 0.90 and 11.2 ms at 0.95. The next system, faiss with batched reads, takes 2.4 and 2.1 times as long. LanceDB takes 3.7 and 2.8 times as long, and the rest up to 680 times.
+ColdIVF has **the fastest cold first query**, 7.7 ms at recall@10 0.90 and 10.8 ms at 0.95. The next system, faiss with batched reads, takes 2.5 and 2.2 times as long. LanceDB takes 3.7 and 2.9 times as long, and the rest up to 700 times.
 
 Each dot is a system's median and its line runs to the p99, on a log scale.
 
@@ -757,28 +757,28 @@ Each dot is a system's median and its line runs to the p99, on a log scale.
 
 | System | Setting | Recall@10 | Trials (Queries) | Cold p50 | Cold p99 | p50 Against ColdIVF |
 |---|---|---|---|---|---|---|
-| ColdIVF | nprobe 192, rerank 39 | 0.953 | 300 (50) | 11.2 ms | 13.1 ms | 1.00x |
-| faiss IVF, batched reads, 2,560 per list | nprobe 48, k_factor 8, qb 4 | 0.956 | 300 (50) | 23.4 ms | 27.8 ms | 2.09x |
-| LanceDB IVF_RQ | nprobes 48, refine 8 | 0.956 | 100 (50) | 31.3 ms | 37.8 ms | 2.79x |
-| DiskANN | list 64, beam 16 | 0.959 | 100 (50) | 149 ms | 160 ms | 13.31x |
-| Paimon 4-bit | nprobe 192 | 0.952 | 100 (50) | 170 ms | 189 ms | 15.17x |
-| RaBitQ-Library IVF 5-bit | nprobe 384 | 0.961 | 68 (46) | 1,247 ms | 1,304 ms | 111.03x |
-| faiss FastScan + SQ8 | nprobe 128, k_factor 4, qb 8 | 0.948 | 98 (50) | 2,111 ms | 2,199 ms | 187.98x |
-| faiss HNSW32-SQ8 | ef 96 | 0.962 | 100 (50) | 4,549 ms | 4,981 ms | 405.07x |
+| ColdIVF | nprobe 192, rerank 39 | 0.953 | 300 (50) | 10.8 ms | 12.9 ms | 1.00x |
+| faiss IVF, batched reads, 2,560 per list | nprobe 48, k_factor 8, qb 4 | 0.956 | 300 (50) | 23.4 ms | 27.8 ms | 2.17x |
+| LanceDB IVF_RQ | nprobes 48, refine 8 | 0.956 | 100 (50) | 31.3 ms | 37.8 ms | 2.90x |
+| DiskANN | list 64, beam 16 | 0.959 | 100 (50) | 149 ms | 160 ms | 13.84x |
+| Paimon 4-bit | nprobe 192 | 0.952 | 100 (50) | 170 ms | 189 ms | 15.78x |
+| RaBitQ-Library IVF 5-bit | nprobe 384 | 0.961 | 68 (46) | 1,247 ms | 1,304 ms | 115.49x |
+| faiss FastScan + SQ8 | nprobe 128, k_factor 4, qb 8 | 0.948 | 98 (50) | 2,111 ms | 2,199 ms | 195.53x |
+| faiss HNSW32-SQ8 | ef 96 | 0.962 | 100 (50) | 4,549 ms | 4,981 ms | 421.35x |
 
 **Recall@10 0.90**
 
 | System | Setting | Recall@10 | Trials (Queries) | Cold p50 | Cold p99 | p50 Against ColdIVF |
 |---|---|---|---|---|---|---|
-| ColdIVF | nprobe 64, rerank 29 | 0.907 | 100 (50) | 7.89 ms | 9.17 ms | 1.00x |
-| faiss IVF, batched reads, 2,560 per list | nprobe 24, k_factor 4, qb 4 | 0.920 | 30 (30) | 18.9 ms | 20.4 ms | 2.39x |
-| LanceDB IVF_RQ | nprobes 32, refine 16 | 0.938 | 30 (30) | 28.8 ms | 35.9 ms | 3.65x |
-| Paimon 4-bit | nprobe 48 | 0.907 | 30 (30) | 49.6 ms | 56.5 ms | 6.29x |
-| DiskANN | list 32, beam 8 | 0.918 | 30 (30) | 149 ms | 154 ms | 18.84x |
-| RaBitQ-Library IVF 5-bit | nprobe 96 | 0.905 | 21 (21) | 1,212 ms | 1,318 ms | 153.58x |
-| faiss FastScan + SQ8 | nprobe 48, k_factor 4, qb 8 | 0.905 | 30 (30) | 1,999 ms | 2,167 ms | 253.36x |
-| faiss HNSW32-SQ8 | ef 48 | 0.933 | 30 (30) | 4,425 ms | 4,660 ms | 560.88x |
-| turbovec 4-bit, calibrated | none | 0.913 | 29 (29) | 5,391 ms | 5,735 ms | 683.39x |
+| ColdIVF | nprobe 64, rerank 29 | 0.907 | 100 (50) | 7.67 ms | 10.1 ms | 1.00x |
+| faiss IVF, batched reads, 2,560 per list | nprobe 24, k_factor 4, qb 4 | 0.920 | 30 (30) | 18.9 ms | 20.4 ms | 2.46x |
+| LanceDB IVF_RQ | nprobes 32, refine 16 | 0.938 | 30 (30) | 28.8 ms | 35.9 ms | 3.75x |
+| Paimon 4-bit | nprobe 48 | 0.907 | 30 (30) | 49.6 ms | 56.5 ms | 6.47x |
+| DiskANN | list 32, beam 8 | 0.918 | 30 (30) | 149 ms | 154 ms | 19.37x |
+| RaBitQ-Library IVF 5-bit | nprobe 96 | 0.905 | 21 (21) | 1,212 ms | 1,318 ms | 157.86x |
+| faiss FastScan + SQ8 | nprobe 48, k_factor 4, qb 8 | 0.905 | 30 (30) | 1,999 ms | 2,167 ms | 260.44x |
+| faiss HNSW32-SQ8 | ef 48 | 0.933 | 30 (30) | 4,425 ms | 4,660 ms | 576.54x |
+| turbovec 4-bit, calibrated | none | 0.913 | 29 (29) | 5,391 ms | 5,735 ms | 702.46x |
 
 </details>
 
@@ -792,7 +792,7 @@ These tables list every configuration each system ran, from [`coldivf-bench/py/h
 | System | Setting | Test Recall@10 | Warm p50 ms | QPS on 6 Threads | QPS on 12 Threads | QPS Method | Cold p50 ms | Cold p99 ms | Cold Trials (Queries) | Cold p50 at Exactly the Target ms |
 |---|---|---|---|---|---|---|---|---|---|---|
 | ColdIVF, binaries | nprobe 64, rerank 29 | 0.9070 | 0.417 | 11,061 | 12,006 | threads | 7.02 | 8.40 | 100 (50) | 6.93 |
-| ColdIVF | nprobe 64, rerank 29 | 0.9070 | 0.418 | 11,340 | 11,605 | threads | 7.89 | 9.17 | 100 (50) | 7.56 |
+| ColdIVF | nprobe 64, rerank 29 | 0.9070 | 0.418 | 11,340 | 11,605 | threads | 7.67 | 10.1 | 100 (50) | 7.41 |
 | faiss IVF, batched reads, 2,560 per list | nprobe 24, k_factor 4 | 0.9200 | 2.62 | 1,996 | 2,556 | processes | 18.9 | 20.4 | 30 (30) | - |
 | faiss IVF, on-disk lists, 2,560 per list | nprobe 24, k_factor 4 | 0.9200 | 2.67 | 2,086 | 2,423 | batch call | 21.8 | 45.2 | 30 (30) | - |
 | faiss IVF, on-disk lists, 640 per list | nprobe 48, k_factor 4 | 0.9052 | 2.17 | 2,326 | 2,729 | batch call | 27.6 | 76.6 | 30 (30) | - |
@@ -815,7 +815,7 @@ These tables list every configuration each system ran, from [`coldivf-bench/py/h
 | System | Setting | Open and First Query: Process + Index Pages | Warm Mode | Warm: Process + Cached Pages | Build Minutes | Build Peak | Build Malloc Cache | Index Size | Bytes per Vector |
 |---|---|---|---|---|---|---|---|---|---|
 | ColdIVF, binaries | nprobe 64, rerank 29 | 7.87 MB + 12.7 MB = 20.6 MB | whole | 26.4 MB + 9.43 GB = 9.45 GB | 11.8 | 843 MB | off | 9.43 GB | 943 |
-| ColdIVF | nprobe 64, rerank 29 | 7.27 MB + 12.7 MB = 20 MB | whole | 75 MB + 9.43 GB = 9.5 GB | 11.8 (another setup's file) | 843 MB | off | 9.43 GB | 943 |
+| ColdIVF | nprobe 64, rerank 29 | 7.23 MB + 12.7 MB = 20 MB | whole | 75 MB + 9.43 GB = 9.5 GB | 11.8 (another setup's file) | 843 MB | off | 9.43 GB | 943 |
 | faiss IVF, batched reads, 2,560 per list | nprobe 24, k_factor 4 | 2.43 MB + 21.8 MB = 24.3 MB | whole | 80.6 MB + 8.81 GB = 8.89 GB | 3.8 (another setup's file) | 9.66 GB | on | 8.81 GB | 881 |
 | faiss IVF, on-disk lists, 2,560 per list | nprobe 24, k_factor 4 | 13.4 MB + 10.7 MB = 24.1 MB | whole | 86 MB + 8.8 GB = 8.89 GB | 3.6 | 9.69 GB | on | 8.81 GB | 881 |
 | faiss IVF, on-disk lists, 640 per list | nprobe 48, k_factor 4 | 49.6 MB + 6.47 MB = 56.1 MB | whole | 123 MB + 8.8 GB = 8.92 GB | 2.4 | 10.2 GB | on | 8.85 GB | 885 |
@@ -838,7 +838,7 @@ These tables list every configuration each system ran, from [`coldivf-bench/py/h
 | System | Setting | Test Recall@10 | Warm p50 ms | QPS on 6 Threads | QPS on 12 Threads | QPS Method | Cold p50 ms | Cold p99 ms | Cold Trials (Queries) | Cold p50 at Exactly the Target ms |
 |---|---|---|---|---|---|---|---|---|---|---|
 | ColdIVF, binaries | nprobe 192, rerank 39 | 0.9534 | 0.809 | 4,977 | 4,866 | threads | 10.4 | 12.7 | 300 (50) | 9.83 |
-| ColdIVF | nprobe 192, rerank 39 | 0.9534 | 0.816 | 5,325 | 4,938 | threads | 11.2 | 13.1 | 300 (50) | 10.6 |
+| ColdIVF | nprobe 192, rerank 39 | 0.9534 | 0.816 | 5,325 | 4,938 | threads | 10.8 | 12.9 | 300 (50) | 10.3 |
 | faiss IVF, batched reads, 2,560 per list | nprobe 48, k_factor 8 | 0.9562 | 4.98 | 1,056 | 1,402 | processes | 23.4 | 27.8 | 300 (50) | 23.1 |
 | LanceDB IVF_RQ | nprobes 48, refine 8 | 0.9562 | 11.3 | 435 | 432 | threads | 31.3 | 37.8 | 100 (50) | 30.4 |
 | faiss IVF, batched reads, 640 per list | nprobe 128, k_factor 4 | 0.9480 | 3.82 | 1,284 | 1,592 | processes | 33.6 | 36.9 | 100 (50) | 34.8 |
