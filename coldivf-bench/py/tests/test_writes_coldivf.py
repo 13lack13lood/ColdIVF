@@ -1,5 +1,5 @@
-"""The write paths of ColdIVF's Python module adapter, the flat scan as the exact reference, and the systems that take
-the stream as a fresh build, on tiny synthetic data.
+"""The write paths of ColdIVF's Python module adapter and its cold open, the flat scan as the exact reference, and the
+systems that take the stream as a fresh build, on tiny synthetic data.
 
 The ColdIVF tests that call the module itself run its adapter in an interpreter that has it, this one or
 $COLDIVF_BENCH_VENVS/venv-coldivf/bin/python3 as in the suites, and are skipped without one.
@@ -15,6 +15,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -178,6 +179,43 @@ class IndexPathTest(unittest.TestCase):
 
             with self.assertRaises(FileNotFoundError):
                 cp.index_path(Path(tmp))
+
+
+class ColdOpenTest(unittest.TestCase):
+    """Cold trials over a stand-in for the module's Index, in a cell whose index and dummy are folders, as the driver
+    gives them."""
+
+    def test_a_cold_process_finds_its_index_before_ready_so_the_timed_open_scans_no_folder(self):
+        opened: list[str] = []
+
+        def open_index(path: str, **limits: int) -> SimpleNamespace:
+            opened.append(path)
+            return SimpleNamespace(prepare=lambda: None, search=lambda query, k, **params: (np.arange(k), None))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            for name in ("index", "dummy"):
+                (root / name).mkdir()
+                (root / name / "index.coldivf").write_bytes(b"x")
+
+            for regime in ("c0", "intent"):
+                opened.clear()
+                adapter = cp.ColdIVFPython()
+                adapter.lib = SimpleNamespace(Index=open_index)
+                ctx = ServeContext(index=root / "index", dataset=None, rows=10, k=2, metric="cosine", threads=1,
+                                   variant="python", params={"nprobe": 2, "rerank": 10}, queries={1: np.ones(4)},
+                                   regime=regime, cpu_state="none", dummy=root / "dummy")
+
+                with mock.patch.object(cp, "index_path", wraps=cp.index_path) as found:
+                    adapter.cold_setup(ctx)
+                    ready = found.call_count
+                    out = adapter.cold_trial(ctx, {"trial": 0, "queries": [1]})
+
+                # A C0 and an intent trial both time the open, and nothing after READY looks for the index, so that
+                # time holds Index() and prepare() alone.
+                self.assertEqual((found.call_count, out["ids"]), (ready, [0, 1]), regime)
+                self.assertEqual(opened, [str(root / f / "index.coldivf") for f in ("dummy", "index")], regime)
 
 
 class FilesTest(unittest.TestCase):

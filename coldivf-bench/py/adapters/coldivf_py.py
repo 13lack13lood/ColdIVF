@@ -133,6 +133,8 @@ class ColdIVFPython(Adapter):
     def __init__(self) -> None:
         super().__init__()
         self.lib: Any = None
+        # The path that names each index this process found, by the path it was given, eg. a cell's folder.
+        self.paths: dict[Path, Path] = {}
 
     def load(self) -> None:
         import coldivf
@@ -165,6 +167,16 @@ class ColdIVFPython(Adapter):
     def overhead_params(self) -> dict:
         return {"nprobe": 2, "rerank": 10}
 
+    def index_at(self, path: Path | str) -> Path:
+        """The path that names the index at `path`, found once per process, since it stays the same when maintenance
+        moves the file into its folder."""
+        key = Path(path)
+
+        if key not in self.paths:
+            self.paths[key] = index_path(key)
+
+        return self.paths[key]
+
     def data_file(self, index: Path) -> Path:
         """The data file that holds the index now, under the index's path as given. The module returns it with
         symbolic links resolved, eg. /private/var for /var."""
@@ -190,9 +202,16 @@ class ColdIVFPython(Adapter):
         listed = {log.name, data.name, *FOLDER_FILES}
         return out + [side_file(p, "bulk") for p in sorted(folder.iterdir()) if p.is_file() and p.name not in listed]
 
+    def cold_setup(self, ctx: ServeContext) -> None:
+        # The index is found before READY, as the binaries' adapter finds the file it hands the cold binary, so the
+        # timed open runs only Index() and prepare(). Finding it takes two scans of the cell's folder and a few stats,
+        # which an app that opens its index by its path never does.
+        self.index_at(ctx.index)
+        super().cold_setup(ctx)
+
     def open(self, ctx: ServeContext, path: Path) -> Handle:
         nprobe, rerank, reach = search_settings(ctx.params)
-        index = self.lib.Index(str(index_path(path)), max_k=ctx.k, max_nprobe=nprobe, max_rerank=max(rerank, ctx.k))
+        index = self.lib.Index(str(self.index_at(path)), max_k=ctx.k, max_nprobe=nprobe, max_rerank=max(rerank, ctx.k))
         index.prepare()
         return Handle(index, nprobe, rerank, reach)
 
