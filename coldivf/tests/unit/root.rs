@@ -9,14 +9,16 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use super::*;
-use crate::index::Inner;
+use crate::index::{Inner, Opening};
 use crate::io::watch::{self, Op};
 use crate::maintain::Live;
 use crate::maintain::tests::{DIM, build_params, churn, settings};
 use crate::quantization::SplitMix64;
 use crate::quantization::sq8;
 use crate::quantization::testutil::{Rows, clustered, scratch_dir};
-use crate::{Anchor, Builder, Index, Metric, RunKind, Throttle, ThrottleParams, Writer};
+use crate::{
+    Anchor, Builder, Index, Limits, Metric, RunKind, SearchCtx, SearchParams, Throttle, ThrottleParams, Writer,
+};
 
 /// A folder of a test's own, by the name that the file system gives it, so it matches the paths of the index's files.
 /// Dropping it removes it.
@@ -566,6 +568,128 @@ fn an_index_from_before_the_root_opens_and_its_first_commit_moves_it_into_its_fo
     let ids = ids_at(&path).unwrap();
     assert!(ids.contains(&60_000) && !ids.contains(&5));
     assert!(Index::open(&path).unwrap().verify().is_ok());
+}
+
+/// The files that `f` opens on this thread, once for each open, sorted.
+fn opened(f: impl FnOnce()) -> Vec<PathBuf> {
+    io::OPENED.set(Some(Vec::new()));
+    f();
+    sorted(io::OPENED.take().unwrap_or_default())
+}
+
+/// `files` in order, to compare with what `opened` gives.
+fn sorted(mut files: Vec<PathBuf>) -> Vec<PathBuf> {
+    files.sort();
+    files
+}
+
+#[test]
+fn an_open_reads_each_root_slot_and_each_log_once() {
+    let scratch = Folder::new("opens");
+    let rows = built(&scratch);
+    let path = scratch.index();
+    let open = || {
+        let mut index = None;
+        let files = opened(|| index = Some(Index::open(&path).unwrap()));
+        (index.unwrap(), files)
+    };
+    // The hits of every cluster for some of the index's vectors, with their scores' bits.
+    let vectors = rows.data.as_chunks::<DIM>().0;
+    let queries: Vec<&[f32]> = vectors.iter().step_by(50).map(|q| &q[..]).collect();
+    let hits = |index: &Index| -> Vec<Vec<(u64, u32)>> {
+        let sp = SearchParams {
+            k: 10,
+            nprobe: 30,
+            rerank: 200,
+            reach: None,
+        };
+        let mut ctx = SearchCtx::new(Limits {
+            max_k: 10,
+            max_nprobe: 30,
+            max_rerank: 200,
+        });
+        let found = queries.iter().map(|q| {
+            let hits = index.search(q, &sp, &mut ctx).unwrap();
+            hits.iter().map(|h| (h.id, h.score.to_bits())).collect()
+        });
+        found.collect()
+    };
+
+    // A fresh build has neither a log nor a folder, so the open opens its file alone.
+    assert_eq!(open().1, vec![path.clone()]);
+
+    // Before the first commit the changes wait in the file's log, which the open opens once and replays through the
+    // handle that checked its header. The replay looks the records' ids up in the file's ids, which it reads through a
+    // handle of its own.
+    let mut writer = Writer::open(&path).unwrap();
+    churn(&mut writer, &rows, 74);
+    let want = hits(&writer.index);
+    drop(writer);
+    let (index, files) = open();
+    assert_eq!(files, sorted(vec![path.clone(), path.clone(), update::log_path(&path)]));
+    assert!(hits(&index) == want, "the replay of the file's log found other vectors");
+    drop(index);
+
+    // After a commit the open reads each root slot once, opens the generation's data file and its log once each, and
+    // maps the activity word.
+    let mut writer = Writer::open(&path).unwrap();
+    writer.compact().unwrap();
+    let at = writer.index.inner().located().clone();
+    drop(writer);
+    let dir = folder(&path);
+    let mut each = vec![at.data.clone(), at.log.clone(), dir.join("activity")];
+    each.extend(SLOTS.map(|slot| dir.join(slot)));
+    assert_eq!(open().1, sorted(each.clone()));
+
+    // So does an open with changes since the commit in the generation's log. Their replay checks the rows that the
+    // records' hints name by the file's ids, through a handle of its own too.
+    let mut writer = Writer::open(&path).unwrap();
+    churn(&mut writer, &rows, 75);
+    let want = hits(&writer.index);
+    drop(writer);
+    let (index, files) = open();
+    each.push(at.data.clone());
+    assert_eq!(files, sorted(each));
+    assert!(
+        hits(&index) == want,
+        "the replay of the generation's log found other vectors"
+    );
+}
+
+#[test]
+fn an_open_that_a_commit_overtakes_opens_the_generation_that_the_root_names_then() {
+    let scratch = Folder::new("overtaken");
+    built(&scratch);
+    let path = scratch.index();
+    let mut writer = Writer::open(&path).unwrap();
+    writer.compact().unwrap();
+    let open = |at: &Located| {
+        let mut inner = None;
+        let files = opened(|| {
+            inner = Some(
+                Opening::start_at(&path, at.clone())
+                    .and_then(|o| o.finish(&path))
+                    .unwrap(),
+            );
+        });
+        (inner.unwrap().located().clone(), files)
+    };
+
+    // From a lookup that still holds, the open reads no root slot.
+    let at = locate(&path).unwrap();
+    assert_eq!(open(&at), (at.clone(), sorted(vec![at.data.clone(), at.log.clone()])));
+
+    // A commit after the lookup deleted the files that it found, so the open reads both slots once more.
+    writer.compact().unwrap();
+    let now = locate(&path).unwrap();
+    let mut files = vec![now.data.clone(), now.log.clone()];
+    files.extend(SLOTS.map(|slot| folder(&path).join(slot)));
+    assert_eq!(open(&at), (now, sorted(files)));
+
+    // A commit after the open opened the data file deleted the generation's log, so the open starts again.
+    let opening = Opening::start(&path).unwrap();
+    writer.compact().unwrap();
+    assert_eq!(opening.finish(&path).unwrap().located(), &locate(&path).unwrap());
 }
 
 #[test]

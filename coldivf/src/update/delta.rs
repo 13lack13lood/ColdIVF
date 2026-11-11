@@ -466,6 +466,7 @@ impl Applier {
     fn file(&mut self) -> Result<&File, Error> {
         if self.file.is_none() {
             self.file = Some(File::open(&self.data)?);
+            io::opened(&self.data);
         }
 
         Ok(self.file.as_ref().expect("the file was just opened"))

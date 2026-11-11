@@ -184,14 +184,15 @@ pub(crate) fn lock(path: &Path) -> Result<File, Error> {
     }
 }
 
-/// The changes of the data file `data`, whose header says `layout`, of the index at `path`, with its log `log` of
-/// `version`, shared with every other open index of that generation in this process. Each open reads whatever the log
-/// holds past what the changes already have, eg. changes that another process made since an earlier open.
+/// The changes of the data file `data`, whose header says `layout`, of the index at `path`, with its log of `version`,
+/// shared with every other open index of that generation in this process. `log` is that log as `log::open_ours` opened
+/// it. Each open reads whatever the log holds past what the changes already have, eg. changes that another process made
+/// since an earlier open.
 pub(crate) fn changes_for(
     path: &Path,
     layout: &Layout,
     data: &Path,
-    log: &Path,
+    log: Option<(File, u64)>,
     version: Version,
 ) -> Result<Arc<Changes>, Error> {
     let key = real_path(path);
@@ -218,14 +219,18 @@ pub(crate) fn changes_for(
     Ok(changes)
 }
 
-/// Brings `changes` up to date with the log `log`, of `version`, of the data file whose header says `layout`, eg. with
-/// what another process's writer appended since. It takes the applier only when the log holds more than the changes
-/// have read, and searches never wait for it.
-pub(crate) fn read_more(changes: &Changes, log: &Path, layout: &Layout, version: Version) -> Result<(), Error> {
+/// Brings `changes` up to date with `log`, their log of `version` for the data file whose header says `layout`, as
+/// `log::open_ours` opened it, eg. with what another process's writer appended since. It takes the applier only when
+/// the log holds more than the changes have read, and searches never wait for it.
+pub(crate) fn read_more(
+    changes: &Changes,
+    log: Option<(File, u64)>,
+    layout: &Layout,
+    version: Version,
+) -> Result<(), Error> {
     let read = changes.load().log_len() as u64;
-    let behind = log::open_ours(log, layout, version)?.is_some_and(|(_, len)| len > read);
 
-    if behind {
+    if log.as_ref().is_some_and(|&(_, len)| len > read) {
         catch_up(changes, &mut changes.applier(), log, layout, version)?;
     }
 
@@ -244,20 +249,22 @@ pub(crate) fn foreign_log(path: &Path, layout: &Layout) -> Result<bool, Error> {
     }
 }
 
-/// Applies the records that the log at `path`, of `version`, holds past what `applier` has read, then publishes them
-/// to `changes` as one snapshot, so a replay packs each block once. Returns whether the log was written for this file.
-/// A missing log, or one written for another file, holds nothing for it, and so does one shorter than what the applier
-/// read. A version 1 log ends at its first record that is cut short, damaged or doesn't fit this file, as a crash in
-/// the middle of a write leaves it. A version 2 log ends only at a damaged last frame, and any other damage fails with
-/// `InvalidData`.
+/// Applies the records that `log`, a log of `version` for the data file whose header says `layout`, as `log::open_ours`
+/// opened it, with its length, holds past what `applier` has read, then publishes them to `changes` as one snapshot, so
+/// a replay packs each block once. It reads on to the log's end, so it also applies what was appended after the open.
+/// Returns whether the log was written for this file. A missing log, or one written for another file, which `open_ours`
+/// gives as `None`, holds nothing for it, and so does one shorter than what the applier read, or a version 1 log that a
+/// writer started again for another file since the open. A version 1 log ends at its first record that is cut short,
+/// damaged or doesn't fit this file, as a crash in the middle of a write leaves it. A version 2 log ends only at a
+/// damaged last frame, and any other damage fails with `InvalidData`.
 pub(crate) fn catch_up(
     changes: &Changes,
     applier: &mut Applier,
-    path: &Path,
+    log: Option<(File, u64)>,
     layout: &Layout,
     version: Version,
 ) -> Result<bool, Error> {
-    let Some((mut file, len)) = log::open_ours(path, layout, version)? else {
+    let Some((mut file, len)) = log else {
         return Ok(false);
     };
     let start = applier.log_len().max(version.header_len());
@@ -269,6 +276,14 @@ pub(crate) fn catch_up(
     let mut bytes = Vec::new();
     file.seek(SeekFrom::Start(start as u64))?;
     file.read_to_end(&mut bytes)?;
+
+    // A writer of a rebuilt file starts a version 1 log again in place, so what this handle read may be that file's
+    // records, eg. when an open waited for the applier after `open_ours` checked the header. Reading the header again
+    // after the records also catches a log started again while they were read.
+    if version == Version::One && !log::is_ours(&file, layout, version)? {
+        return Ok(false);
+    }
+
     let replayed = applier.replay(&bytes, start);
     changes.publish(applier);
     replayed.map(|()| true)

@@ -288,6 +288,7 @@ pub(crate) struct Cold {
 /// and a direct handle of its own, which skips it, except the row waves of warm searches.
 pub(crate) fn open_cold(path: &Path) -> Result<Cold, Error> {
     let file = File::open(path)?;
+    opened(path);
 
     if !file.metadata()?.is_file() {
         return Err(Error::new(ErrorKind::InvalidData, "the path isn't a regular file"));
@@ -652,6 +653,7 @@ impl Activity {
                 .create(true)
                 .truncate(false)
                 .open(&self.file)?;
+            opened(&self.file);
             if file.metadata()?.len() < 8 {
                 file.set_len(8)?;
             }
@@ -901,6 +903,29 @@ pub(crate) fn step(name: &'static str, path: &Path) {
     #[cfg(test)]
     let _ = watch::see(watch::Op::Step(name), path);
     let _ = (name, path);
+}
+
+/// Notes that this thread just opened the file at `path`, for a test that counts the opens of an index's files. It
+/// does nothing outside tests.
+#[inline]
+pub(crate) fn opened(path: &Path) {
+    #[cfg(test)]
+    OPENED.with_borrow_mut(|files| {
+        if let Some(files) = files {
+            files.push(path.to_path_buf());
+        }
+    });
+    let _ = path;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The files that this thread opened since a test began to count them, in order, or `None` when no test counts.
+    /// Each thread keeps its own, so tests that run at the same time don't see each other's opens, and an open never
+    /// waits on the lock that `watch` holds while a hook runs, eg. a hook that opens the index.
+    pub(crate) static OPENED: std::cell::RefCell<Option<Vec<std::path::PathBuf>>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 
 /// What tests see of the file operations that keep an index crash-safe. A test sets a hook for a folder of its own, and

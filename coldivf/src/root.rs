@@ -99,11 +99,13 @@ fn read_slots(dir: &Path) -> Result<([Option<Root>; 2], bool), Error> {
     let (mut slots, mut damaged) = ([None, None], false);
 
     for (slot, name) in slots.iter_mut().zip(SLOTS) {
-        let bytes = match fs::read(dir.join(name)) {
+        let path = dir.join(name);
+        let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
+        io::opened(&path);
         *slot = format::read_root(&bytes).ok();
         damaged |= slot.is_none() && bytes.iter().any(|&b| b != 0);
     }

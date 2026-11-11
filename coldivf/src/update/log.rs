@@ -373,28 +373,33 @@ fn followed(bytes: &[u8], at: usize, dim: usize) -> bool {
 }
 
 /// Opens the log at `path` when it was written for the data file whose header says `layout`, as `version` says, and
-/// returns it read past its header, with its length. A missing log, one shorter than a header and one written for
-/// another file give `None`.
+/// returns it with its length. A missing log, one shorter than a header and one written for another file give `None`.
 pub(crate) fn open_ours(path: &Path, layout: &Layout, version: Version) -> Result<Option<(File, u64)>, Error> {
-    let mut file = match File::open(path) {
+    let file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let mut head = vec![0u8; version.header_len()];
+    io::opened(path);
 
-    match file.read_exact(&mut head) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-
-    if head != version.header(layout) {
+    if !is_ours(&file, layout, version)? {
         return Ok(None);
     }
 
     let len = file.metadata()?.len();
     Ok(Some((file, len)))
+}
+
+/// Whether the log that `file` has open starts with the header that `version` gives the data file whose header says
+/// `layout`. One shorter than a header doesn't. It reads the header at offset 0, whatever the handle read before.
+pub(crate) fn is_ours(file: &File, layout: &Layout, version: Version) -> Result<bool, Error> {
+    let mut head = vec![0u8; version.header_len()];
+
+    match io::read_at(file, &mut head, 0) {
+        Ok(()) => Ok(head == version.header(layout)),
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// The log of one data file, open for appending, with its writer's lock held.
@@ -447,7 +452,7 @@ impl Log {
         }
 
         let mut a = changes.applier();
-        let ours = super::catch_up(changes, &mut a, path, layout, version)?;
+        let ours = super::catch_up(changes, &mut a, open_ours(path, layout, version)?, layout, version)?;
         let len = file.metadata()?.len();
 
         if (!ours && a.log_len() > 0) || len < a.log_len() as u64 {

@@ -477,6 +477,46 @@ fn a_log_left_next_to_a_rebuilt_file_is_ignored() {
 }
 
 #[test]
+fn a_log_started_again_for_a_rebuilt_file_after_an_open_checked_it_is_ignored() {
+    let (path, rows) = sample("restarted.coldivf", Metric::L2);
+    // A byte-identical copy's writer stands in for another process that logs a change the open index hasn't read.
+    let twin = temp_file("restarted-twin.coldivf");
+    std::fs::copy(&path, &twin).unwrap();
+    let index = Index::open(&path).unwrap();
+    Writer::open(&twin).unwrap().delete(3).unwrap();
+    std::fs::copy(log_path(&twin), log_path(&path)).unwrap();
+
+    // Another open checks the log's header, then waits for the applier, eg. while an open on another thread replays.
+    let inner = index.inner();
+    let log = log::open_ours(&inner.located().log, inner.layout(), Version::One).unwrap();
+    assert!(log.is_some());
+
+    // Meanwhile other processes rebuild the index with as many clusters, and a writer of the new file starts the log
+    // again in place, then logs whole records that would fit the old file too.
+    let (other, mut clusters) = clustered(&mut SplitMix64::new(68), 600, 128, 12, 1.0);
+    group(&mut clusters, 3);
+    write(&InMemory::build(&params(Metric::L2), &other, &clusters).unwrap(), &path).unwrap();
+    let v = gaussian(&mut SplitMix64::new(69), 1, 128, |_| 1.0);
+    let mut writer = Writer::open(&path).unwrap();
+    writer.insert(9000, &v).unwrap();
+    writer.delete(7).unwrap();
+    drop(writer);
+
+    // The open reads the new file's records through the handle that it checked, and applies none of them, so the old
+    // file's changes have read no byte of the log and hold no change.
+    read_more(inner.changes(), log, inner.layout(), Version::One).unwrap();
+    let delta = inner.changes().load();
+    assert_eq!((delta.log_len(), delta.len(), delta.next()), (0, 0, 1));
+    let ids = |q: &[f32]| -> Vec<u64> {
+        let mut c = ctx();
+        let hits = index.search(q, &everything(), &mut c).unwrap();
+        hits.iter().map(|h| h.id).collect()
+    };
+    assert!(!ids(&v).contains(&9000));
+    assert_eq!(ids(&rows.data[7 * 128..8 * 128])[0], 7);
+}
+
+#[test]
 fn a_record_for_a_cluster_the_file_lacks_ends_the_log() {
     let (path, _) = sample("leaf.coldivf", Metric::L2);
     let vs = gaussian(&mut SplitMix64::new(62), 2, 128, |_| 1.0);

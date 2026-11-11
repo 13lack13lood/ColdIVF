@@ -89,12 +89,14 @@ impl Shared {
         // An open reads whatever the log holds past what this process has read, as the open of a new handle would.
         if let Some(shared) = find(&real, |cur| cur.is(&at)) {
             let cur = shared.load();
-            update::read_more(&cur.changes, &cur.at.log, &cur.layout, cur.at.version())?;
+            let log = update::log::open_ours(&cur.at.log, &cur.layout, cur.at.version())?;
+            update::read_more(&cur.changes, log, &cur.layout, cur.at.version())?;
             drop(cur);
             return Ok(shared);
         }
 
-        Ok(Shared::adopt(&real, Inner::open(&real)?))
+        // Otherwise it opens the generation that it just found, without looking it up again.
+        Ok(Shared::adopt(&real, Opening::start_at(&real, at)?.finish(&real)?))
     }
 
     /// The cell for `inner`, a generation of the index at `path`: the one that holds it or an older generation of the
@@ -1142,10 +1144,15 @@ impl Opening {
     /// Opens the current data file of the index at `path`, once, and starts reading its first 16 KiB. A commit may
     /// delete the file that the root named between the lookup and the open, so then it looks again.
     pub(crate) fn start(path: &Path) -> Result<Opening, Error> {
+        Opening::start_at(path, root::locate(path)?)
+    }
+
+    /// The same, from `at`, the generation that a lookup of `path` found, so an open that has looked already reads the
+    /// root slots once. It looks again only when a commit has deleted that generation's data file since.
+    pub(crate) fn start_at(path: &Path, mut at: Located) -> Result<Opening, Error> {
         let mut tries = 0;
 
         loop {
-            let at = root::locate(path)?;
             match io::open_cold(&at.data) {
                 Ok(cold) => {
                     let len =
@@ -1153,7 +1160,10 @@ impl Opening {
                     io::will_need(&cold.file, 0, FIRST_READ.min(len));
                     return Ok(Opening { cold, len, at });
                 }
-                Err(e) if e.kind() == ErrorKind::NotFound && at.root.is_some() && tries < REOPENS => tries += 1,
+                Err(e) if e.kind() == ErrorKind::NotFound && at.root.is_some() && tries < REOPENS => {
+                    tries += 1;
+                    at = root::locate(path)?;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1203,18 +1213,23 @@ impl Opening {
             return Err(damaged("the file changed while it was being opened"));
         }
 
-        // The root names one data file by its header's checksum, and a generation's log must be there and name it too.
-        // A commit may have deleted the log since the lookup, which gives `NotFound`.
-        if let Some(root) = &at.root {
-            if root.check != layout.check {
-                return Err(damaged("the data file isn't the one that the index's root names"));
-            }
-            if update::log::open_ours(&at.log, &layout, at.version())?.is_none() {
-                return match std::fs::exists(&at.log)? {
-                    true => Err(damaged("the log doesn't belong to the data file that the root names")),
-                    false => Err(Error::new(ErrorKind::NotFound, "the generation's log is gone")),
-                };
-            }
+        // The root names one data file by its header's checksum.
+        if let Some(root) = &at.root
+            && root.check != layout.check
+        {
+            return Err(damaged("the data file isn't the one that the index's root names"));
+        }
+
+        // A generation's log must be there and name the data file too. A commit may have deleted it since the lookup,
+        // which gives `NotFound`. The changes are read through the handle that checked its header, so the log is opened
+        // once, and a commit that deletes it later takes none of them away.
+        let log = update::log::open_ours(&at.log, &layout, at.version())?;
+
+        if at.root.is_some() && log.is_none() {
+            return match std::fs::exists(&at.log)? {
+                true => Err(damaged("the log doesn't belong to the data file that the root names")),
+                false => Err(Error::new(ErrorKind::NotFound, "the generation's log is gone")),
+            };
         }
 
         let uid = NEXT_UID.fetch_add(1, Ordering::Relaxed);
@@ -1222,7 +1237,7 @@ impl Opening {
             uid,
             cell: AtomicU64::new(uid),
             owner: OnceLock::new(),
-            changes: update::changes_for(path, &layout, &at.data, &at.log, at.version())?,
+            changes: update::changes_for(path, &layout, &at.data, log, at.version())?,
             path: path.to_path_buf(),
             at,
             cold,
