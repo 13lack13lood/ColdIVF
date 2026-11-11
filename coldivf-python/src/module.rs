@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{Error, ErrorKind};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
@@ -186,13 +187,28 @@ fn vector(py: Python<'_>, array: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
     PyBuffer::<f32>::get(array)?.to_vec(py)
 }
 
-/// The rows of a build, copied out of the array they came in.
-struct Rows {
-    data: Vec<f32>,
+/// The rows of a build, in the array they came in or in a copy of it.
+struct Rows<'a> {
+    data: Cow<'a, [f32]>,
     dim: usize,
 }
 
-impl coldivf::VectorSource for Rows {
+impl<'a> Rows<'a> {
+    /// The rows of `buffer`, `dim` values each, read in place. A source hands out rows as slices, so rows that aren't
+    /// contiguous, eg. those of a slice with a step, are copied.
+    fn new(buffer: &'a PyBuffer<f32>, py: Python<'a>, dim: usize) -> PyResult<Rows<'a>> {
+        let data = match buffer.as_slice(py) {
+            // SAFETY: a ReadOnlyCell<f32> is an f32 in memory, and the slice can't outlive the buffer, which holds the
+            // array. The cells allow other code to write the values and the slice doesn't, so build's doc asks that
+            // nothing change the array until the build returns.
+            Some(cells) => Cow::Borrowed(unsafe { &*(std::ptr::from_ref(cells) as *const [f32]) }),
+            None => Cow::Owned(buffer.to_vec(py)?),
+        };
+        Ok(Rows { data, dim })
+    }
+}
+
+impl coldivf::VectorSource for Rows<'_> {
     fn count(&self) -> usize {
         self.data.len().checked_div(self.dim).unwrap_or(0)
     }
@@ -207,9 +223,10 @@ impl coldivf::VectorSource for Rows {
 }
 
 /// Builds an index file at `path` from `vectors`, a 2-D float32 array with one vector per row, whose ids are their
-/// row numbers. It copies the array first, so it needs memory for the vectors a second time, and lets other Python
-/// threads run while it builds. For more vectors than fit in memory twice, use the build_index binary, which reads
-/// them from a file. `metric` is "cosine" or "l2", `order` "chained" or "id", `anchor` "cluster" or "mean", and
+/// row numbers. It reads the rows in place, so it needs little memory beyond the array's, unless they aren't
+/// contiguous, eg. a slice with a step, which it copies whole first. For more vectors than fit in memory, pass an
+/// np.memmap of a file of them. It lets other Python threads run while it builds, and nothing may change the array
+/// until it returns. `metric` is "cosine" or "l2", `order` "chained" or "id", `anchor` "cluster" or "mean", and
 /// `clustering` "flat" or "two-level". `threads` 0 takes one per logical CPU.
 #[pyfunction]
 #[pyo3(signature = (path, vectors, *, metric = "cosine", vectors_per_list = 160, parents = 128, order = "chained",
@@ -261,10 +278,7 @@ fn build(
         "clustering",
         &[("flat", Clustering::Flat), ("two-level", Clustering::TwoLevel)],
     )?;
-    let rows = Rows {
-        data: buffer.to_vec(py)?,
-        dim,
-    };
+    let rows = Rows::new(&buffer, py, dim)?;
     let builder = Builder::new(params).clustering(clustering);
     py.detach(|| builder.build(&rows, &path)).map_err(error)
 }

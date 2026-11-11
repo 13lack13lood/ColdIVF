@@ -1,5 +1,6 @@
-"""The coldivf module on small random indexes: its hits against an exact search, warm searches, searches from several
-threads, inserts and deletes through its writer, maintenance in the foreground and as a background job, and its errors.
+"""The coldivf module on small random indexes: builds from mapped and strided arrays and the memory a build takes, its
+hits against an exact search, warm searches, searches from several threads, inserts and deletes through its writer,
+maintenance in the foreground and as a background job, and its errors.
 
     python -m unittest discover -s coldivf-python/tests
 """
@@ -23,6 +24,21 @@ N, DIM, PER_LIST = 3000, 128, 100
 # Random vectors have near-ties that the 8-bit copies a search rescores with can't order, so even a search of every
 # cluster finds ~95% of the true 10 nearest, not all of them.
 RECALL = 0.9
+
+# A process of its own builds an index from a 128 MiB array, then prints by how much its peak memory grew during the
+# build, and the array's size, in bytes. The peak before the build already counts the whole array.
+PEAK = """
+import resource, sys
+import numpy as np
+import coldivf
+
+vectors = np.random.default_rng(5).standard_normal((1 << 17, 256), dtype=np.float32)
+before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+coldivf.build(sys.argv[1], vectors, vectors_per_list=8192, parents=8, threads=2)
+# The peak is in bytes on macOS and in KiB on Linux.
+unit = 1 if sys.platform == "darwin" else 1024
+print((resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before) * unit, vectors.nbytes)
+"""
 
 
 def rows(n: int, seed: int, unit: bool = True) -> np.ndarray:
@@ -114,6 +130,28 @@ class ColdIVFTest(unittest.TestCase):
         index = coldivf.Index(self.path)
         index.verify()
         self.assertFalse(index.refresh())
+
+    def test_a_mapped_or_strided_array_builds_the_same_file(self):
+        # The rows of an .fbin file after its 8-byte header, which the build reads in place through the map, and rows
+        # with a step between them or in column order, which it copies first.
+        fbin = self.dir / "base.fbin"
+        fbin.write_bytes(np.array([N, DIM], np.int32).tobytes() + self.base.tobytes())
+        wide = np.zeros((N, 2 * DIM), np.float32)
+        wide[:, ::2] = self.base
+        arrays = {"mapped": np.memmap(fbin, np.float32, "r", offset=8, shape=(N, DIM)), "strided": wide[:, ::2],
+                  "columns": np.asfortranarray(self.base)}
+
+        for name, vectors in arrays.items():
+            path = self.dir / f"{name}.coldivf"
+            coldivf.build(path, vectors, vectors_per_list=PER_LIST, parents=8, threads=2)
+            self.assertEqual(path.read_bytes(), self.path.read_bytes(), name)
+
+    def test_a_build_reads_the_array_in_place(self):
+        out = subprocess.run([sys.executable, "-c", PEAK, str(self.dir / "peak.coldivf")], capture_output=True,
+                             text=True, check=True).stdout
+        grew, size = map(int, out.split())
+        # The build's own buffers stay well under the array's size, which a copy of the array would add on its own.
+        self.assertLess(grew, size)
 
     def test_bad_requests_raise(self):
         index = coldivf.Index(self.path)
