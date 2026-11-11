@@ -1,5 +1,6 @@
 //! Unit tests for k-means.
 
+use std::cell::Cell;
 use std::io::ErrorKind;
 
 use super::*;
@@ -317,6 +318,90 @@ fn the_same_seed_gives_the_same_centers_on_any_thread_count() {
     assert_ne!(bits(&one), bits(&other));
 }
 
+/// A source that counts the rows read from it.
+struct Counted<'a> {
+    rows: &'a Rows,
+    reads: Cell<usize>,
+}
+
+impl VectorSource for Counted<'_> {
+    fn count(&self) -> usize {
+        self.rows.count()
+    }
+
+    fn dim(&self) -> usize {
+        self.rows.dim()
+    }
+
+    fn rows(&self, start: usize, rows: usize) -> &[f32] {
+        self.reads.set(self.reads.get() + rows);
+        self.rows.rows(start, rows)
+    }
+}
+
+/// A source's rows that don't say k-means may keep them loaded.
+struct Reloaded<'a>(Source<'a>);
+
+impl super::Rows for Reloaded<'_> {
+    fn count(&self) -> usize {
+        self.0.count()
+    }
+
+    fn dim(&self) -> usize {
+        self.0.dim()
+    }
+
+    fn load(&self, ids: &[u32], out: &mut [f32], pool: &ThreadPool) -> Result<(), Error> {
+        self.0.load(ids, out, pool)
+    }
+}
+
+#[test]
+fn rows_that_fit_in_one_chunk_are_loaded_once_and_train_the_same_centers() {
+    let (n, dim, k) = (2500, 128, 8);
+    let (rows, _) = clustered(&mut SplitMix64::new(20), n, dim, k, 0.5);
+    let counted = || Counted {
+        rows: &rows,
+        reads: Cell::new(0),
+    };
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    // The set fits in one chunk, fills one exactly or is a sample that fits in one, or it takes two or three chunks,
+    // the last of them part full.
+    let cases = [
+        (usize::MAX, 4000),
+        (usize::MAX, 2500),
+        (700, 1000),
+        (usize::MAX, 1250),
+        (usize::MAX, 1000),
+        (1500, 1000),
+    ];
+
+    for threads in [1, 4] {
+        let pool = crate::build::threads(threads).unwrap();
+        for metric in [Metric::L2, Metric::Cosine] {
+            for (sample, chunk) in cases {
+                for rounds in [0, 1, 6] {
+                    let params = KMeans {
+                        sample,
+                        ..settings(k, rounds)
+                    };
+                    let (a, b) = (counted(), counted());
+                    let kept = train_rows(&params, &Source { src: &a, metric }, chunk, &pool).unwrap();
+                    let reloaded = train_rows(&params, &Reloaded(Source { src: &b, metric }), chunk, &pool).unwrap();
+                    let set = sample.min(n);
+                    let case = format!("{threads} threads, {metric:?}, {set} in chunks of {chunk}, {rounds} rounds");
+                    assert_eq!(bits(&kept), bits(&reloaded), "{case}");
+                    // Both read the first centers, then the set in each round, except that a source's rows that fit in
+                    // one chunk are read in the first round only.
+                    let rounds_read = if set <= chunk { rounds.min(1) } else { rounds };
+                    assert_eq!(a.reads.get(), k + rounds_read * set, "{case}");
+                    assert_eq!(b.reads.get(), k + rounds * set, "{case}");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn a_sample_has_that_many_different_rows_in_order() {
     let mut rng = SplitMix64::new(9);
@@ -398,4 +483,36 @@ fn bad_input_fails_with_invalid_input() {
     let mut huge = good;
     huge[5] = 1e38;
     assert_eq!(kind(huge, 20, Metric::L2), ErrorKind::InvalidInput);
+}
+
+#[test]
+fn with_cosine_a_vector_of_any_finite_length_clusters_at_length_1() {
+    let dim = 768;
+    let mut rng = SplitMix64::new(21);
+    let mut one = vec![0f32; dim];
+    one[5] = -f32::MAX;
+    // From the smallest value above 0 to the largest finite one. With L2 the last three are too long to cluster.
+    let vectors = [
+        vec![f32::from_bits(1); dim],
+        gaussian(&mut rng, 1, dim, |_| 1.0),
+        gaussian(&mut rng, 1, dim, |_| 1e30),
+        one,
+        vec![f32::MAX; dim],
+    ];
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let mut row = vec![0f32; dim];
+
+    for (i, x) in vectors.iter().enumerate() {
+        let l2 = match i {
+            0 | 1 => Ok(()),
+            _ => Err("a vector is too long to cluster"),
+        };
+        assert_eq!(copy_row(x, Metric::L2, &mut row), l2, "vector {i}");
+        assert_eq!(copy_row(x, Metric::Cosine, &mut row), Ok(()), "vector {i}");
+        let mut want = x.clone();
+        assert!(normalize(&mut want));
+        assert_eq!(bits(&row), bits(&want), "vector {i}");
+        let length = row.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>();
+        assert!((length - 1.0).abs() < 1e-5, "vector {i} has length {length}");
+    }
 }

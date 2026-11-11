@@ -31,10 +31,16 @@ pub(crate) trait Rows {
     /// Writes the rows `ids`, which are in increasing order, one after another into `out`, as k-means clusters them. A
     /// vector that can't be clustered fails with `InvalidInput`, and a damaged one with `InvalidData`.
     fn load(&self, ids: &[u32], out: &mut [f32], pool: &ThreadPool) -> Result<(), Error>;
+    /// Whether k-means may keep the rows it trains on loaded from one round to the next when they fit in one block,
+    /// instead of loading them again for each round. It loads them again unless they say so.
+    fn keep(&self) -> bool {
+        false
+    }
 }
 
 /// The rows of a source, normalized for cosine. A value that isn't finite, a zero vector with cosine, or a vector too
-/// long to cluster fails with `InvalidInput`, and the first such vector decides the error, whatever the threads do.
+/// long to cluster with L2 fails with `InvalidInput`, and the first such vector decides the error, whatever the threads
+/// do.
 pub(crate) struct Source<'a> {
     pub(crate) src: &'a dyn VectorSource,
     pub(crate) metric: Metric,
@@ -47,6 +53,11 @@ impl Rows for Source<'_> {
 
     fn dim(&self) -> usize {
         self.src.dim()
+    }
+
+    /// Loading the rows again would only check and normalize the same vectors again.
+    fn keep(&self) -> bool {
+        true
     }
 
     fn load(&self, ids: &[u32], out: &mut [f32], pool: &ThreadPool) -> Result<(), Error> {
@@ -93,7 +104,8 @@ pub(crate) fn train(
     train_rows(params, &Source { src, metric }, ROWS, pool)
 }
 
-/// The same for any rows, reading at most `chunk` of them at a time.
+/// The same for any rows, reading at most `chunk` of them at a time. Rows that may stay loaded and fit in one chunk are
+/// read in the first round only.
 pub(crate) fn train_rows(params: &KMeans, src: &dyn Rows, chunk: usize, pool: &ThreadPool) -> Result<Vec<f32>, Error> {
     let (n, dim, k, chunk) = (src.count(), src.dim(), params.k, chunk.max(1));
     let mut rng = SplitMix64::new(params.seed);
@@ -108,13 +120,20 @@ pub(crate) fn train_rows(params: &KMeans, src: &dyn Rows, chunk: usize, pool: &T
     scratch.load(src, &first, pool)?;
     let mut centers = scratch.rows.clone();
     let (mut sums, mut counts, mut norms) = (vec![0f64; k * dim], vec![0usize; k], vec![0f32; k]);
+    // A load gives the same rows every time, and `nearest` only reads them, so a set of one chunk that may stay loaded
+    // trains the same centers from the rows its first round loaded.
+    let reload = !src.keep() || set.len() > chunk;
+    #[cfg(test)]
+    let reload = reload || RELOAD.with(std::cell::Cell::get);
 
-    for _ in 0..params.rounds {
+    for round in 0..params.rounds {
         squared_norms(&centers, dim, &mut norms);
         sums.fill(0.0);
         counts.fill(0);
         for chunk in set.chunks(chunk) {
-            scratch.load(src, chunk, pool)?;
+            if reload || round == 0 {
+                scratch.load(src, chunk, pool)?;
+            }
             scratch.nearest(&centers, &norms, dim, pool);
             for (row, &c) in scratch.rows.chunks_exact(dim).zip(&scratch.best) {
                 counts[c as usize] += 1;
@@ -127,6 +146,13 @@ pub(crate) fn train_rows(params: &KMeans, src: &dyn Rows, chunk: usize, pool: &T
     }
 
     Ok(centers)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes `train_rows` on this thread load its rows again in every round, even rows it would keep loaded, so tests
+    /// can check that keeping them trains the same centers.
+    pub(crate) static RELOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The nearest of `centers` to each vector of `src`, normalized for cosine. Ties go to the lower center.
@@ -315,8 +341,12 @@ fn copy_row(x: &[f32], metric: Metric, row: &mut [f32]) -> Result<(), &'static s
 
     row.copy_from_slice(x);
 
-    if metric == Metric::Cosine && !normalize(row) {
-        return Err("a zero vector has no direction for cosine");
+    // A row normalized for cosine has length 1, give or take rounding, so only an L2 row can be too long to cluster.
+    if metric == Metric::Cosine {
+        return match normalize(row) {
+            true => Ok(()),
+            false => Err("a zero vector has no direction for cosine"),
+        };
     }
 
     if row.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() > LIMIT {

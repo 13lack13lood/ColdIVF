@@ -169,6 +169,38 @@ fn a_build_gives_the_same_bytes_on_any_thread_count() {
 }
 
 #[test]
+fn a_build_gives_the_same_bytes_when_k_means_loads_its_rows_again_in_every_round() {
+    // At 3,000 vectors every k-means trains on rows that fit in one chunk, which it keeps loaded. At 20,500 the flat
+    // build's clusters and the two-level build's one group train on two chunks, which it loads again in each round,
+    // while the flat build's groups, found from its cluster centers, and the two-level build's, found from a sample,
+    // train on one.
+    for (n, vectors_per_list, parents) in [(3000, 150, 4), (20_500, 7000, 1)] {
+        let (rows, _) = clustered(&mut SplitMix64::new(14), n, 128, 12, 1.0);
+        for clustering in [Clustering::Flat, Clustering::TwoLevel] {
+            for metric in [Metric::L2, Metric::Cosine] {
+                let built = |threads: usize, reload: bool| {
+                    let settings = BuildParams {
+                        threads,
+                        vectors_per_list,
+                        parents,
+                        ..params(metric)
+                    };
+                    let out = temp_file(&format!("reload-{n}-{clustering:?}-{metric:?}-{threads}.coldivf"));
+                    kmeans::RELOAD.with(|r| r.set(reload));
+                    let result = crate::Builder::new(settings).clustering(clustering).build(&rows, &out);
+                    kmeans::RELOAD.with(|r| r.set(false));
+                    result.unwrap();
+                    fs::read(&out).unwrap()
+                };
+                // The build that keeps rows loaded runs on 4 threads, and the one that loads them again on 1.
+                let (kept, reloaded) = (built(4, false), built(1, true));
+                assert!(kept == reloaded, "{n} vectors, {clustering:?}, {metric:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn the_groups_never_outnumber_the_clusters() {
     let (rows, _) = clustered(&mut SplitMix64::new(7), 400, 128, 4, 0.5);
     let settings = BuildParams {
